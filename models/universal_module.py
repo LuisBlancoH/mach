@@ -8,6 +8,7 @@ from models.meta_learner import MetaLearnerTransformer
 from models.action_head import ActionHead
 from models.memory_head import MemoryHead
 from models.reward_projection import RewardProjection
+from models.critic import Critic, CriticSignalProjection
 
 
 class DifferentiablePatch(nn.Module):
@@ -176,6 +177,146 @@ class MACHPhase2(nn.Module):
                 patch_idx, weight_name, coefficients, gate
             )
             self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+
+class MACHPhase3(nn.Module):
+    """
+    Phase 3 universal module: Phase 2 + Critic (basal ganglia).
+
+    Changes from Phase 2:
+    - Adds Critic MLP (evaluates mean-pooled transformer hidden states)
+    - Replaces RewardProjection with CriticSignalProjection
+    - fire() takes value + td_error instead of raw reward_signals
+    - Stores last transformer hidden states for critic evaluation
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_meta=128, n_basis=8):
+        super().__init__()
+        self.d_model = d_model
+        self.d_meta = d_meta
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+
+        # Same as Phase 2
+        self.obs_proj = ObservationProjection(d_model, d_meta)
+        self.gru = SimpleGRU(d_meta)
+        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+        self.transformer = MetaLearnerTransformer(d_meta, n_tokens=7)
+        self.action_head = ActionHead(d_meta, len(patch_layers), n_basis)
+        self.memory_head = MemoryHead(d_meta)
+
+        # NEW: Critic (basal ganglia)
+        self.critic = Critic(d_meta, hidden_dim=d_meta)
+
+        # NEW: Critic signal projection (replaces reward_proj)
+        self.critic_signal_proj = CriticSignalProjection(d_meta)
+
+        # Differentiable patches
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # State
+        self._tf_mem = None
+        self._last_hidden = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        self.gru.reset()
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._tf_mem = self.transformer.tf_mem_init.clone()
+        self._last_hidden = None
+
+    def observe(self, base_model, input_ids):
+        """
+        Identical to Phase 2 — observation is detached.
+        """
+        with torch.no_grad():
+            hidden_state = None
+            target_layer = self.patch_layers[len(self.patch_layers) // 2]
+
+            def hook(module, input, output):
+                nonlocal hidden_state
+                if isinstance(output, tuple):
+                    hidden_state = output[0][:, -1, :]
+                else:
+                    hidden_state = output[:, -1, :]
+
+            h = base_model.model.layers[target_layer].register_forward_hook(hook)
+            base_model(input_ids=input_ids)
+            h.remove()
+
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0).detach()
+        gru_memory = self.gru.integrate(projected)
+        return gru_memory
+
+    def fire(self, gru_memory, last_value, last_td_error):
+        """
+        One meta-learner firing. Produces patch writes and memory update.
+
+        gru_memory: (d_meta,)
+        last_value: scalar tensor — previous step's critic value estimate
+        last_td_error: scalar tensor — previous step's TD error
+        Returns: writes (list of (patch_idx, weight_name, coefficients, gate))
+        """
+        critic_token = self.critic_signal_proj(last_value, last_td_error)
+        zero_placeholder = torch.zeros(self.d_meta, device=gru_memory.device)
+
+        tokens = torch.stack([
+            gru_memory,                             # world state
+            critic_token,                           # critic signals (was reward)
+            zero_placeholder,                       # cerebellar correction (still zeros)
+            self._tf_mem,                           # transformer memory
+            self.transformer.think_0_init,          # action
+            self.transformer.think_1_init,          # memory update
+            self.transformer.think_2_init,          # upstream output
+        ])  # (7, d_meta)
+
+        hidden = self.transformer(tokens)  # (7, d_meta)
+
+        # Store hidden states for critic (stays in graph)
+        self._last_hidden = hidden
+
+        # Action from think_0 (position 4)
+        writes = self.action_head(hidden[4])
+
+        # Memory update from think_1 (position 5)
+        self._tf_mem = self.memory_head(hidden[5], self._tf_mem)
+
+        return writes
+
+    def get_value(self):
+        """
+        Evaluate current transformer hidden states with the critic.
+        Must be called AFTER fire(). Returns scalar value (in graph).
+        """
+        assert self._last_hidden is not None, "Must call fire() before get_value()"
+        return self.critic(self._last_hidden)
+
+    def apply_writes(self, writes):
+        """Apply differentiable patch weight modifications via basis vectors."""
+        for (patch_idx, weight_name, coefficients, gate) in writes:
+            delta_W = self.basis.compute_delta_W(
+                patch_idx, weight_name, coefficients, gate
+            )
+            self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+    def load_phase2_checkpoint(self, checkpoint_path, device='cpu'):
+        """
+        Load compatible weights from a Phase 2 checkpoint.
+        Skips reward_proj (replaced by critic_signal_proj).
+        """
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        compatible = {
+            k: v for k, v in state_dict.items()
+            if not k.startswith('reward_proj')
+        }
+        missing, unexpected = self.load_state_dict(compatible, strict=False)
+        print(f"  Loaded Phase 2 checkpoint: {len(compatible)} keys loaded, "
+              f"{len(missing)} missing (new), {len(unexpected)} unexpected")
+        return missing, unexpected
 
 
 class MACHPatchedModel(nn.Module):
