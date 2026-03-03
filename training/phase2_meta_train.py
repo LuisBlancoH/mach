@@ -141,15 +141,15 @@ def meta_train(base_model, mach, patched_model, tokenizer, device,
             if wandb is not None:
                 wandb.log(log_dict)
 
-        # Validation + diagnostics every 100 episodes
-        if episode_idx % 100 == 0 and episode_idx > 0:
+        # Validation + diagnostics every 200 episodes
+        if episode_idx % 200 == 0 and episode_idx > 0:
             _run_validation(base_model, mach, patched_model, tokenizer,
                             device, difficulty, episode_idx)
             _log_diagnostics(mach, meta_params, episode_idx)
 
 
 def _run_validation(base_model, mach, patched_model, tokenizer, device,
-                    difficulty, episode_idx, n_episodes=5, n_problems=20):
+                    difficulty, episode_idx, n_episodes=10, n_problems=20):
     """
     Held-out evaluation: fresh problems, no gradient.
     Compares base Qwen (no patches) vs meta-learner writes.
