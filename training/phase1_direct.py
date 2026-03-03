@@ -44,6 +44,7 @@ def train_patches_direct(patched_model, tokenizer, train_problems, test_problems
 
             if global_step % 100 == 0:
                 wandb.log({
+                    f"diff{difficulty}/train_loss_avg": total_loss / n_problems,
                     f"diff{difficulty}/train_loss_step": loss.item(),
                     "global_step": global_step,
                 })
