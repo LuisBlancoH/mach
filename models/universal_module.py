@@ -354,6 +354,10 @@ class MACHPhase4(MACHPhase3):
         # Cerebellum
         self.cerebellum = Cerebellum(d_meta, hidden_dim=d_meta)
 
+        # Surprise normalization (running stats, persist across episodes)
+        self._surprise_ema = 1.0   # exponential moving average of raw surprise
+        self._surprise_ema_decay = 0.99
+
         # State (reset per episode)
         self._accumulated_correction = None
         self._last_predicted_obs = None
@@ -405,7 +409,16 @@ class MACHPhase4(MACHPhase3):
                 self._last_predicted_obs, projected
             )
             self._cerebellum_losses.append(pred_loss)
-            self._surprises.append(surprise.item())
+
+            # Normalize surprise by running mean (relative, not absolute)
+            raw_surprise = surprise.item()
+            self._surprise_ema = (
+                self._surprise_ema_decay * self._surprise_ema
+                + (1 - self._surprise_ema_decay) * raw_surprise
+            )
+            # Relative surprise: 1.0 = average, >1 = more surprising
+            surprise = raw_surprise / max(self._surprise_ema, 1e-6)
+            self._surprises.append(surprise)
 
             if self._accumulated_correction is None:
                 self._accumulated_correction = correction
