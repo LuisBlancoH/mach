@@ -34,7 +34,7 @@ def load_base_model():
     print(f"Loading {config.BASE_MODEL} on {config.DEVICE}...")
     tokenizer = AutoTokenizer.from_pretrained(config.BASE_MODEL)
     model = AutoModelForCausalLM.from_pretrained(
-        config.BASE_MODEL, torch_dtype=config.DTYPE
+        config.BASE_MODEL, dtype=config.DTYPE
     ).to(config.DEVICE)
 
     # Freeze all base model parameters

@@ -12,10 +12,15 @@ def evaluate_model(model, tokenizer, problems, max_new_tokens=10, label=None):
     prefix = f"  [{label}]" if label else "  [eval]"
 
     for i, p in enumerate(problems):
-        input_ids = tokenizer(p["prompt"], return_tensors="pt").input_ids.to(model.device)
+        encoding = tokenizer(p["prompt"], return_tensors="pt").to(model.device)
         with torch.no_grad():
-            output = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
-        response = tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
+            output = model.generate(
+                input_ids=encoding.input_ids,
+                attention_mask=encoding.attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+        response = tokenizer.decode(output[0][encoding.input_ids.shape[1]:], skip_special_tokens=True).strip()
         predicted = extract_number(response)
         if predicted == p["answer"]:
             correct += 1
