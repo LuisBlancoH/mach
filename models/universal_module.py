@@ -2,13 +2,14 @@ import torch
 import torch.nn as nn
 
 from models.observation import ObservationProjection
-from models.gru import SimpleGRU
+from models.gru import SimpleGRU, SurpriseGatedGRU
 from models.basis_vectors import BasisVectors
 from models.meta_learner import MetaLearnerTransformer
 from models.action_head import ActionHead
 from models.memory_head import MemoryHead
 from models.reward_projection import RewardProjection
 from models.critic import Critic, CriticSignalProjection
+from models.cerebellum import Cerebellum
 
 
 class DifferentiablePatch(nn.Module):
@@ -322,6 +323,167 @@ class MACHPhase3(nn.Module):
         }
         missing, unexpected = self.load_state_dict(compatible, strict=False)
         print(f"  Loaded Phase 2 checkpoint: {len(compatible)} keys loaded, "
+              f"{len(missing)} missing (new), {len(unexpected)} unexpected")
+        return missing, unexpected
+
+
+class MACHPhase4(MACHPhase3):
+    """
+    Phase 4 universal module: Phase 3 + Cerebellum + Surprise-Gated GRU.
+
+    Changes from Phase 3:
+    - Replaces SimpleGRU with SurpriseGatedGRU
+    - Adds Cerebellum (predictor + correction projection)
+    - observe() computes surprise and correction from cerebellar prediction error
+    - fire() uses accumulated correction at position 2 (was zeros)
+    - Cerebellum predictor has its own optimizer (online supervised)
+    - correction_proj is in meta_params (gets CE loss gradient)
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_meta=128, n_basis=8, detach_obs=True, surprise_scale=2.0):
+        super().__init__(
+            d_model=d_model, n_layers=n_layers, patch_layers=patch_layers,
+            hidden_dim=hidden_dim, d_meta=d_meta, n_basis=n_basis,
+            detach_obs=detach_obs,
+        )
+
+        # Replace SimpleGRU with SurpriseGatedGRU
+        self.gru = SurpriseGatedGRU(d_meta, surprise_scale=surprise_scale)
+
+        # Cerebellum
+        self.cerebellum = Cerebellum(d_meta, hidden_dim=d_meta)
+
+        # State (reset per episode)
+        self._accumulated_correction = None
+        self._last_predicted_obs = None
+        self._cerebellum_losses = []
+        self._surprises = []
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        super().reset_episode()
+        self._accumulated_correction = None
+        self._last_predicted_obs = None
+        self._cerebellum_losses = []
+        self._surprises = []
+
+    def observe(self, base_model, input_ids):
+        """
+        Observation with cerebellar prediction error.
+
+        1. Get hidden state from frozen Qwen + project to d_meta
+        2. Compare to cerebellum's prediction -> surprise, correction
+        3. Train cerebellum predictor (accumulate loss)
+        4. Accumulate correction
+        5. GRU integrate with surprise gating
+        6. Predict next observation
+        """
+        with torch.no_grad():
+            hidden_state = None
+            target_layer = self.patch_layers[len(self.patch_layers) // 2]
+
+            def hook(module, input, output):
+                nonlocal hidden_state
+                if isinstance(output, tuple):
+                    hidden_state = output[0][:, -1, :]
+                else:
+                    hidden_state = output[:, -1, :]
+
+            h = base_model.model.layers[target_layer].register_forward_hook(hook)
+            base_model(input_ids=input_ids)
+            h.remove()
+
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        if self.detach_obs:
+            projected = projected.detach()
+
+        # Cerebellar prediction error
+        surprise = None
+        if self._last_predicted_obs is not None:
+            surprise, correction, pred_loss = self.cerebellum.compute_error(
+                self._last_predicted_obs, projected
+            )
+            self._cerebellum_losses.append(pred_loss)
+            self._surprises.append(surprise.item())
+
+            if self._accumulated_correction is None:
+                self._accumulated_correction = correction
+            else:
+                self._accumulated_correction = (
+                    self._accumulated_correction + correction
+                )
+
+        # GRU integrate with surprise gating
+        gru_memory = self.gru.integrate(projected, surprise=surprise)
+
+        # Predict next observation
+        self._last_predicted_obs = self.cerebellum.predict(gru_memory)
+
+        return gru_memory
+
+    def fire(self, gru_memory, last_value, last_td_error):
+        """
+        Meta-learner firing with accumulated correction at position 2.
+        Resets accumulated correction after use.
+        """
+        critic_token = self.critic_signal_proj(last_value, last_td_error)
+
+        if self._accumulated_correction is not None:
+            correction_token = self._accumulated_correction
+        else:
+            correction_token = torch.zeros(
+                self.d_meta, device=gru_memory.device
+            )
+
+        tokens = torch.stack([
+            gru_memory,                             # 0: world state
+            critic_token,                           # 1: critic signals
+            correction_token,                       # 2: cerebellar correction
+            self._tf_mem,                           # 3: transformer memory
+            self.transformer.think_0_init,          # 4: action
+            self.transformer.think_1_init,          # 5: memory update
+            self.transformer.think_2_init,          # 6: upstream output
+        ])  # (7, d_meta)
+
+        hidden = self.transformer(tokens)  # (7, d_meta)
+        self._last_hidden = hidden
+
+        writes = self.action_head(hidden[4])
+        self._tf_mem = self.memory_head(hidden[5], self._tf_mem)
+
+        # Reset accumulated correction after firing
+        self._accumulated_correction = None
+
+        return writes
+
+    def get_cerebellum_loss(self):
+        """Sum of predictor losses for the cerebellum optimizer."""
+        if not self._cerebellum_losses:
+            return torch.tensor(0.0)
+        return sum(self._cerebellum_losses)
+
+    def get_cerebellum_diagnostics(self):
+        """Cerebellum-specific diagnostics."""
+        diag = {}
+        if self._surprises:
+            diag["avg_surprise"] = sum(self._surprises) / len(self._surprises)
+            diag["max_surprise"] = max(self._surprises)
+            diag["min_surprise"] = min(self._surprises)
+        if self._cerebellum_losses:
+            diag["cerebellum_loss"] = sum(
+                l.item() for l in self._cerebellum_losses
+            ) / len(self._cerebellum_losses)
+        return diag
+
+    def load_phase3_checkpoint(self, checkpoint_path, device='cpu'):
+        """
+        Load Phase 3 checkpoint. GRU cell weights transfer directly.
+        Cerebellum components start fresh.
+        """
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        print(f"  Loaded Phase 3 checkpoint: {len(state_dict)} keys loaded, "
               f"{len(missing)} missing (new), {len(unexpected)} unexpected")
         return missing, unexpected
 
