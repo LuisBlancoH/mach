@@ -1,0 +1,41 @@
+import torch
+
+# Base model
+BASE_MODEL = "Qwen/Qwen2.5-4B"
+DTYPE = torch.float16
+
+# Device auto-detection: cuda > mps > cpu
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
+
+# Universal module dimensions
+D_META = 128
+PATCH_HIDDEN_DIM = 256
+N_BASIS = 8
+N_META_LAYERS = 2
+N_META_HEADS = 2
+META_MLP_DIM = 256
+
+# Write mechanism
+GATE_SCALE = 0.1
+PATCH_INIT_STD = 0.01
+
+# Phase 1
+PHASE1_LR = 1e-4
+PHASE1_EPOCHS = 20
+PHASE1_TRAIN_PROBLEMS = 5000
+PHASE1_TEST_PROBLEMS = 500
+
+# Phase 2
+PHASE2_LR = 3e-4
+PHASE2_EPISODES = 2000
+PHASE2_PROBLEMS_PER_EPISODE = 20
+PHASE2_GRAD_CLIP = 1.0
+
+# Future phases
+MAX_INTERVAL = 16
+MAX_PLANNING_ITERS = 3
