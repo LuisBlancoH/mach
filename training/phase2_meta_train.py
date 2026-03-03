@@ -141,9 +141,110 @@ def meta_train(base_model, mach, patched_model, tokenizer, device,
             if wandb is not None:
                 wandb.log(log_dict)
 
-        # Detailed diagnostics every 100 episodes
+        # Validation + diagnostics every 100 episodes
         if episode_idx % 100 == 0 and episode_idx > 0:
+            _run_validation(base_model, mach, patched_model, tokenizer,
+                            device, difficulty, episode_idx)
             _log_diagnostics(mach, meta_params, episode_idx)
+
+
+def _run_validation(base_model, mach, patched_model, tokenizer, device,
+                    difficulty, episode_idx, n_episodes=5, n_problems=20):
+    """
+    Held-out evaluation: fresh problems, no gradient.
+    Compares base Qwen (no patches) vs meta-learner writes.
+    """
+    from data.arithmetic import generate_arithmetic_problems, extract_number
+
+    base_correct = 0
+    meta_correct_early = 0
+    meta_correct_late = 0
+    meta_total_early = 0
+    meta_total_late = 0
+    base_total = 0
+    all_rewards = []
+
+    for ep in range(n_episodes):
+        problems = generate_arithmetic_problems(n_problems, difficulty)
+        mach.reset_episode()
+
+        rewards = []
+        for i, problem in enumerate(problems):
+            input_ids = tokenizer(
+                problem["prompt"], return_tensors="pt"
+            ).input_ids.to(device)
+
+            # Observe + fire + write (still need forward graph for patches)
+            gru_memory = mach.observe(base_model, input_ids)
+            reward_signals = torch.tensor(
+                [rewards[-1] if rewards else 0.0,
+                 sum(rewards), float(i)],
+                device=device, dtype=torch.float32
+            )
+            writes = mach.fire(gru_memory, reward_signals)
+            mach.apply_writes(writes)
+
+            # Evaluate patched model
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = output.logits if hasattr(output, 'logits') else output[0]
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            reward = 1.0 if correct else -1.0
+            rewards.append(reward)
+
+            if i < 5:
+                meta_correct_early += int(correct)
+                meta_total_early += 1
+            if i >= n_problems - 5:
+                meta_correct_late += int(correct)
+                meta_total_late += 1
+
+        all_rewards.extend(rewards)
+
+        # Baseline: run same problems through base Qwen without patches
+        # (reset patches so they're zero, then restore)
+        mach.reset_episode()  # zeros out all deltas
+        for problem in problems[:10]:  # sample 10 for speed
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = output.logits if hasattr(output, 'logits') else output[0]
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                base_correct += int(predicted == problem["answer"])
+                base_total += 1
+
+    base_acc = base_correct / base_total if base_total > 0 else 0
+    early_acc = meta_correct_early / meta_total_early if meta_total_early > 0 else 0
+    late_acc = meta_correct_late / meta_total_late if meta_total_late > 0 else 0
+    avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0
+    delta = late_acc - early_acc
+
+    print(f"  EVAL ep{episode_idx} d={difficulty} | "
+          f"base={base_acc:.0%} early={early_acc:.0%} late={late_acc:.0%} "
+          f"delta={delta:+.0%} avg_r={avg_reward:.2f}")
+
+    if wandb is not None:
+        wandb.log({
+            "eval/episode": episode_idx,
+            "eval/base_accuracy": base_acc,
+            "eval/early_accuracy": early_acc,
+            "eval/late_accuracy": late_acc,
+            "eval/learning_delta": delta,
+            "eval/avg_reward": avg_reward,
+            "eval/improvement_over_base": late_acc - base_acc,
+        })
 
 
 def _log_diagnostics(mach, meta_params, episode_idx):
