@@ -25,11 +25,6 @@ def evaluate_model(model, tokenizer, problems, max_new_tokens=5, label=None):
         if predicted == p["answer"]:
             correct += 1
 
-        # Debug: print first 3 responses to diagnose parsing
-        if i < 3:
-            print(f"\n    DEBUG: prompt={p['prompt']!r} answer={p['answer']!r} "
-                  f"response={response!r} predicted={predicted!r}")
-
         if (i + 1) % 50 == 0 or (i + 1) == total:
             acc_so_far = correct / (i + 1)
             print(f"\r{prefix} {i+1}/{total}  acc={acc_so_far:.2%}", end="", flush=True)
