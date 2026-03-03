@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-MACH (Meta-learned Adaptive Cognitive Hierarchy) is a ~5M parameter neural network wrapper around a frozen Qwen2.5-4B language model. It gives the frozen LLM the ability to learn new computation from user feedback at inference time by writing into small "cortical patch" MLPs injected into the LLM's residual stream.
+MACH (Meta-learned Adaptive Cognitive Hierarchy) is a ~5M parameter neural network wrapper around a frozen Qwen3-4B language model. It gives the frozen LLM the ability to learn new computation from user feedback at inference time by writing into small "cortical patch" MLPs injected into the LLM's residual stream.
 
 The full design spec is in `mach_v1_implementation_spec_v2.md`.
 
@@ -27,7 +27,14 @@ python scripts/run_phase1.py
 python scripts/run_phase2.py
 ```
 
-Hardware target: NVIDIA A100 (80GB VRAM). Qwen runs in float16; patch parameters use float32.
+Hardware target: NVIDIA A100 (80GB VRAM). Qwen3 runs in bfloat16; patch parameters use float32.
+
+### Qwen3-4B Architecture
+
+- `hidden_size`: 2560, `num_hidden_layers`: 36, `hidden_act`: SiLU
+- Decoder layer forward returns a **single tensor** (not a tuple)
+- Layer access: `model.model.layers[i]` (Qwen3ForCausalLM → Qwen3Model → ModuleList)
+- GQA: 32 attention heads, 8 KV heads, head_dim 128
 
 ## Architecture
 

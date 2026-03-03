@@ -1,8 +1,8 @@
 import torch
 
 # Base model
-BASE_MODEL = "Qwen/Qwen2.5-4B"
-DTYPE = torch.float16
+BASE_MODEL = "Qwen/Qwen3-4B"
+DTYPE = torch.bfloat16
 
 # Device auto-detection: cuda > mps > cpu
 if torch.cuda.is_available():

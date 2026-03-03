@@ -10,7 +10,7 @@ class CorticalPatch(nn.Module):
     def __init__(self, d_model, hidden_dim=256):
         super().__init__()
         self.down = nn.Linear(d_model, hidden_dim, bias=False)
-        self.act = nn.GELU()
+        self.act = nn.SiLU()
         self.up = nn.Linear(hidden_dim, d_model, bias=False)
 
         # Initialize near zero so patches start as identity
