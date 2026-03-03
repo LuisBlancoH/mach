@@ -49,8 +49,8 @@ def generate_arithmetic_problems(n, difficulty):
 
 
 def extract_number(text):
-    """Extract the first integer (possibly negative) from a string."""
-    match = re.search(r"-?\d+", text)
-    if match:
-        return match.group()
+    """Extract the last integer (possibly negative) from a string."""
+    matches = re.findall(r"-?\d+", text)
+    if matches:
+        return matches[-1]
     return None
