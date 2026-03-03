@@ -20,14 +20,19 @@ from training.phase1_direct import train_patches_direct
 
 
 DIFFICULTY_LABELS = {
-    1: "1-digit addition",
-    2: "2-digit addition",
-    3: "3-digit addition",
-    4: "2-digit subtraction",
-    5: "3-digit subtraction",
-    6: "1x1 multiplication",
-    7: "2x1 multiplication",
+    1: "4-digit addition",
+    2: "5-digit addition",
+    3: "4-digit subtraction",
+    4: "5-digit subtraction",
+    5: "2x2 multiplication",
+    6: "3x2 multiplication",
+    7: "3x3 multiplication",
+    8: "4-digit division",
+    9: "mixed hard",
+    10: "6-digit addition",
 }
+
+N_DIFFICULTIES = 10
 
 
 def load_base_model():
@@ -54,7 +59,7 @@ def load_base_model():
 def run_baseline(model, tokenizer):
     print("\n=== Baseline Evaluation ===")
     results = {}
-    for diff in range(1, 8):
+    for diff in range(1, N_DIFFICULTIES + 1):
         print(f"  Difficulty {diff}/7 ({DIFFICULTY_LABELS[diff]}):")
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
         acc = evaluate_model(model, tokenizer, problems, label=f"baseline d{diff}")
@@ -85,7 +90,7 @@ def run_training(model, tokenizer, d_model, n_layers):
     print(f"Trainable patch parameters: {n_patch_params:,}")
 
     # Train on each difficulty level where baseline struggles
-    for diff in range(1, 8):
+    for diff in range(1, N_DIFFICULTIES + 1):
         print(f"\n=== Training on difficulty {diff} ({DIFFICULTY_LABELS[diff]}) ===")
 
         train_problems = generate_arithmetic_problems(config.PHASE1_TRAIN_PROBLEMS, diff)
@@ -100,7 +105,7 @@ def run_training(model, tokenizer, d_model, n_layers):
     # Final evaluation across all difficulties
     print("\n=== Final Patched Evaluation ===")
     patched_results = {}
-    for diff in range(1, 8):
+    for diff in range(1, N_DIFFICULTIES + 1):
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
         acc = evaluate_model(patched_model, tokenizer, problems, label=f"final d{diff}")
         patched_results[diff] = acc
@@ -142,7 +147,7 @@ def main():
     # Print and log comparison
     print("\n=== Baseline vs Patched ===")
     summary = {}
-    for diff in range(1, 8):
+    for diff in range(1, N_DIFFICULTIES + 1):
         base = baseline_results[diff]
         patched = patched_results[diff]
         delta = patched - base

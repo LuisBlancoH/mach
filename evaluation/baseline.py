@@ -19,7 +19,7 @@ class StopOnNonDigit(StoppingCriteria):
         return not last_token.strip().isdigit()
 
 
-def evaluate_model(model, tokenizer, problems, max_new_tokens=5, label=None):
+def evaluate_model(model, tokenizer, problems, max_new_tokens=10, label=None):
     """Evaluate a model on arithmetic problems. Returns accuracy as a float."""
     correct = 0
     total = len(problems)
