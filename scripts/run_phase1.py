@@ -55,10 +55,11 @@ def run_baseline(model, tokenizer):
     print("\n=== Baseline Evaluation ===")
     results = {}
     for diff in range(1, 8):
+        print(f"  Difficulty {diff}/7 ({DIFFICULTY_LABELS[diff]}):")
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
-        acc = evaluate_model(model, tokenizer, problems)
+        acc = evaluate_model(model, tokenizer, problems, label=f"baseline d{diff}")
         results[diff] = acc
-        print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}): {acc:.2%}")
+        print(f"  -> {acc:.2%}")
         wandb.log({f"baseline/diff{diff}_accuracy": acc})
     return results
 
@@ -101,9 +102,9 @@ def run_training(model, tokenizer, d_model, n_layers):
     patched_results = {}
     for diff in range(1, 8):
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
-        acc = evaluate_model(patched_model, tokenizer, problems)
+        acc = evaluate_model(patched_model, tokenizer, problems, label=f"final d{diff}")
         patched_results[diff] = acc
-        print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}): {acc:.2%}")
+        print(f"  -> {acc:.2%}")
         wandb.log({f"final/diff{diff}_accuracy": acc})
 
     return patched_results

@@ -17,7 +17,8 @@ def train_patches_direct(patched_model, tokenizer, train_problems, test_problems
         total_loss = 0.0
         n_problems = 0
 
-        for p in train_problems:
+        n_total = len(train_problems)
+        for i, p in enumerate(train_problems):
             full_text = p["prompt"] + p["answer"]
             encoding = tokenizer(full_text, return_tensors="pt").to(device)
             input_ids = encoding.input_ids
@@ -37,14 +38,20 @@ def train_patches_direct(patched_model, tokenizer, train_problems, test_problems
             n_problems += 1
             global_step += 1
 
+            if (i + 1) % 50 == 0 or (i + 1) == n_total:
+                avg_so_far = total_loss / n_problems
+                print(f"\r  [train d{difficulty} ep{epoch}] {i+1}/{n_total}  loss={avg_so_far:.4f}", end="", flush=True)
+
             if global_step % 100 == 0:
                 wandb.log({
                     f"diff{difficulty}/train_loss_step": loss.item(),
                     "global_step": global_step,
                 })
 
+        print()
+
         avg_loss = total_loss / n_problems
-        accuracy = evaluate_model(patched_model, tokenizer, test_problems)
+        accuracy = evaluate_model(patched_model, tokenizer, test_problems, label=f"d{difficulty} ep{epoch}")
 
         print(f"Epoch {epoch}: avg loss = {avg_loss:.4f}, accuracy = {accuracy:.2%}")
 
