@@ -48,10 +48,31 @@ Each episode contains problems sampled randomly from d5, d6, and d7 (instead of 
 
 **Phase 2b verdict**: Mixed difficulties sustain within-episode learning on d7. The +14% peak at ep600 crosses the strict 10pp threshold. Unlike Phase 2, the delta does not fully collapse — it settled at +8% at ep800. Write mechanism remains strong (+40pp on d7 over base).
 
-## Next Experiment
+## Phase 2b+undetach Results (Observation Path Gradient)
 
-Phase 2b with `--undetach-obs`: allow gradient through obs_proj and GRU so the meta-learner learns WHAT to observe, not just what to write. Currently obs_proj is randomly initialized and never trained — the meta-learner's observation is noise projected through an untrained linear layer.
+Same setup but with `--undetach-obs`: gradient flows through obs_proj and GRU.
 
-```bash
-python scripts/run_phase2b.py --checkpoint checkpoints/phase2_mach.pt --undetach-obs
-```
+| Episode | Difficulty | Base | Early | Late | Delta | 2b Delta (detached) |
+|---------|-----------|------|-------|------|-------|---------------------|
+| 200 | d7 | 6% | 40% | 44% | +4% | +4% |
+| 400 | d7 | 3% | 52% | 44% | -8% | +4% |
+| 600 | d7 | 7% | 44% | 36% | -8% | **+14%** |
+
+**Verdict: undetaching hurts.** d7 delta went negative (-8%) while detached 2b peaked at +14%.
+
+### Why It Failed (Diagnostics at ep600)
+
+Gradient norms with undetach:
+- obs_proj: 0.000134 (barely any signal despite undetaching)
+- gru: 0.000034 (weaker than detached 2b's 0.001)
+- action_head: 0.045, basis: 0.131 (1000x stronger)
+
+The gradient path from loss → action_head → transformer → token[0] → GRU → obs_proj is too deep — the signal vanishes. Worse, the small noisy gradient interferes with the indirect signal the GRU was getting before.
+
+**Conclusion**: The observation path needs a *direct* loss signal, not diluted backprop through the write path. This is exactly what the critic (Phase 3) provides.
+
+## Next Steps
+
+1. **Phase 3**: Critic provides loss directly on transformer hidden states, creating a short gradient path that forces observation-dependent behavior
+2. Phase 3 uses mixed difficulties by default (lesson from 2b)
+3. `--undetach-obs` flag available on Phase 3 if critic provides enough gradient for obs_proj to learn
