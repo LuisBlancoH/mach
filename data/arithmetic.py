@@ -43,14 +43,14 @@ def generate_arithmetic_problems(n, difficulty):
         else:
             raise ValueError(f"Unknown difficulty level: {difficulty}")
 
-        prompt = f"What is {a} {op} {b}? "
+        prompt = f"{a} {op} {b} = "
         problems.append({"prompt": prompt, "answer": str(answer), "a": a, "b": b, "op": op})
     return problems
 
 
 def extract_number(text):
-    """Extract the last integer (possibly negative) from a string."""
-    matches = re.findall(r"-?\d+", text)
-    if matches:
-        return matches[-1]
+    """Extract the first integer (possibly negative) from a string."""
+    match = re.search(r"-?\d+", text)
+    if match:
+        return match.group()
     return None

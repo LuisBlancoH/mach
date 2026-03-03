@@ -5,7 +5,7 @@ import torch
 from data.arithmetic import extract_number
 
 
-def evaluate_model(model, tokenizer, problems, max_new_tokens=10, label=None):
+def evaluate_model(model, tokenizer, problems, max_new_tokens=5, label=None):
     """Evaluate a model on arithmetic problems. Returns accuracy as a float."""
     correct = 0
     total = len(problems)
