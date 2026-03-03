@@ -326,6 +326,135 @@ class MACHPhase3(nn.Module):
         return missing, unexpected
 
 
+class MACHPhase6(MACHPhase3):
+    """
+    Phase 6 universal module: Phase 3 + Planning Loop.
+
+    Overrides fire() to run 1-N transformer iterations per problem.
+    The critic evaluates each iteration's proposal, and only the
+    best-valued one is committed (writes applied). Zero new parameters.
+
+    Gradient flow:
+    - CE loss flows through committed iteration's writes (and any earlier
+      iterations that shaped tf_mem for the committed one).
+    - Critic loss flows through ALL iterations (every proposal should
+      predict value accurately).
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_meta=128, n_basis=8, detach_obs=True, max_planning_iters=3):
+        super().__init__(
+            d_model=d_model, n_layers=n_layers, patch_layers=patch_layers,
+            hidden_dim=hidden_dim, d_meta=d_meta, n_basis=n_basis,
+            detach_obs=detach_obs,
+        )
+        self.max_planning_iters = max_planning_iters
+
+        # Planning diagnostics (not parameters, just tracking)
+        self._iteration_values = []     # all values across iterations (in graph)
+        self._committed_iteration = 0   # which iteration was committed
+        self._committed_writes = None   # writes from committed iteration
+        self._committed_value = None    # value from committed iteration
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        super().reset_episode()
+        self._iteration_values = []
+        self._committed_iteration = 0
+        self._committed_writes = None
+        self._committed_value = None
+
+    def fire(self, gru_memory, last_value, last_td_error):
+        """
+        Planning loop: run transformer up to max_planning_iters times.
+        Each iteration gets fresh think tokens but evolving tf_mem.
+        Commit the iteration with highest critic value.
+
+        gru_memory: (d_meta,) — fixed across iterations
+        last_value: scalar tensor — previous step's critic value
+        last_td_error: scalar tensor — previous step's TD error
+        Returns: writes from the best-valued iteration
+        """
+        critic_token = self.critic_signal_proj(last_value, last_td_error)
+        zero_placeholder = torch.zeros(self.d_meta, device=gru_memory.device)
+
+        iteration_data = []  # (value, writes, hidden) per iteration
+        tf_mem = self._tf_mem  # evolves across iterations
+
+        for iteration in range(self.max_planning_iters):
+            # Fresh think tokens each iteration (new proposal)
+            tokens = torch.stack([
+                gru_memory,                             # world state (fixed)
+                critic_token,                           # critic signals
+                zero_placeholder,                       # cerebellar correction
+                tf_mem,                                 # evolving memory
+                self.transformer.think_0_init,          # fresh action
+                self.transformer.think_1_init,          # fresh memory update
+                self.transformer.think_2_init,          # fresh upstream
+            ])  # (7, d_meta)
+
+            hidden = self.transformer(tokens)  # (7, d_meta)
+
+            # Critic evaluates this proposal
+            value = self.critic(hidden)
+
+            # Action head produces writes from this proposal
+            writes = self.action_head(hidden[4])
+
+            iteration_data.append((value, writes, hidden))
+
+            # Evolve state for next iteration (if not last)
+            if iteration < self.max_planning_iters - 1:
+                # Update tf_mem via memory head (stays in graph)
+                tf_mem = self.memory_head(hidden[5], tf_mem)
+                # Feed critic value back as updated signal
+                # Use current value and approximate td_error from value change
+                td_approx = value.detach() - last_value.detach()
+                critic_token = self.critic_signal_proj(value.detach(), td_approx)
+
+        # Select iteration with highest critic value
+        values = [d[0] for d in iteration_data]
+        best_idx = max(range(len(values)), key=lambda i: values[i].item())
+
+        # Store all iteration values for multi-iteration critic loss
+        self._iteration_values = values
+        self._committed_iteration = best_idx
+        self._committed_writes = iteration_data[best_idx][1]
+        self._committed_value = iteration_data[best_idx][0]
+
+        # Store hidden from committed iteration for get_value()
+        self._last_hidden = iteration_data[best_idx][2]
+
+        # Update tf_mem: last iteration's think_1 updates the evolved memory.
+        # tf_mem chains through all iterations' memory_head calls (gradient flows).
+        self._tf_mem = self.memory_head(iteration_data[-1][2][5], tf_mem)
+
+        return self._committed_writes
+
+    def get_value(self):
+        """Returns committed iteration's value (in graph)."""
+        assert self._committed_value is not None, "Must call fire() before get_value()"
+        return self._committed_value
+
+    def get_all_iteration_values(self):
+        """Returns all iteration values for multi-iteration critic loss."""
+        return self._iteration_values
+
+    def get_committed_iteration(self):
+        """Returns which iteration index was committed."""
+        return self._committed_iteration
+
+    def load_phase3_checkpoint(self, checkpoint_path, device='cpu'):
+        """
+        Load Phase 3 checkpoint directly — identical parameter structure.
+        """
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        print(f"  Loaded Phase 3 checkpoint: {len(state_dict)} keys loaded, "
+              f"{len(missing)} missing (new), {len(unexpected)} unexpected")
+        return missing, unexpected
+
+
 class MACHPatchedModel(nn.Module):
     """Wraps Qwen with MACH differentiable patches hooked into residual stream."""
 
