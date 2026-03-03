@@ -48,7 +48,7 @@ def load_base_model():
     return model, tokenizer, d_model, n_layers
 
 
-def create_mach_phase3(d_model, n_layers):
+def create_mach_phase3(d_model, n_layers, detach_obs=True):
     patch_layers = [
         n_layers // 4,
         n_layers // 2,
@@ -64,6 +64,7 @@ def create_mach_phase3(d_model, n_layers):
         hidden_dim=config.PATCH_HIDDEN_DIM,
         d_meta=config.D_META,
         n_basis=config.N_BASIS,
+        detach_obs=detach_obs,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -215,6 +216,8 @@ def main():
                         help="Phase 2 checkpoint to load")
     parser.add_argument("--from-scratch", action="store_true",
                         help="Train from scratch without loading Phase 2 checkpoint")
+    parser.add_argument("--undetach-obs", action="store_true",
+                        help="Allow gradient through obs_proj and GRU")
     args = parser.parse_args()
 
     if wandb is not None:
@@ -234,7 +237,10 @@ def main():
         )
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
-    mach, patch_layers = create_mach_phase3(d_model, n_layers)
+    detach_obs = not args.undetach_obs
+    if not detach_obs:
+        print("*** Observation path UNDETACHED — gradient flows through obs_proj and GRU ***")
+    mach, patch_layers = create_mach_phase3(d_model, n_layers, detach_obs=detach_obs)
     patched_model = MACHPatchedModel(base_model, mach)
 
     checkpoint = None if args.from_scratch else args.checkpoint

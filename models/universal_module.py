@@ -68,12 +68,13 @@ class MACHPhase2(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_meta=128, n_basis=8):
+                 d_meta=128, n_basis=8, detach_obs=True):
         super().__init__()
         self.d_model = d_model
         self.d_meta = d_meta
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
+        self.detach_obs = detach_obs
 
         # Observation projection (Qwen -> d_meta)
         self.obs_proj = ObservationProjection(d_model, d_meta)
@@ -132,8 +133,10 @@ class MACHPhase2(nn.Module):
             base_model(input_ids=input_ids)
             h.remove()
 
-        # Project and integrate (detached — no gradient through observation)
-        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0).detach()
+        # Project and integrate
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        if self.detach_obs:
+            projected = projected.detach()
         gru_memory = self.gru.integrate(projected)
         return gru_memory
 
@@ -191,12 +194,13 @@ class MACHPhase3(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_meta=128, n_basis=8):
+                 d_meta=128, n_basis=8, detach_obs=True):
         super().__init__()
         self.d_model = d_model
         self.d_meta = d_meta
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
+        self.detach_obs = detach_obs
 
         # Same as Phase 2
         self.obs_proj = ObservationProjection(d_model, d_meta)
@@ -231,7 +235,8 @@ class MACHPhase3(nn.Module):
 
     def observe(self, base_model, input_ids):
         """
-        Identical to Phase 2 — observation is detached.
+        Observation path. Qwen forward is always no_grad (frozen).
+        If detach_obs=False, gradient flows through obs_proj and GRU.
         """
         with torch.no_grad():
             hidden_state = None
@@ -248,7 +253,9 @@ class MACHPhase3(nn.Module):
             base_model(input_ids=input_ids)
             h.remove()
 
-        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0).detach()
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        if self.detach_obs:
+            projected = projected.detach()
         gru_memory = self.gru.integrate(projected)
         return gru_memory
 

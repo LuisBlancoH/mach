@@ -165,6 +165,8 @@ def main():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Load Phase 2 checkpoint to continue training")
+    parser.add_argument("--undetach-obs", action="store_true",
+                        help="Allow gradient through obs_proj and GRU")
     args = parser.parse_args()
 
     if wandb is not None:
@@ -179,6 +181,7 @@ def main():
                 "episodes": args.episodes,
                 "problems_per_episode": 20,
                 "difficulties": [5, 6, 7],
+                "detach_obs": not args.undetach_obs,
                 "device": str(config.DEVICE),
             },
         )
@@ -199,9 +202,13 @@ def main():
     patch_layers = [n_layers // 4, n_layers // 2, 3 * n_layers // 4, n_layers - 2]
     print(f"Patch layers: {patch_layers}")
 
+    detach_obs = not args.undetach_obs
+    if not detach_obs:
+        print("*** Observation path UNDETACHED — gradient flows through obs_proj and GRU ***")
     mach = MACHPhase2(
         d_model=d_model, n_layers=n_layers, patch_layers=patch_layers,
         hidden_dim=config.PATCH_HIDDEN_DIM, d_meta=config.D_META, n_basis=config.N_BASIS,
+        detach_obs=detach_obs,
     ).to(config.DEVICE)
     patched_model = MACHPatchedModel(base_model, mach)
 
