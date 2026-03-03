@@ -141,11 +141,11 @@ def meta_train(base_model, mach, patched_model, tokenizer, device,
             if wandb is not None:
                 wandb.log(log_dict)
 
-        # Validation + diagnostics every 200 episodes
+        # Diagnostics + validation every 200 episodes
         if episode_idx % 200 == 0 and episode_idx > 0:
+            _log_diagnostics(mach, meta_params, episode_idx)
             _run_validation(base_model, mach, patched_model, tokenizer,
                             device, difficulty, episode_idx)
-            _log_diagnostics(mach, meta_params, episode_idx)
 
 
 def _run_validation(base_model, mach, patched_model, tokenizer, device,
