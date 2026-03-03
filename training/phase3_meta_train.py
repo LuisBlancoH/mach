@@ -269,8 +269,8 @@ def meta_train_phase3(base_model, mach, patched_model, tokenizer, device,
             if wandb is not None:
                 wandb.log(log_dict)
 
-        # Diagnostics + validation every 200 episodes
-        if episode_idx % 200 == 0 and episode_idx > 0:
+        # Diagnostics + validation every 200 episodes + final
+        if (episode_idx % 200 == 0 and episode_idx > 0) or episode_idx == n_episodes - 1:
             _log_diagnostics_phase3(mach, meta_params, episode_idx)
             for eval_diff in [5, 6, 7]:
                 _run_validation_phase3(

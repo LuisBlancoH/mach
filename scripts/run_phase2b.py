@@ -150,8 +150,8 @@ def meta_train_mixed(base_model, mach, patched_model, tokenizer, device,
                     log_dict[f"problem_loss/{j}"] = pl
                 wandb.log(log_dict)
 
-        # Validation every 200 episodes
-        if episode_idx % 200 == 0 and episode_idx > 0:
+        # Validation every 200 episodes + final
+        if (episode_idx % 200 == 0 and episode_idx > 0) or episode_idx == n_episodes - 1:
             _log_diagnostics(mach, meta_params, episode_idx)
             # Eval on each difficulty separately
             for eval_diff in [5, 6, 7]:
