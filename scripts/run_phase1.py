@@ -32,7 +32,7 @@ DIFFICULTY_LABELS = {
     10: "6-digit addition",
 }
 
-N_DIFFICULTIES = 10
+TRAIN_DIFFICULTIES = [6, 7, 8, 9]
 
 
 def load_base_model():
@@ -56,11 +56,11 @@ def load_base_model():
     return model, tokenizer, d_model, n_layers
 
 
-def run_baseline(model, tokenizer):
+def run_baseline(model, tokenizer, diffs):
     print("\n=== Baseline Evaluation ===")
     results = {}
-    for diff in range(1, N_DIFFICULTIES + 1):
-        print(f"  Difficulty {diff}/{N_DIFFICULTIES} ({DIFFICULTY_LABELS[diff]}):")
+    for i, diff in enumerate(diffs):
+        print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}) [{i+1}/{len(diffs)}]:")
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
         acc = evaluate_model(model, tokenizer, problems, label=f"baseline d{diff}")
         results[diff] = acc
@@ -89,18 +89,7 @@ def run_training(model, tokenizer, d_model, n_layers, baseline_results):
     n_patch_params = sum(p.numel() for p in patched_model.patches.parameters())
     print(f"Trainable patch parameters: {n_patch_params:,}")
 
-    # Only train on difficulty levels where baseline < 80%
-    train_diffs = [d for d, acc in baseline_results.items() if acc < 0.80]
-    if not train_diffs:
-        print("\nNo difficulty levels below 80% baseline — nothing to train on!")
-        train_diffs = [d for d, acc in sorted(baseline_results.items(), key=lambda x: x[1])][:3]
-        print(f"Falling back to 3 weakest levels: {train_diffs}")
-
-    skip_diffs = [d for d in range(1, N_DIFFICULTIES + 1) if d not in train_diffs]
-    if skip_diffs:
-        print(f"\nSkipping levels with baseline >= 80%: {skip_diffs}")
-
-    for diff in train_diffs:
+    for diff in TRAIN_DIFFICULTIES:
         print(f"\n=== Training on difficulty {diff} ({DIFFICULTY_LABELS[diff]}) "
               f"[baseline: {baseline_results[diff]:.2%}] ===")
 
@@ -113,10 +102,10 @@ def run_training(model, tokenizer, d_model, n_layers, baseline_results):
             epochs=config.PHASE1_EPOCHS, lr=config.PHASE1_LR,
         )
 
-    # Final evaluation across all difficulties
+    # Final evaluation on trained difficulties
     print("\n=== Final Patched Evaluation ===")
     patched_results = {}
-    for diff in range(1, N_DIFFICULTIES + 1):
+    for diff in TRAIN_DIFFICULTIES:
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
         acc = evaluate_model(patched_model, tokenizer, problems, label=f"final d{diff}")
         patched_results[diff] = acc
@@ -147,7 +136,7 @@ def main():
     )
 
     model, tokenizer, d_model, n_layers = load_base_model()
-    baseline_results = run_baseline(model, tokenizer)
+    baseline_results = run_baseline(model, tokenizer, TRAIN_DIFFICULTIES)
 
     if args.baseline_only:
         wandb.finish()
@@ -158,7 +147,7 @@ def main():
     # Print and log comparison
     print("\n=== Baseline vs Patched ===")
     summary = {}
-    for diff in range(1, N_DIFFICULTIES + 1):
+    for diff in TRAIN_DIFFICULTIES:
         base = baseline_results[diff]
         patched = patched_results[diff]
         delta = patched - base
