@@ -55,6 +55,10 @@ class PatchedModel(nn.Module):
                 return output + patch_output.to(output.dtype)
         return hook
 
+    @property
+    def device(self):
+        return self.base_model.device
+
     def forward(self, input_ids, labels=None, attention_mask=None):
         return self.base_model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
 
