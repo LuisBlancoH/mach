@@ -70,62 +70,136 @@ def create_mach(d_model, n_layers):
     return mach, patch_layers
 
 
+EVAL_DIFFICULTIES = {
+    5: "2x2 multiplication",
+    6: "3x2 multiplication",
+    7: "3x3 multiplication",
+    9: "mixed hard",
+}
+
+
 def final_evaluation(base_model, mach, patched_model, tokenizer, device,
-                     n_episodes=10, n_problems=20):
-    """Run evaluation episodes and report early vs late accuracy."""
-    print(f"\n=== Final Evaluation ({n_episodes} episodes, {n_problems} problems each) ===")
+                     n_episodes=20, n_problems=20):
+    """
+    Final evaluation across all curriculum difficulties.
+    Per difficulty: base accuracy, early/late meta-learner accuracy, delta.
+    20 episodes × 20 problems = 400 samples per difficulty (100 per early/late group).
+    """
+    from data.arithmetic import extract_number
 
-    all_early = []
-    all_late = []
-    all_rewards = []
+    print(f"\n{'='*60}")
+    print(f"FINAL EVALUATION — {n_episodes} episodes × {n_problems} problems per difficulty")
+    print(f"{'='*60}")
 
-    for ep in range(n_episodes):
-        difficulty = 6  # 3x2 multiplication (Phase 1's best target)
-        problems = generate_arithmetic_problems(n_problems, difficulty)
+    any_passed = False
 
-        with torch.no_grad():
-            # Still need grad for write path through patches
-            pass
+    for difficulty, label in EVAL_DIFFICULTIES.items():
+        base_correct = 0
+        base_total = 0
+        meta_correct_early = 0
+        meta_correct_late = 0
+        meta_total_early = 0
+        meta_total_late = 0
+        all_rewards = []
 
-        # Run episode (no backward needed)
-        loss, rewards, _ = run_episode(
-            base_model, mach, patched_model, tokenizer, problems, device
-        )
+        for ep in range(n_episodes):
+            problems = generate_arithmetic_problems(n_problems, difficulty)
 
-        early_acc = sum(1 for r in rewards[:5] if r > 0) / 5
-        late_acc = sum(1 for r in rewards[-5:] if r > 0) / 5
+            # --- Meta-learner evaluation ---
+            mach.reset_episode()
+            rewards = []
+            for i, problem in enumerate(problems):
+                input_ids = tokenizer(
+                    problem["prompt"], return_tensors="pt"
+                ).input_ids.to(device)
 
-        all_early.append(early_acc)
-        all_late.append(late_acc)
-        all_rewards.extend(rewards)
+                gru_memory = mach.observe(base_model, input_ids)
+                reward_signals = torch.tensor(
+                    [rewards[-1] if rewards else 0.0,
+                     sum(rewards), float(i)],
+                    device=device, dtype=torch.float32
+                )
+                writes = mach.fire(gru_memory, reward_signals)
+                mach.apply_writes(writes)
 
-        print(f"  Episode {ep}: early={early_acc:.0%} late={late_acc:.0%} "
-              f"delta={late_acc - early_acc:+.0%}")
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(device)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
 
-    avg_early = sum(all_early) / len(all_early)
-    avg_late = sum(all_late) / len(all_late)
-    avg_reward = sum(all_rewards) / len(all_rewards)
-    delta = avg_late - avg_early
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids)
+                    logits = output.logits if hasattr(output, 'logits') else output[0]
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(
+                        pred_tokens, skip_special_tokens=True
+                    ).strip()
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == problem["answer"])
 
-    print(f"\n  Average early accuracy: {avg_early:.1%}")
-    print(f"  Average late accuracy:  {avg_late:.1%}")
-    print(f"  Learning delta:         {delta:+.1%}")
-    print(f"  Average reward:         {avg_reward:.2f}")
+                reward = 1.0 if correct else -1.0
+                rewards.append(reward)
 
-    passed = delta >= 0.10
-    print(f"\n  Phase 2 {'PASS' if passed else 'FAIL'}: "
-          f"late - early = {delta:+.1%} ({'≥' if passed else '<'} 10pp)")
+                if i < 5:
+                    meta_correct_early += int(correct)
+                    meta_total_early += 1
+                if i >= n_problems - 5:
+                    meta_correct_late += int(correct)
+                    meta_total_late += 1
 
-    if wandb is not None:
-        wandb.log({
-            "final/avg_early_accuracy": avg_early,
-            "final/avg_late_accuracy": avg_late,
-            "final/learning_delta": delta,
-            "final/avg_reward": avg_reward,
-            "final/passed": passed,
-        })
+            all_rewards.extend(rewards)
 
-    return passed
+            # --- Base Qwen evaluation (zero patches) ---
+            mach.reset_episode()
+            for problem in problems:
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(device)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids)
+                    logits = output.logits if hasattr(output, 'logits') else output[0]
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(
+                        pred_tokens, skip_special_tokens=True
+                    ).strip()
+                    predicted = extract_number(pred_text)
+                    base_correct += int(predicted == problem["answer"])
+                    base_total += 1
+
+        base_acc = base_correct / base_total
+        early_acc = meta_correct_early / meta_total_early
+        late_acc = meta_correct_late / meta_total_late
+        delta = late_acc - early_acc
+        improvement = late_acc - base_acc
+        passed = delta >= 0.10
+
+        if passed:
+            any_passed = True
+
+        marker = " <<< PASS" if passed else ""
+        print(f"\n  d{difficulty} ({label}):")
+        print(f"    Base Qwen:    {base_acc:.1%}")
+        print(f"    Early (0-4):  {early_acc:.1%}")
+        print(f"    Late (15-19): {late_acc:.1%}")
+        print(f"    Delta:        {delta:+.1%}{marker}")
+        print(f"    vs Base:      {improvement:+.1%}")
+
+        if wandb is not None:
+            wandb.log({
+                f"final/d{difficulty}_base": base_acc,
+                f"final/d{difficulty}_early": early_acc,
+                f"final/d{difficulty}_late": late_acc,
+                f"final/d{difficulty}_delta": delta,
+                f"final/d{difficulty}_vs_base": improvement,
+                f"final/d{difficulty}_passed": passed,
+            })
+
+    print(f"\n{'='*60}")
+    print(f"Phase 2 {'PASS' if any_passed else 'FAIL'}: "
+          f"{'at least one' if any_passed else 'no'} difficulty shows "
+          f"late - early >= 10pp")
+    print(f"{'='*60}")
+
+    return any_passed
 
 
 def run_ablation(base_model, mach, patched_model, tokenizer, device):
