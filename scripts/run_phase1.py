@@ -60,7 +60,7 @@ def run_baseline(model, tokenizer):
     print("\n=== Baseline Evaluation ===")
     results = {}
     for diff in range(1, N_DIFFICULTIES + 1):
-        print(f"  Difficulty {diff}/7 ({DIFFICULTY_LABELS[diff]}):")
+        print(f"  Difficulty {diff}/{N_DIFFICULTIES} ({DIFFICULTY_LABELS[diff]}):")
         problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
         acc = evaluate_model(model, tokenizer, problems, label=f"baseline d{diff}")
         results[diff] = acc
@@ -69,7 +69,7 @@ def run_baseline(model, tokenizer):
     return results
 
 
-def run_training(model, tokenizer, d_model, n_layers):
+def run_training(model, tokenizer, d_model, n_layers, baseline_results):
     # Determine patch layers (quarter points)
     patch_layers = [
         n_layers // 4,
@@ -89,9 +89,20 @@ def run_training(model, tokenizer, d_model, n_layers):
     n_patch_params = sum(p.numel() for p in patched_model.patches.parameters())
     print(f"Trainable patch parameters: {n_patch_params:,}")
 
-    # Train on each difficulty level where baseline struggles
-    for diff in range(1, N_DIFFICULTIES + 1):
-        print(f"\n=== Training on difficulty {diff} ({DIFFICULTY_LABELS[diff]}) ===")
+    # Only train on difficulty levels where baseline < 80%
+    train_diffs = [d for d, acc in baseline_results.items() if acc < 0.80]
+    if not train_diffs:
+        print("\nNo difficulty levels below 80% baseline — nothing to train on!")
+        train_diffs = [d for d, acc in sorted(baseline_results.items(), key=lambda x: x[1])][:3]
+        print(f"Falling back to 3 weakest levels: {train_diffs}")
+
+    skip_diffs = [d for d in range(1, N_DIFFICULTIES + 1) if d not in train_diffs]
+    if skip_diffs:
+        print(f"\nSkipping levels with baseline >= 80%: {skip_diffs}")
+
+    for diff in train_diffs:
+        print(f"\n=== Training on difficulty {diff} ({DIFFICULTY_LABELS[diff]}) "
+              f"[baseline: {baseline_results[diff]:.2%}] ===")
 
         train_problems = generate_arithmetic_problems(config.PHASE1_TRAIN_PROBLEMS, diff)
         test_problems = generate_arithmetic_problems(config.PHASE1_TEST_PROBLEMS, diff)
@@ -142,7 +153,7 @@ def main():
         wandb.finish()
         return
 
-    patched_results = run_training(model, tokenizer, d_model, n_layers)
+    patched_results = run_training(model, tokenizer, d_model, n_layers, baseline_results)
 
     # Print and log comparison
     print("\n=== Baseline vs Patched ===")
