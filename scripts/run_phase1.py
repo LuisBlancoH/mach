@@ -9,6 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import wandb
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import config
@@ -58,6 +59,7 @@ def run_baseline(model, tokenizer):
         acc = evaluate_model(model, tokenizer, problems)
         results[diff] = acc
         print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}): {acc:.2%}")
+        wandb.log({f"baseline/diff{diff}_accuracy": acc})
     return results
 
 
@@ -90,7 +92,8 @@ def run_training(model, tokenizer, d_model, n_layers):
 
         train_patches_direct(
             patched_model, tokenizer, train_problems, test_problems,
-            device=config.DEVICE, epochs=config.PHASE1_EPOCHS, lr=config.PHASE1_LR,
+            device=config.DEVICE, difficulty=diff,
+            epochs=config.PHASE1_EPOCHS, lr=config.PHASE1_LR,
         )
 
     # Final evaluation across all difficulties
@@ -101,6 +104,7 @@ def run_training(model, tokenizer, d_model, n_layers):
         acc = evaluate_model(patched_model, tokenizer, problems)
         patched_results[diff] = acc
         print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}): {acc:.2%}")
+        wandb.log({f"final/diff{diff}_accuracy": acc})
 
     return patched_results
 
@@ -111,16 +115,32 @@ def main():
                         help="Only run baseline evaluation, no training")
     args = parser.parse_args()
 
+    wandb.init(
+        project="mach",
+        name="phase1-baseline" if args.baseline_only else "phase1-patch-training",
+        config={
+            "base_model": config.BASE_MODEL,
+            "patch_hidden_dim": config.PATCH_HIDDEN_DIM,
+            "lr": config.PHASE1_LR,
+            "epochs": config.PHASE1_EPOCHS,
+            "train_problems": config.PHASE1_TRAIN_PROBLEMS,
+            "test_problems": config.PHASE1_TEST_PROBLEMS,
+            "device": str(config.DEVICE),
+        },
+    )
+
     model, tokenizer, d_model, n_layers = load_base_model()
     baseline_results = run_baseline(model, tokenizer)
 
     if args.baseline_only:
+        wandb.finish()
         return
 
     patched_results = run_training(model, tokenizer, d_model, n_layers)
 
-    # Print comparison
+    # Print and log comparison
     print("\n=== Baseline vs Patched ===")
+    summary = {}
     for diff in range(1, 8):
         base = baseline_results[diff]
         patched = patched_results[diff]
@@ -128,6 +148,9 @@ def main():
         marker = " <<<" if delta > 0.10 else ""
         print(f"  Difficulty {diff} ({DIFFICULTY_LABELS[diff]}): "
               f"{base:.2%} -> {patched:.2%} (delta: {delta:+.2%}){marker}")
+        summary[f"delta/diff{diff}"] = delta
+    wandb.log(summary)
+    wandb.finish()
 
 
 if __name__ == "__main__":
