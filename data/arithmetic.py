@@ -74,24 +74,28 @@ def extract_number(text):
 
 
 def _make_operands(op_type):
-    """Generate operands and answer for a given operation type."""
+    """
+    Generate operands with UNIFORM ranges across all operations.
+
+    All ops use a, b in [10, 99] with a >= b. The test prompt
+    "a ? b = " is indistinguishable across operations — the model
+    MUST read demos to determine which operation to apply.
+
+    Division uses integer floor division (a // b), giving answers 1-9.
+    """
+    a = random.randint(10, 99)
+    b = random.randint(10, 99)
+    if b > a:
+        a, b = b, a
+
     if op_type == "add":
-        a = random.randint(100, 9999)
-        b = random.randint(100, 9999)
         return a, b, a + b
     elif op_type == "sub":
-        a = random.randint(100, 9999)
-        b = random.randint(100, a)
         return a, b, a - b
     elif op_type == "mul":
-        a = random.randint(10, 99)
-        b = random.randint(10, 99)
         return a, b, a * b
     elif op_type == "div":
-        b = random.randint(2, 99)
-        answer = random.randint(10, 999)
-        a = b * answer
-        return a, b, answer
+        return a, b, a // b
     else:
         raise ValueError(f"Unknown op_type: {op_type}")
 
