@@ -40,7 +40,7 @@ def generate_episode_problems(n_problems, mode):
 
 
 def run_episode_phase2_fewshot(base_model, mach, patched_model, tokenizer,
-                                problems, device):
+                                problems, device, no_rewards=False):
     """
     Phase 2 episode with few-shot demo handling.
     Plain CE loss. No critic, no value estimates.
@@ -59,14 +59,17 @@ def run_episode_phase2_fewshot(base_model, mach, patched_model, tokenizer,
             problem["prompt"], return_tensors="pt"
         ).input_ids.to(device)
 
-        # Step 1: Observe (detached)
+        # Step 1: Observe
         gru_memory = mach.observe(base_model, input_ids)
 
         # Step 2: Fire meta-learner (Phase 2 reward signals)
-        reward_signals = torch.tensor(
-            [last_reward, cumulative_reward, float(i)],
-            device=device, dtype=torch.float32
-        )
+        if no_rewards:
+            reward_signals = torch.zeros(3, device=device, dtype=torch.float32)
+        else:
+            reward_signals = torch.tensor(
+                [last_reward, cumulative_reward, float(i)],
+                device=device, dtype=torch.float32
+            )
         writes = mach.fire(gru_memory, reward_signals)
 
         # Step 3: Apply writes
@@ -105,8 +108,9 @@ def run_episode_phase2_fewshot(base_model, mach, patched_model, tokenizer,
         # Step 6: Plain CE loss
         qwen_loss = qwen_loss + output.loss
 
-        last_reward = reward
-        cumulative_reward += reward
+        if not no_rewards:
+            last_reward = reward
+            cumulative_reward += reward
 
     return qwen_loss, rewards, problem_losses
 
@@ -114,7 +118,7 @@ def run_episode_phase2_fewshot(base_model, mach, patched_model, tokenizer,
 def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                                device, n_episodes=None, lr=None,
                                curriculum=None, checkpoint_path=None,
-                               save_path=None):
+                               save_path=None, no_rewards=False):
     """Phase 2 ablation: few-shot task with Phase 2 architecture (no critic)."""
     if n_episodes is None:
         n_episodes = config.PHASE2_EPISODES
@@ -141,6 +145,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
 
     n_meta = sum(p.numel() for p in meta_params)
     print(f"Phase 2 (fewshot ablation) trainable parameters: {n_meta:,}")
+    print(f"No rewards: {no_rewards}")
 
     def get_n_problems(episode_idx):
         if episode_idx < 100:
@@ -162,7 +167,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
         try:
             loss, rewards, problem_losses = run_episode_phase2_fewshot(
                 base_model, mach, patched_model, tokenizer,
-                problems, device
+                problems, device, no_rewards=no_rewards
             )
             loss.backward()
             loss_scalar = loss.item()
@@ -175,7 +180,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
             problems = problems[:max(5, n_problems // 2)]
             loss, rewards, problem_losses = run_episode_phase2_fewshot(
                 base_model, mach, patched_model, tokenizer,
-                problems, device
+                problems, device, no_rewards=no_rewards
             )
             loss.backward()
             loss_scalar = loss.item()
@@ -249,13 +254,15 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                 for op in ["add", "sub", "mul", "div"]:
                     _run_few_shot_validation(
                         base_model, mach, patched_model, tokenizer,
-                        device, op, episode_idx
+                        device, op, episode_idx,
+                        no_rewards=no_rewards,
                     )
             else:
                 for eval_diff in [6, 7]:
                     _run_standard_validation(
                         base_model, mach, patched_model, tokenizer,
-                        device, eval_diff, episode_idx
+                        device, eval_diff, episode_idx,
+                        no_rewards=no_rewards,
                     )
 
             if save_path is not None:
@@ -267,7 +274,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
 
 def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
                               device, op_type, episode_idx, n_episodes=10,
-                              n_problems=20, n_demos=5):
+                              n_problems=20, n_demos=5, no_rewards=False):
     """Evaluate few-shot performance for a specific operation."""
     test_correct = 0
     test_total = 0
@@ -292,10 +299,15 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
             ).input_ids.to(device)
 
             gru_memory = mach.observe(base_model, input_ids)
-            reward_signals = torch.tensor(
-                [last_reward, cumulative_reward, float(i)],
-                device=device, dtype=torch.float32
-            )
+            if no_rewards:
+                reward_signals = torch.zeros(
+                    3, device=device, dtype=torch.float32
+                )
+            else:
+                reward_signals = torch.tensor(
+                    [last_reward, cumulative_reward, float(i)],
+                    device=device, dtype=torch.float32
+                )
             writes = mach.fire(gru_memory, reward_signals)
             mach.apply_writes(writes)
 
@@ -330,8 +342,9 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
             test_idx += 1
 
             reward = 1.0 if correct else -1.0
-            last_reward = reward
-            cumulative_reward += reward
+            if not no_rewards:
+                last_reward = reward
+                cumulative_reward += reward
 
     test_acc = test_correct / test_total if test_total > 0 else 0
     early_acc = (
@@ -359,7 +372,7 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
 
 def _run_standard_validation(base_model, mach, patched_model, tokenizer,
                               device, difficulty, episode_idx, n_episodes=10,
-                              n_problems=20):
+                              n_problems=20, no_rewards=False):
     """Standard per-difficulty eval (for warmup phase)."""
     meta_correct_early = 0
     meta_correct_late = 0
@@ -378,10 +391,15 @@ def _run_standard_validation(base_model, mach, patched_model, tokenizer,
             ).input_ids.to(device)
 
             gru_memory = mach.observe(base_model, input_ids)
-            reward_signals = torch.tensor(
-                [last_reward, cumulative_reward, float(i)],
-                device=device, dtype=torch.float32
-            )
+            if no_rewards:
+                reward_signals = torch.zeros(
+                    3, device=device, dtype=torch.float32
+                )
+            else:
+                reward_signals = torch.tensor(
+                    [last_reward, cumulative_reward, float(i)],
+                    device=device, dtype=torch.float32
+                )
             writes = mach.fire(gru_memory, reward_signals)
             mach.apply_writes(writes)
 
@@ -402,8 +420,9 @@ def _run_standard_validation(base_model, mach, patched_model, tokenizer,
                 correct = (predicted == problem["answer"])
 
             reward = 1.0 if correct else -1.0
-            last_reward = reward
-            cumulative_reward += reward
+            if not no_rewards:
+                last_reward = reward
+                cumulative_reward += reward
 
             if i < 5:
                 meta_correct_early += int(correct)

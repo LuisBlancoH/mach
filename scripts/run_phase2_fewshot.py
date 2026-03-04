@@ -75,7 +75,8 @@ def create_mach_phase2(d_model, n_layers, detach_obs=True):
 
 
 def final_evaluation(base_model, mach, patched_model, tokenizer, device,
-                     n_episodes=20, n_problems=20, n_demos=5):
+                     n_episodes=20, n_problems=20, n_demos=5,
+                     no_rewards=False):
     """Few-shot evaluation per operation."""
     print(f"\n{'='*60}")
     print(f"FINAL FEW-SHOT EVALUATION (Phase 2 ablation)")
@@ -109,10 +110,15 @@ def final_evaluation(base_model, mach, patched_model, tokenizer, device,
                 ).input_ids.to(device)
 
                 gru_memory = mach.observe(base_model, input_ids)
-                reward_signals = torch.tensor(
-                    [last_reward, cumulative_reward, float(i)],
-                    device=device, dtype=torch.float32
-                )
+                if no_rewards:
+                    reward_signals = torch.zeros(
+                        3, device=device, dtype=torch.float32
+                    )
+                else:
+                    reward_signals = torch.tensor(
+                        [last_reward, cumulative_reward, float(i)],
+                        device=device, dtype=torch.float32
+                    )
                 writes = mach.fire(gru_memory, reward_signals)
                 mach.apply_writes(writes)
 
@@ -152,8 +158,9 @@ def final_evaluation(base_model, mach, patched_model, tokenizer, device,
                 test_idx += 1
 
                 reward = 1.0 if correct else -1.0
-                last_reward = reward
-                cumulative_reward += reward
+                if not no_rewards:
+                    last_reward = reward
+                    cumulative_reward += reward
 
         test_acc = test_correct / test_total if test_total > 0 else 0
         early_acc = (
@@ -211,12 +218,18 @@ def main():
         "--undetach-obs", action="store_true",
         help="Allow gradient through obs_proj and GRU"
     )
+    parser.add_argument(
+        "--no-rewards", action="store_true",
+        help="Zero out reward signals — force model to use observations only"
+    )
     args = parser.parse_args()
 
     detach_obs = not args.undetach_obs
     run_name = "ablation-phase2-fewshot"
     if args.undetach_obs:
         run_name += "-undetach"
+    if args.no_rewards:
+        run_name += "-noreward"
 
     if wandb is not None:
         wandb.init(
@@ -233,6 +246,7 @@ def main():
                 "ablation": True,
                 "from_scratch": args.from_scratch,
                 "detach_obs": detach_obs,
+                "no_rewards": args.no_rewards,
                 "device": str(config.DEVICE),
             },
         )
@@ -250,10 +264,12 @@ def main():
         n_episodes=args.episodes, lr=args.lr,
         checkpoint_path=checkpoint,
         save_path=save_path,
+        no_rewards=args.no_rewards,
     )
 
     passed = final_evaluation(
-        base_model, mach, patched_model, tokenizer, config.DEVICE
+        base_model, mach, patched_model, tokenizer, config.DEVICE,
+        no_rewards=args.no_rewards,
     )
 
     torch.save(mach.state_dict(), save_path)
