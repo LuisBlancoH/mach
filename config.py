@@ -54,6 +54,7 @@ PHASE4_GAMMA = 0.5
 PHASE4_CEREBELLUM_LR = 1e-3
 PHASE4_SURPRISE_SCALE = 2.0
 PHASE4_TD_MODULATION = 0.5    # CE loss weighted by |reward - V(s)|; dopamine-like
+PHASE4_RECENCY_ALPHA = 1.0    # Progressive weighting: problem 0 → 1.0, last → 2.0
 
 # Phase 6
 PHASE6_LR = 1e-4

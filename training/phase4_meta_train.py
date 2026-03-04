@@ -53,6 +53,7 @@ def run_episode_phase4(base_model, mach, patched_model, tokenizer,
         gamma = config.PHASE4_GAMMA
     critic_loss_weight = config.PHASE4_CRITIC_LOSS_WEIGHT
     td_modulation = config.PHASE4_TD_MODULATION
+    recency_alpha = config.PHASE4_RECENCY_ALPHA
 
     mach.reset_episode()
 
@@ -107,12 +108,13 @@ def run_episode_phase4(base_model, mach, patched_model, tokenizer,
         rewards.append(reward)
         problem_losses.append(output.loss.item())
 
-        # Step 7: Accumulate Qwen CE loss, modulated by TD error
-        # Dopamine analogy: unexpected outcomes (|reward - V(s)|) get more
-        # gradient pressure. Expected outcomes get less.
+        # Step 7: Accumulate Qwen CE loss with two modulations:
+        # 1. TD modulation (dopamine): unexpected outcomes get more gradient
+        # 2. Recency weighting: later problems matter more (eligibility trace)
         advantage = reward - current_value.detach().item()
-        weight = 1.0 + td_modulation * abs(advantage)
-        qwen_loss = qwen_loss + weight * output.loss
+        td_weight = 1.0 + td_modulation * abs(advantage)
+        recency_weight = 1.0 + recency_alpha * (i / max(len(problems) - 1, 1))
+        qwen_loss = qwen_loss + td_weight * recency_weight * output.loss
 
         # Step 8: TD error and critic loss for PREVIOUS step
         # gamma=0: td_target = last_reward (no bootstrap)
