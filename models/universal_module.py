@@ -866,13 +866,14 @@ class MACHPhase5(nn.Module):
                 return hidden_state
 
     def _project_hidden(self, hidden):
-        """Project extracted hidden states to d_obs."""
+        """Project extracted hidden states to d_obs. Returns (d_obs,) 1D."""
         if self.multi_layer_obs:
             layer_obs = []
             for i, layer_idx in enumerate(self.patch_layers):
                 proj = self.layer_projs[i](hidden[layer_idx].float())
                 layer_obs.append(proj)
-            return torch.cat(layer_obs, dim=-1)  # (d_obs,)
+            projected = torch.cat(layer_obs, dim=-1)  # (batch, d_obs)
+            return projected.squeeze(0)  # (d_obs,)
         else:
             return self.obs_proj(hidden.float().unsqueeze(1)).squeeze(0)
 
