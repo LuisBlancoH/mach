@@ -41,7 +41,9 @@ def load_base_model():
     return model, tokenizer, d_model, n_layers
 
 
-def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0):
+def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0, d_task=None):
+    if d_task is None:
+        d_task = config.PHASE5_D_TASK
     patch_layers = [
         n_layers // 4,
         n_layers // 2,
@@ -50,7 +52,7 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0):
     ]
     print(f"Patch layers: {patch_layers}")
     print(f"d_obs={config.PHASE5_D_OBS}, d_gru={config.PHASE5_D_GRU}, "
-          f"d_task={config.PHASE5_D_TASK}, "
+          f"d_task={d_task}, "
           f"deliberation_steps={n_deliberation_steps}")
 
     mach = MACHPhase5(
@@ -60,7 +62,7 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0):
         hidden_dim=config.PATCH_HIDDEN_DIM,
         d_obs=config.PHASE5_D_OBS,
         d_gru=config.PHASE5_D_GRU,
-        d_task=config.PHASE5_D_TASK,
+        d_task=d_task,
         n_basis=config.N_BASIS,
         n_deliberation_steps=n_deliberation_steps,
     ).to(config.DEVICE)
@@ -91,6 +93,10 @@ def main():
         "--deliberation-steps", type=int, default=None,
         help="Number of deliberation steps (0=none, 3+=iterative refinement)"
     )
+    parser.add_argument(
+        "--d-task", type=int, default=None,
+        help="Task state dimensionality (default: 32, try 4-8 to force composition)"
+    )
     args = parser.parse_args()
 
     curriculum = LINEAR_CURRICULUM if args.task == "linear" else DEFAULT_CURRICULUM
@@ -120,10 +126,13 @@ def main():
         else config.PHASE5_N_DELIBERATION_STEPS
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
-    mach, patch_layers = create_mach_phase5(d_model, n_layers, n_delib)
+    mach, patch_layers = create_mach_phase5(
+        d_model, n_layers, n_delib, d_task=args.d_task
+    )
     patched_model = MACHPatchedModel(base_model, mach)
 
-    save_path = f"checkpoints/phase5_{args.task}.pt"
+    d_task_actual = args.d_task or config.PHASE5_D_TASK
+    save_path = f"checkpoints/phase5_{args.task}_d{d_task_actual}.pt"
     os.makedirs("checkpoints", exist_ok=True)
 
     meta_train_phase5(
