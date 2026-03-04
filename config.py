@@ -78,6 +78,7 @@ PHASE5_DECORR_BETA = 0.01        # lateral inhibition: decorrelation loss weight
 PHASE5_TASK_NOISE = 0.0          # forgetting: noise std on task state (0 = off)
 PHASE5_ENERGY_BETA = 0.0         # free energy: unified metabolic cost (0 = use separate losses)
 PHASE5_N_SELF_EVAL_STEPS = 0    # self-evaluation: observe own output on demos (0 = off)
+PHASE5_MULTI_LAYER_OBS = False  # observe all 4 patch layers (vs just middle)
 
 # Future phases
 MAX_INTERVAL = 16

@@ -43,7 +43,7 @@ def load_base_model():
 
 
 def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
-                       d_task=None, task_noise=0.0):
+                       d_task=None, task_noise=0.0, multi_layer_obs=False):
     if d_task is None:
         d_task = config.PHASE5_D_TASK
     patch_layers = [
@@ -56,7 +56,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
     print(f"d_obs={config.PHASE5_D_OBS}, d_gru={config.PHASE5_D_GRU}, "
           f"d_task={d_task}, "
           f"deliberation_steps={n_deliberation_steps}, "
-          f"task_noise={task_noise}")
+          f"task_noise={task_noise}, "
+          f"multi_layer_obs={multi_layer_obs}")
 
     mach = MACHPhase5(
         d_model=d_model,
@@ -69,6 +70,7 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         n_basis=config.N_BASIS,
         n_deliberation_steps=n_deliberation_steps,
         task_noise=task_noise,
+        multi_layer_obs=multi_layer_obs,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -118,6 +120,10 @@ def main():
         "--self-eval-steps", type=int, default=None,
         help="Self-evaluation rounds: observe own patched output on demos"
     )
+    parser.add_argument(
+        "--multi-layer-obs", action="store_true",
+        help="Observe all 4 patch layers instead of just the middle one"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -148,6 +154,7 @@ def main():
                 "deliberation_steps": args.deliberation_steps or config.PHASE5_N_DELIBERATION_STEPS,
                 "task_noise": args.task_noise or config.PHASE5_TASK_NOISE,
                 "energy_beta": args.energy_beta or config.PHASE5_ENERGY_BETA,
+                "multi_layer_obs": args.multi_layer_obs,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -158,9 +165,12 @@ def main():
     task_noise = args.task_noise if args.task_noise is not None \
         else config.PHASE5_TASK_NOISE
 
+    multi_layer_obs = args.multi_layer_obs or config.PHASE5_MULTI_LAYER_OBS
+
     base_model, tokenizer, d_model, n_layers = load_base_model()
     mach, patch_layers = create_mach_phase5(
-        d_model, n_layers, n_delib, d_task=args.d_task, task_noise=task_noise
+        d_model, n_layers, n_delib, d_task=args.d_task, task_noise=task_noise,
+        multi_layer_obs=multi_layer_obs,
     )
     patched_model = MACHPatchedModel(base_model, mach)
 

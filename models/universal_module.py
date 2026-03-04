@@ -767,7 +767,8 @@ class MACHPhase5(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  d_obs=64, d_gru=64, d_task=32, n_basis=8,
-                 n_deliberation_steps=0, task_noise=0.0):
+                 n_deliberation_steps=0, task_noise=0.0,
+                 multi_layer_obs=False):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -777,9 +778,19 @@ class MACHPhase5(nn.Module):
         self.patch_layers = patch_layers
         self.n_deliberation_steps = n_deliberation_steps
         self.task_noise = task_noise  # noise std on task state (forgetting)
+        self.multi_layer_obs = multi_layer_obs
 
         # Sensory cortex: project Qwen hidden states
-        self.obs_proj = ObservationProjection(d_model, d_obs)
+        if multi_layer_obs:
+            # Multi-layer: each patch layer gets its own projection
+            # Like distinct sensory areas (V1, V4, IT, PFC)
+            d_per_layer = d_obs // len(patch_layers)
+            self.layer_projs = nn.ModuleList([
+                nn.Linear(d_model, d_per_layer, bias=False)
+                for _ in patch_layers
+            ])
+        else:
+            self.obs_proj = ObservationProjection(d_model, d_obs)
 
         # Hippocampus: episodic sequential memory
         self.gru = SimpleGRU(d_obs)
@@ -814,27 +825,66 @@ class MACHPhase5(nn.Module):
             self.d_task, device=next(self.parameters()).device
         )
 
+    def _extract_hidden_states(self, model_layers, input_ids, run_model):
+        """
+        Extract hidden states from Qwen layers (frozen forward pass).
+        Returns dict of {layer_idx: hidden_state} if multi_layer_obs,
+        or single hidden_state tensor if not.
+        """
+        with torch.no_grad():
+            if self.multi_layer_obs:
+                hidden_states = {}
+                hooks = []
+                for layer_idx in self.patch_layers:
+                    def make_hook(idx):
+                        def hook(module, input, output):
+                            t = output[0] if isinstance(output, tuple) else output
+                            hidden_states[idx] = t[:, -1, :]
+                        return hook
+                    h = model_layers[layer_idx].register_forward_hook(
+                        make_hook(layer_idx)
+                    )
+                    hooks.append(h)
+                run_model(input_ids=input_ids)
+                for h in hooks:
+                    h.remove()
+                return hidden_states
+            else:
+                hidden_state = None
+                target_layer = self.patch_layers[len(self.patch_layers) // 2]
+
+                def hook(module, input, output):
+                    nonlocal hidden_state
+                    if isinstance(output, tuple):
+                        hidden_state = output[0][:, -1, :]
+                    else:
+                        hidden_state = output[:, -1, :]
+
+                h = model_layers[target_layer].register_forward_hook(hook)
+                run_model(input_ids=input_ids)
+                h.remove()
+                return hidden_state
+
+    def _project_hidden(self, hidden):
+        """Project extracted hidden states to d_obs."""
+        if self.multi_layer_obs:
+            layer_obs = []
+            for i, layer_idx in enumerate(self.patch_layers):
+                proj = self.layer_projs[i](hidden[layer_idx].float())
+                layer_obs.append(proj)
+            return torch.cat(layer_obs, dim=-1)  # (d_obs,)
+        else:
+            return self.obs_proj(hidden.float().unsqueeze(1)).squeeze(0)
+
     def observe(self, base_model, input_ids):
         """
         Sensory processing: Qwen forward (frozen) -> project -> GRU.
-        Gradient flows through obs_proj and GRU (always undetached).
+        Gradient flows through obs_proj/layer_projs and GRU (always undetached).
         """
-        with torch.no_grad():
-            hidden_state = None
-            target_layer = self.patch_layers[len(self.patch_layers) // 2]
-
-            def hook(module, input, output):
-                nonlocal hidden_state
-                if isinstance(output, tuple):
-                    hidden_state = output[0][:, -1, :]
-                else:
-                    hidden_state = output[:, -1, :]
-
-            h = base_model.model.layers[target_layer].register_forward_hook(hook)
-            base_model(input_ids=input_ids)
-            h.remove()
-
-        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        hidden = self._extract_hidden_states(
+            base_model.model.layers, input_ids, base_model
+        )
+        projected = self._project_hidden(hidden)
         gru_memory = self.gru.integrate(projected)
         return gru_memory
 
@@ -878,32 +928,18 @@ class MACHPhase5(nn.Module):
         """
         Self-evaluation: observe own output through patched model.
 
-        Same observation pathway (obs_proj → GRU) but runs through
-        patched_model instead of base_model, so hidden states reflect
-        current patches. The meta-learner sees what its modifications
-        produce and can compare with earlier demo observations.
+        Same observation pathway (layer_projs/obs_proj → GRU) but runs
+        through patched_model instead of base_model, so hidden states
+        reflect current patches.
 
         Task-agnostic: no explicit error computation, the model learns
         to detect its own errors through the same pathway it uses for
         everything else.
         """
-        with torch.no_grad():
-            hidden_state = None
-            target_layer = self.patch_layers[len(self.patch_layers) // 2]
-
-            def hook(module, input, output):
-                nonlocal hidden_state
-                if isinstance(output, tuple):
-                    hidden_state = output[0][:, -1, :]
-                else:
-                    hidden_state = output[:, -1, :]
-
-            h = patched_model.base_model.model.layers[target_layer] \
-                .register_forward_hook(hook)
-            patched_model(input_ids=input_ids)
-            h.remove()
-
-        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        hidden = self._extract_hidden_states(
+            patched_model.base_model.model.layers, input_ids, patched_model
+        )
+        projected = self._project_hidden(hidden)
         gru_memory = self.gru.integrate(projected)
         return gru_memory
 
