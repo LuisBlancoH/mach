@@ -661,6 +661,178 @@ class MACHPhase6(MACHPhase3):
         return missing, unexpected
 
 
+class TaskStateModule(nn.Module):
+    """
+    PFC-like gated task representation.
+
+    Maintains a persistent task state (d_task) that is updated by gated
+    integration of GRU observations. The gate learns which observations
+    are informative and how much to update the task representation.
+    """
+
+    def __init__(self, d_gru, d_task):
+        super().__init__()
+        self.d_task = d_task
+        self.gate_net = nn.Linear(d_gru + d_task, d_task)
+        self.candidate_net = nn.Linear(d_gru + d_task, d_task)
+
+    def forward(self, gru_memory, task_state):
+        combined = torch.cat([gru_memory, task_state])
+        gate = torch.sigmoid(self.gate_net(combined))
+        candidate = torch.tanh(self.candidate_net(combined))
+        new_task_state = gate * candidate + (1 - gate) * task_state
+        return new_task_state
+
+
+class ActionCompiler(nn.Module):
+    """
+    Compiles task state into patch write coefficients.
+    Same output format as ActionHead but takes d_task input.
+    """
+
+    def __init__(self, d_task, n_patches=4, n_basis=8):
+        super().__init__()
+        self.n_patches = n_patches
+        self.n_basis = n_basis
+        n_writes = n_patches * 2
+        n_outputs = n_writes * (n_basis + 1)
+
+        self.head = nn.Sequential(
+            nn.Linear(d_task, 64),
+            nn.GELU(),
+            nn.Linear(64, n_outputs),
+        )
+
+    def forward(self, task_state):
+        from config import GATE_SCALE
+        raw = self.head(task_state)
+
+        writes = []
+        idx = 0
+        for patch_i in range(self.n_patches):
+            for weight_name in ["down", "up"]:
+                coefficients = raw[idx:idx + self.n_basis]
+                gate = torch.sigmoid(raw[idx + self.n_basis]) * GATE_SCALE
+                idx += self.n_basis + 1
+                writes.append((patch_i, weight_name, coefficients, gate))
+
+        return writes
+
+
+class MACHPhase5(nn.Module):
+    """
+    Phase 5: Brain-like meta-learner with structured task bottleneck.
+
+    Key changes from Phase 2:
+    - Smaller obs projection (d_model -> d_obs instead of d_meta)
+    - Smaller GRU (d_obs -> d_gru)
+    - Gated task state (d_task) replaces transformer + memory head
+    - ActionCompiler takes d_task input (the bottleneck)
+    - No reward input to fire()
+    - L1 sparsity penalty on task_state
+    - ~540K params (down from ~5M)
+
+    Brain mapping:
+    - obs_proj: sensory cortex
+    - GRU: hippocampus (episodic memory)
+    - task_state: PFC (working memory)
+    - action_compiler: premotor cortex
+    - basis + patches: motor execution
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_obs=64, d_gru=64, d_task=32, n_basis=8):
+        super().__init__()
+        self.d_model = d_model
+        self.d_obs = d_obs
+        self.d_gru = d_gru
+        self.d_task = d_task
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+
+        # Sensory cortex: project Qwen hidden states
+        self.obs_proj = ObservationProjection(d_model, d_obs)
+
+        # Hippocampus: episodic sequential memory
+        self.gru = SimpleGRU(d_obs)
+        # Override GRU internal dim: input is d_obs, hidden is d_gru
+        self.gru.gru_cell = nn.GRUCell(d_obs, d_gru)
+
+        # PFC: gated task state
+        self.task_state_module = TaskStateModule(d_gru, d_task)
+
+        # Premotor: compile task state into patch writes
+        self.action_compiler = ActionCompiler(d_task, len(patch_layers), n_basis)
+
+        # Motor execution: basis vectors + patches
+        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Persistent state (reset per episode)
+        self._task_state = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        self.gru.reset()
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._task_state = torch.zeros(
+            self.d_task, device=next(self.parameters()).device
+        )
+
+    def observe(self, base_model, input_ids):
+        """
+        Sensory processing: Qwen forward (frozen) -> project -> GRU.
+        Gradient flows through obs_proj and GRU (always undetached).
+        """
+        with torch.no_grad():
+            hidden_state = None
+            target_layer = self.patch_layers[len(self.patch_layers) // 2]
+
+            def hook(module, input, output):
+                nonlocal hidden_state
+                if isinstance(output, tuple):
+                    hidden_state = output[0][:, -1, :]
+                else:
+                    hidden_state = output[:, -1, :]
+
+            h = base_model.model.layers[target_layer].register_forward_hook(hook)
+            base_model(input_ids=input_ids)
+            h.remove()
+
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        gru_memory = self.gru.integrate(projected)
+        return gru_memory
+
+    def fire(self, gru_memory):
+        """
+        PFC update + action compilation. No reward input.
+
+        gru_memory: (d_gru,) from GRU
+        Returns: writes (list of (patch_idx, weight_name, coefficients, gate))
+        """
+        # PFC: gated task state update
+        self._task_state = self.task_state_module(gru_memory, self._task_state)
+
+        # Premotor: compile task state into patch writes
+        writes = self.action_compiler(self._task_state)
+        return writes
+
+    def get_task_state(self):
+        """Return current task state for sparsity loss."""
+        return self._task_state
+
+    def apply_writes(self, writes):
+        """Apply differentiable patch weight modifications via basis vectors."""
+        for (patch_idx, weight_name, coefficients, gate) in writes:
+            delta_W = self.basis.compute_delta_W(
+                patch_idx, weight_name, coefficients, gate
+            )
+            self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+
 class MACHPatchedModel(nn.Module):
     """Wraps Qwen with MACH differentiable patches hooked into residual stream."""
 

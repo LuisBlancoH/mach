@@ -64,6 +64,16 @@ PHASE6_GRAD_CLIP = 1.0
 PHASE6_CRITIC_LOSS_WEIGHT = 0.5
 PHASE6_GAMMA = 0.95
 
+# Phase 5 (brain-like)
+PHASE5_D_OBS = 64       # observation projection output
+PHASE5_D_GRU = 64       # GRU hidden state (hippocampal memory)
+PHASE5_D_TASK = 32      # task state (PFC working memory) — bottleneck
+PHASE5_SPARSITY_BETA = 0.01  # L1 penalty on task state
+PHASE5_LR = 3e-4
+PHASE5_EPISODES = 2000
+PHASE5_PROBLEMS_PER_EPISODE = 20
+PHASE5_GRAD_CLIP = 1.0
+
 # Future phases
 MAX_INTERVAL = 16
 MAX_PLANNING_ITERS = 3
