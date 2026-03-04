@@ -214,3 +214,25 @@ Learning faster overall. Learns 2x scaling (28% on 0a+2b), which old architectur
 
 ### Held-out: still 0%
 Expected at ep600 — train combos not saturated yet. Generalization typically kicks in once model is forced to share representations across all training tasks.
+
+## d_task=4 + Continuous + Decorrelation + Noise + Deliberation (ep1999)
+
+Full brain-like setup: d_task=4, continuous_linear, decorr_beta=0.01, task_noise=0.1, deliberation_steps=3.
+
+### First ever held-out generalization
+- **0a+0b = 43%** — never in training pool, model learned "zero coefficient = don't use operand"
+- 2a+1b = 5%, 1a+2b = 2% — tiny but nonzero
+
+### Train combos (capacity-limited)
+- 1a+0b = 99% (learned "output a")
+- 0a+1b = 1% (can't also learn "output b" — bottleneck too tight)
+- 0a+2b = 15%, 2a+0b = 20%, 2a+2b = 1%
+
+### Task state
+- 4/4 dims active (>0.1), only 2 strongly active (>0.5)
+- L1 norm = 0.60, max abs = 0.89
+
+### Key insight
+d_task=4 is too tight for full learning but produces real generalization.
+d_task=32 learns everything but memorizes with 0% held-out.
+Sweet spot might be d_task=8.
