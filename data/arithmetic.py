@@ -148,22 +148,26 @@ def generate_few_shot_episode(n_problems, n_demos=None, op_type=None):
 
 LINEAR_COEFFS = [0, 1, 2]
 
+# Train on 6 combinations, hold out 3 for generalization testing
+LINEAR_TRAIN = [(0, 1), (0, 2), (1, 0), (1, 1), (2, 0), (2, 2)]
+LINEAR_HELDOUT = [(1, 2), (2, 1), (0, 0)]
 
-def generate_linear_episode(n_problems, n_demos=None, coeffs=None):
+
+def generate_linear_episode(n_problems, n_demos=None, coeffs=None,
+                            train_only=True):
     """
     Generate a few-shot episode for a random linear combination f(a,b) = c1*a + c2*b.
 
-    Each episode picks random (c1, c2) from LINEAR_COEFFS. Demos show
-    the complete answer; test problems show only the question. The model
-    must infer the coefficients from demos and apply them.
+    If train_only=True (default), picks from LINEAR_TRAIN only.
+    If train_only=False, picks from all 9 combinations.
 
     Same "a ? b = " format as few-shot episodes.
     """
     if n_demos is None:
         n_demos = max(2, n_problems // 4)
     if coeffs is None:
-        c1 = random.choice(LINEAR_COEFFS)
-        c2 = random.choice(LINEAR_COEFFS)
+        pool = LINEAR_TRAIN if train_only else [(c1, c2) for c1 in LINEAR_COEFFS for c2 in LINEAR_COEFFS]
+        c1, c2 = random.choice(pool)
     else:
         c1, c2 = coeffs
 

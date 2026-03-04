@@ -15,7 +15,7 @@ except ImportError:
 
 from data.arithmetic import (
     generate_arithmetic_problems, extract_number, generate_few_shot_episode,
-    generate_linear_episode, LINEAR_COEFFS,
+    generate_linear_episode, LINEAR_COEFFS, LINEAR_TRAIN, LINEAR_HELDOUT,
 )
 import config
 
@@ -261,13 +261,20 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                         no_rewards=no_rewards,
                     )
             elif mode == "linear":
-                for c1 in LINEAR_COEFFS:
-                    for c2 in LINEAR_COEFFS:
-                        _run_linear_validation(
-                            base_model, mach, patched_model, tokenizer,
-                            device, (c1, c2), episode_idx,
-                            no_rewards=True,
-                        )
+                print(f"  --- TRAIN combos ---")
+                for coeffs in LINEAR_TRAIN:
+                    _run_linear_validation(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                        no_rewards=True,
+                    )
+                print(f"  --- HELD-OUT combos ---")
+                for coeffs in LINEAR_HELDOUT:
+                    _run_linear_validation(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                        no_rewards=True,
+                    )
             else:
                 for eval_diff in [6, 7]:
                     _run_standard_validation(

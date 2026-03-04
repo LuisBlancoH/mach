@@ -17,7 +17,10 @@ except ImportError:
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import config
-from data.arithmetic import extract_number, generate_linear_episode, LINEAR_COEFFS
+from data.arithmetic import (
+    extract_number, generate_linear_episode,
+    LINEAR_COEFFS, LINEAR_TRAIN, LINEAR_HELDOUT,
+)
 from models.universal_module import MACHPhase2, MACHPatchedModel
 from training.phase2_fewshot_train import meta_train_phase2_fewshot
 
@@ -72,88 +75,97 @@ def create_mach_phase2(d_model, n_layers, detach_obs=True):
     return mach, patch_layers
 
 
+def _eval_linear_combo(base_model, mach, patched_model, tokenizer, device,
+                       coeffs, n_episodes, n_problems, n_demos):
+    """Evaluate one linear combination, return accuracy."""
+    c1, c2 = coeffs
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_linear_episode(
+            n_problems, n_demos=n_demos, coeffs=(c1, c2)
+        )
+        mach.reset_episode()
+
+        for i, problem in enumerate(problems):
+            input_ids = tokenizer(
+                problem["prompt"], return_tensors="pt"
+            ).input_ids.to(device)
+
+            gru_memory = mach.observe(base_model, input_ids)
+            reward_signals = torch.zeros(
+                3, device=device, dtype=torch.float32
+            )
+            writes = mach.fire(gru_memory, reward_signals)
+            mach.apply_writes(writes)
+
+            if problem["is_demo"]:
+                continue
+
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(
+                full_text, return_tensors="pt"
+            ).to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits
+                    if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[
+                    0, prompt_len - 1:-1
+                ].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+    return test_correct / test_total if test_total > 0 else 0
+
+
 def final_evaluation(base_model, mach, patched_model, tokenizer, device,
                      n_episodes=20, n_problems=20, n_demos=5):
-    """Evaluate all 9 linear combinations."""
+    """Evaluate all 9 linear combinations, split by train/held-out."""
     print(f"\n{'='*60}")
     print(f"FINAL LINEAR COMBINATION EVALUATION")
     print(f"{n_episodes} episodes x {n_problems} problems "
           f"({n_demos} demos + {n_problems - n_demos} test)")
     print(f"{'='*60}")
 
-    n_test = n_problems - n_demos
-    results = {}
+    print(f"\n--- TRAINED combinations ---")
+    train_accs = []
+    for c1, c2 in LINEAR_TRAIN:
+        acc = _eval_linear_combo(
+            base_model, mach, patched_model, tokenizer, device,
+            (c1, c2), n_episodes, n_problems, n_demos,
+        )
+        train_accs.append(acc)
+        print(f"  {c1}a+{c2}b: {acc:.0%}")
 
-    for c1 in LINEAR_COEFFS:
-        for c2 in LINEAR_COEFFS:
-            test_correct = 0
-            test_total = 0
+    print(f"\n--- HELD-OUT combinations (never seen during training) ---")
+    heldout_accs = []
+    for c1, c2 in LINEAR_HELDOUT:
+        acc = _eval_linear_combo(
+            base_model, mach, patched_model, tokenizer, device,
+            (c1, c2), n_episodes, n_problems, n_demos,
+        )
+        heldout_accs.append(acc)
+        print(f"  {c1}a+{c2}b: {acc:.0%}")
 
-            for ep in range(n_episodes):
-                problems = generate_linear_episode(
-                    n_problems, n_demos=n_demos, coeffs=(c1, c2)
-                )
-                mach.reset_episode()
-
-                for i, problem in enumerate(problems):
-                    input_ids = tokenizer(
-                        problem["prompt"], return_tensors="pt"
-                    ).input_ids.to(device)
-
-                    gru_memory = mach.observe(base_model, input_ids)
-                    reward_signals = torch.zeros(
-                        3, device=device, dtype=torch.float32
-                    )
-                    writes = mach.fire(gru_memory, reward_signals)
-                    mach.apply_writes(writes)
-
-                    if problem["is_demo"]:
-                        continue
-
-                    full_text = problem["prompt"] + problem["answer"]
-                    encoding = tokenizer(
-                        full_text, return_tensors="pt"
-                    ).to(device)
-                    prompt_len = len(tokenizer(problem["prompt"]).input_ids)
-
-                    with torch.no_grad():
-                        output = patched_model(input_ids=encoding.input_ids)
-                        logits = (
-                            output.logits
-                            if hasattr(output, 'logits') else output[0]
-                        )
-                        pred_tokens = logits[
-                            0, prompt_len - 1:-1
-                        ].argmax(dim=-1)
-                        pred_text = tokenizer.decode(
-                            pred_tokens, skip_special_tokens=True
-                        ).strip()
-                        predicted = extract_number(pred_text)
-                        correct = (predicted == problem["answer"])
-
-                    test_correct += int(correct)
-                    test_total += 1
-
-            acc = test_correct / test_total if test_total > 0 else 0
-            results[(c1, c2)] = acc
-            label = f"{c1}a+{c2}b"
-            known = ""
-            if (c1, c2) == (1, 1):
-                known = " (= add)"
-            elif (c1, c2) == (1, 0):
-                known = " (= a)"
-            elif (c1, c2) == (0, 1):
-                known = " (= b)"
-            elif (c1, c2) == (0, 0):
-                known = " (= 0)"
-            print(f"  {label:8s}: {acc:.0%}{known}")
+    train_avg = sum(train_accs) / len(train_accs)
+    heldout_avg = sum(heldout_accs) / len(heldout_accs)
 
     print(f"\n{'='*60}")
-    avg = sum(results.values()) / len(results)
-    print(f"Average across all 9 combinations: {avg:.0%}")
+    print(f"Train avg: {train_avg:.0%}  |  Held-out avg: {heldout_avg:.0%}")
+    print(f"If held-out > 0: genuine function induction")
     print(f"{'='*60}")
-
-    return results
 
 
 def main():
