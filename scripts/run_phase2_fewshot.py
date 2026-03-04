@@ -230,21 +230,23 @@ def main():
     mach, patch_layers = create_mach_phase2(d_model, n_layers)
     patched_model = MACHPatchedModel(base_model, mach)
 
+    save_path = "checkpoints/phase2_fewshot_ablation.pt"
+    os.makedirs("checkpoints", exist_ok=True)
+
     checkpoint = None if args.from_scratch else args.checkpoint
     meta_train_phase2_fewshot(
         base_model, mach, patched_model, tokenizer, config.DEVICE,
         n_episodes=args.episodes, lr=args.lr,
         checkpoint_path=checkpoint,
+        save_path=save_path,
     )
 
     passed = final_evaluation(
         base_model, mach, patched_model, tokenizer, config.DEVICE
     )
 
-    save_path = "checkpoints/phase2_fewshot_ablation.pt"
-    os.makedirs("checkpoints", exist_ok=True)
     torch.save(mach.state_dict(), save_path)
-    print(f"\nSaved ablation checkpoint to {save_path}")
+    print(f"\nSaved final checkpoint to {save_path}")
 
     if wandb is not None:
         wandb.finish()

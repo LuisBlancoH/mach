@@ -113,7 +113,8 @@ def run_episode_phase2_fewshot(base_model, mach, patched_model, tokenizer,
 
 def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                                device, n_episodes=None, lr=None,
-                               curriculum=None, checkpoint_path=None):
+                               curriculum=None, checkpoint_path=None,
+                               save_path=None):
     """Phase 2 ablation: few-shot task with Phase 2 architecture (no critic)."""
     if n_episodes is None:
         n_episodes = config.PHASE2_EPISODES
@@ -240,7 +241,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
             if wandb is not None:
                 wandb.log(log_dict)
 
-        # Diagnostics + validation every 200 episodes + final
+        # Diagnostics + validation + checkpoint every 200 episodes + final
         if (episode_idx % 200 == 0 and episode_idx > 0) or \
                 episode_idx == n_episodes - 1:
             _log_diagnostics(mach, meta_params, episode_idx)
@@ -256,6 +257,12 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                         base_model, mach, patched_model, tokenizer,
                         device, eval_diff, episode_idx
                     )
+
+            if save_path is not None:
+                import os
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(mach.state_dict(), save_path)
+                print(f"  Checkpoint saved to {save_path}")
 
 
 def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
