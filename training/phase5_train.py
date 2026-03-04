@@ -29,6 +29,11 @@ LINEAR_CURRICULUM = [
     (300, 2000, "linear"),
 ]
 
+CONTINUOUS_LINEAR_CURRICULUM = [
+    (0, 300, "single"),
+    (300, 2000, "continuous_linear"),
+]
+
 
 def get_episode_mode(episode_idx, curriculum):
     for start, end, mode in curriculum:
@@ -42,6 +47,8 @@ def generate_episode_problems(n_problems, mode):
         return generate_arithmetic_problems(n_problems, 6)
     elif mode == "linear":
         return generate_linear_episode(n_problems)
+    elif mode == "continuous_linear":
+        return generate_linear_episode(n_problems, continuous=True, max_coeff=5)
     else:  # few_shot
         return generate_few_shot_episode(n_problems)
 
@@ -112,10 +119,36 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     return qwen_loss, sparsity_loss, rewards, problem_losses
 
 
+def compute_decorrelation_loss(task_state_buffer, current_task_state):
+    """
+    Lateral inhibition: penalize correlation between task state dimensions.
+    Forces each dimension to encode independent features.
+
+    Uses detached buffer for statistics but the current (live) task state
+    for the gradient signal — so the loss backprops through the current episode.
+    """
+    if len(task_state_buffer) < 10:
+        return torch.tensor(0.0)
+    # Stack buffer (detached) + current state (live gradient)
+    detached_states = torch.stack(task_state_buffer)
+    all_states = torch.cat([detached_states, current_task_state.unsqueeze(0)])
+    # Center
+    mean = all_states.mean(dim=0, keepdim=True)
+    centered = all_states - mean
+    # Correlation matrix
+    norms = centered.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    normed = centered / norms
+    corr = normed.T @ normed / all_states.shape[0]
+    # Penalize off-diagonal correlations
+    eye = torch.eye(corr.shape[0], device=corr.device)
+    decorr_loss = (corr - eye).pow(2).mean()
+    return decorr_loss
+
+
 def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       device, n_episodes=None, lr=None, curriculum=None,
                       checkpoint_path=None, save_path=None,
-                      sparsity_beta=None):
+                      sparsity_beta=None, decorr_beta=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -125,6 +158,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         curriculum = DEFAULT_CURRICULUM
     if sparsity_beta is None:
         sparsity_beta = config.PHASE5_SPARSITY_BETA
+    if decorr_beta is None:
+        decorr_beta = config.PHASE5_DECORR_BETA
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -136,7 +171,11 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
 
     n_meta = sum(p.numel() for p in meta_params)
     print(f"Phase 5 trainable parameters: {n_meta:,}")
-    print(f"Sparsity beta: {sparsity_beta}")
+    print(f"Sparsity beta: {sparsity_beta}, decorr beta: {decorr_beta}")
+
+    # Rolling buffer of task states for decorrelation loss
+    task_state_buffer = []
+    BUFFER_SIZE = 50
 
     def get_n_problems(episode_idx):
         if episode_idx < 100:
@@ -161,10 +200,26 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                 )
-            total_loss = ce_loss + sparsity_beta * sparsity_loss
+            # Decorrelation loss (lateral inhibition)
+            task_state = mach.get_task_state()
+            if task_state is not None:
+                decorr_loss = compute_decorrelation_loss(
+                    task_state_buffer, task_state
+                )
+                decorr_loss = decorr_loss.to(device)
+                # Update buffer with detached copy
+                task_state_buffer.append(task_state.detach())
+                if len(task_state_buffer) > BUFFER_SIZE:
+                    task_state_buffer.pop(0)
+            else:
+                decorr_loss = torch.tensor(0.0, device=device)
+
+            total_loss = ce_loss + sparsity_beta * sparsity_loss \
+                + decorr_beta * decorr_loss
             total_loss.backward()
             loss_scalar = ce_loss.item()
             sparsity_scalar = sparsity_loss.item()
+            decorr_scalar = decorr_loss.item()
 
         except torch.cuda.OutOfMemoryError:
             print(f"\n  OOM at episode {episode_idx}. Reducing problems.")
@@ -180,6 +235,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             total_loss.backward()
             loss_scalar = ce_loss.item()
             sparsity_scalar = sparsity_loss.item()
+            decorr_scalar = 0.0
 
         torch.nn.utils.clip_grad_norm_(
             meta_params, max_norm=config.PHASE5_GRAD_CLIP
@@ -212,7 +268,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 ts_max = 0.0
 
             diff_str = ""
-            if mode in ("few_shot", "linear"):
+            if mode in ("few_shot", "linear", "continuous_linear"):
                 diff_correct = {}
                 diff_total = {}
                 for j, p in enumerate(problems):
@@ -229,7 +285,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
 
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
-                f"ce={loss_scalar:.4f} sp={sparsity_scalar:.3f} | "
+                f"ce={loss_scalar:.4f} sp={sparsity_scalar:.3f} "
+                f"dc={decorr_scalar:.3f} | "
                 f"avg_r={avg_reward:.2f} "
                 f"early={early_acc:.0%} late={late_acc:.0%} | "
                 f"active={n_active:.0f}/{mach.d_task} max={ts_max:.2f}"
@@ -241,6 +298,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     "episode": episode_idx,
                     "ce_loss": loss_scalar,
                     "sparsity_loss": sparsity_scalar,
+                    "decorr_loss": decorr_scalar,
                     "avg_reward": avg_reward,
                     "early_accuracy": early_acc,
                     "late_accuracy": late_acc,
@@ -258,7 +316,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                         base_model, mach, patched_model, tokenizer,
                         device, op, episode_idx,
                     )
-            elif mode == "linear":
+            elif mode in ("linear", "continuous_linear"):
+                # For continuous: eval on sample of combos to check generalization
                 print(f"  --- TRAIN combos ---")
                 for coeffs in LINEAR_TRAIN:
                     _run_linear_validation(
@@ -271,6 +330,13 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                     )
+                if mode == "continuous_linear":
+                    print(f"  --- NOVEL combos (never in fixed pool) ---")
+                    for coeffs in [(3, 1), (1, 4), (4, 3), (5, 0), (0, 5)]:
+                        _run_linear_validation(
+                            base_model, mach, patched_model, tokenizer,
+                            device, coeffs, episode_idx,
+                        )
             else:
                 for eval_diff in [6, 7]:
                     _run_standard_validation(

@@ -154,20 +154,24 @@ LINEAR_HELDOUT = [(1, 2), (2, 1), (0, 0)]
 
 
 def generate_linear_episode(n_problems, n_demos=None, coeffs=None,
-                            train_only=True):
+                            train_only=True, continuous=False, max_coeff=5):
     """
     Generate a few-shot episode for a random linear combination f(a,b) = c1*a + c2*b.
 
-    If train_only=True (default), picks from LINEAR_TRAIN only.
-    If train_only=False, picks from all 9 combinations.
+    If continuous=True, samples c1, c2 ~ randint(0, max_coeff) each episode.
+    Otherwise uses fixed train/test pools.
 
     Same "a ? b = " format as few-shot episodes.
     """
     if n_demos is None:
         n_demos = max(2, n_problems // 4)
     if coeffs is None:
-        pool = LINEAR_TRAIN if train_only else [(c1, c2) for c1 in LINEAR_COEFFS for c2 in LINEAR_COEFFS]
-        c1, c2 = random.choice(pool)
+        if continuous:
+            c1 = random.randint(0, max_coeff)
+            c2 = random.randint(0, max_coeff)
+        else:
+            pool = LINEAR_TRAIN if train_only else [(c1, c2) for c1 in LINEAR_COEFFS for c2 in LINEAR_COEFFS]
+            c1, c2 = random.choice(pool)
     else:
         c1, c2 = coeffs
 

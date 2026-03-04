@@ -767,7 +767,7 @@ class MACHPhase5(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  d_obs=64, d_gru=64, d_task=32, n_basis=8,
-                 n_deliberation_steps=0):
+                 n_deliberation_steps=0, task_noise=0.0):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -776,6 +776,7 @@ class MACHPhase5(nn.Module):
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
         self.n_deliberation_steps = n_deliberation_steps
+        self.task_noise = task_noise  # noise std on task state (forgetting)
 
         # Sensory cortex: project Qwen hidden states
         self.obs_proj = ObservationProjection(d_model, d_obs)
@@ -846,6 +847,11 @@ class MACHPhase5(nn.Module):
         """
         # PFC: gated task state update
         self._task_state = self.task_state_module(gru_memory, self._task_state)
+
+        # Forgetting: noise on task state forces robust representations
+        if self.task_noise > 0 and self.training:
+            self._task_state = self._task_state + \
+                self.task_noise * torch.randn_like(self._task_state)
 
         # PFC deliberation: iterative refinement
         if self.n_deliberation_steps > 0:

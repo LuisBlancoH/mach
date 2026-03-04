@@ -74,6 +74,8 @@ PHASE5_EPISODES = 2000
 PHASE5_PROBLEMS_PER_EPISODE = 20
 PHASE5_GRAD_CLIP = 1.0
 PHASE5_N_DELIBERATION_STEPS = 0  # 0 = no deliberation, 3+ = iterative refinement
+PHASE5_DECORR_BETA = 0.01        # lateral inhibition: decorrelation loss weight
+PHASE5_TASK_NOISE = 0.0          # forgetting: noise std on task state (0 = off)
 
 # Future phases
 MAX_INTERVAL = 16
