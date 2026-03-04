@@ -507,6 +507,17 @@ class MACHPhase4(MACHPhase3):
         """
         state_dict = torch.load(checkpoint_path, map_location=device)
 
+        # Remap action_head keys: Sequential (head.0/head.2) -> fc1/fc2
+        key_remap = {
+            "action_head.head.0.weight": "action_head.fc1.weight",
+            "action_head.head.0.bias": "action_head.fc1.bias",
+            "action_head.head.2.weight": "action_head.fc2.weight",
+            "action_head.head.2.bias": "action_head.fc2.bias",
+        }
+        for old_key, new_key in key_remap.items():
+            if old_key in state_dict:
+                state_dict[new_key] = state_dict.pop(old_key)
+
         # Handle action_head.fc1 shape mismatch (128 -> 256 input)
         key = "action_head.fc1.weight"
         if key in state_dict and self.action_head.obs_conditioned:
