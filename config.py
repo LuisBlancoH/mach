@@ -73,6 +73,7 @@ PHASE5_LR = 3e-4
 PHASE5_EPISODES = 2000
 PHASE5_PROBLEMS_PER_EPISODE = 20
 PHASE5_GRAD_CLIP = 1.0
+PHASE5_N_DELIBERATION_STEPS = 0  # 0 = no deliberation, 3+ = iterative refinement
 
 # Future phases
 MAX_INTERVAL = 16

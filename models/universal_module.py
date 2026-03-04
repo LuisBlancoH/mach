@@ -684,6 +684,31 @@ class TaskStateModule(nn.Module):
         return new_task_state
 
 
+class DeliberationModule(nn.Module):
+    """
+    PFC iterative refinement — task state refines itself.
+
+    After observation updates the task state, this module runs N steps
+    of self-recurrence. Like PFC attractor dynamics: recurrent processing
+    settles into a stable, structured representation.
+
+    Gate bias initialized to -3.0 (sigmoid ≈ 0.05) so deliberation starts
+    as near-identity — safe to add to existing checkpoints.
+    """
+
+    def __init__(self, d_task):
+        super().__init__()
+        self.gate_net = nn.Linear(d_task, d_task)
+        self.candidate_net = nn.Linear(d_task, d_task)
+        # Start as near-identity so loading existing checkpoints works
+        nn.init.constant_(self.gate_net.bias, -3.0)
+
+    def forward(self, task_state):
+        gate = torch.sigmoid(self.gate_net(task_state))
+        candidate = torch.tanh(self.candidate_net(task_state))
+        return gate * candidate + (1 - gate) * task_state
+
+
 class ActionCompiler(nn.Module):
     """
     Compiles task state into patch write coefficients.
@@ -741,7 +766,8 @@ class MACHPhase5(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_obs=64, d_gru=64, d_task=32, n_basis=8):
+                 d_obs=64, d_gru=64, d_task=32, n_basis=8,
+                 n_deliberation_steps=0):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -749,6 +775,7 @@ class MACHPhase5(nn.Module):
         self.d_task = d_task
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
+        self.n_deliberation_steps = n_deliberation_steps
 
         # Sensory cortex: project Qwen hidden states
         self.obs_proj = ObservationProjection(d_model, d_obs)
@@ -760,6 +787,10 @@ class MACHPhase5(nn.Module):
 
         # PFC: gated task state
         self.task_state_module = TaskStateModule(d_gru, d_task)
+
+        # PFC deliberation: iterative self-refinement
+        if n_deliberation_steps > 0:
+            self.deliberation = DeliberationModule(d_task)
 
         # Premotor: compile task state into patch writes
         self.action_compiler = ActionCompiler(d_task, len(patch_layers), n_basis)
@@ -815,6 +846,11 @@ class MACHPhase5(nn.Module):
         """
         # PFC: gated task state update
         self._task_state = self.task_state_module(gru_memory, self._task_state)
+
+        # PFC deliberation: iterative refinement
+        if self.n_deliberation_steps > 0:
+            for _ in range(self.n_deliberation_steps):
+                self._task_state = self.deliberation(self._task_state)
 
         # Premotor: compile task state into patch writes
         writes = self.action_compiler(self._task_state)

@@ -41,7 +41,7 @@ def load_base_model():
     return model, tokenizer, d_model, n_layers
 
 
-def create_mach_phase5(d_model, n_layers):
+def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0):
     patch_layers = [
         n_layers // 4,
         n_layers // 2,
@@ -50,7 +50,8 @@ def create_mach_phase5(d_model, n_layers):
     ]
     print(f"Patch layers: {patch_layers}")
     print(f"d_obs={config.PHASE5_D_OBS}, d_gru={config.PHASE5_D_GRU}, "
-          f"d_task={config.PHASE5_D_TASK}")
+          f"d_task={config.PHASE5_D_TASK}, "
+          f"deliberation_steps={n_deliberation_steps}")
 
     mach = MACHPhase5(
         d_model=d_model,
@@ -61,6 +62,7 @@ def create_mach_phase5(d_model, n_layers):
         d_gru=config.PHASE5_D_GRU,
         d_task=config.PHASE5_D_TASK,
         n_basis=config.N_BASIS,
+        n_deliberation_steps=n_deliberation_steps,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -85,6 +87,10 @@ def main():
         "--sparsity-beta", type=float, default=None,
         help="L1 sparsity penalty weight on task state"
     )
+    parser.add_argument(
+        "--deliberation-steps", type=int, default=None,
+        help="Number of deliberation steps (0=none, 3+=iterative refinement)"
+    )
     args = parser.parse_args()
 
     curriculum = LINEAR_CURRICULUM if args.task == "linear" else DEFAULT_CURRICULUM
@@ -104,13 +110,17 @@ def main():
                 "lr": args.lr or config.PHASE5_LR,
                 "episodes": args.episodes or config.PHASE5_EPISODES,
                 "architecture": "phase5",
+                "deliberation_steps": args.deliberation_steps or config.PHASE5_N_DELIBERATION_STEPS,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
         )
 
+    n_delib = args.deliberation_steps if args.deliberation_steps is not None \
+        else config.PHASE5_N_DELIBERATION_STEPS
+
     base_model, tokenizer, d_model, n_layers = load_base_model()
-    mach, patch_layers = create_mach_phase5(d_model, n_layers)
+    mach, patch_layers = create_mach_phase5(d_model, n_layers, n_delib)
     patched_model = MACHPatchedModel(base_model, mach)
 
     save_path = f"checkpoints/phase5_{args.task}.pt"
