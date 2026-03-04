@@ -48,7 +48,7 @@ def load_base_model():
     return model, tokenizer, d_model, n_layers
 
 
-def create_mach_phase2(d_model, n_layers):
+def create_mach_phase2(d_model, n_layers, detach_obs=True):
     patch_layers = [
         n_layers // 4,
         n_layers // 2,
@@ -56,6 +56,7 @@ def create_mach_phase2(d_model, n_layers):
         n_layers - 2,
     ]
     print(f"Patch layers: {patch_layers}")
+    print(f"Detach obs: {detach_obs}")
 
     mach = MACHPhase2(
         d_model=d_model,
@@ -64,7 +65,7 @@ def create_mach_phase2(d_model, n_layers):
         hidden_dim=config.PATCH_HIDDEN_DIM,
         d_meta=config.D_META,
         n_basis=config.N_BASIS,
-        detach_obs=True,
+        detach_obs=detach_obs,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -206,12 +207,21 @@ def main():
         "--from-scratch", action="store_true",
         help="Train from scratch without loading checkpoint"
     )
+    parser.add_argument(
+        "--undetach-obs", action="store_true",
+        help="Allow gradient through obs_proj and GRU"
+    )
     args = parser.parse_args()
+
+    detach_obs = not args.undetach_obs
+    run_name = "ablation-phase2-fewshot"
+    if args.undetach_obs:
+        run_name += "-undetach"
 
     if wandb is not None:
         wandb.init(
             project="mach",
-            name="ablation-phase2-fewshot",
+            name=run_name,
             config={
                 "base_model": config.BASE_MODEL,
                 "d_meta": config.D_META,
@@ -222,12 +232,13 @@ def main():
                 "task": "few_shot",
                 "ablation": True,
                 "from_scratch": args.from_scratch,
+                "detach_obs": detach_obs,
                 "device": str(config.DEVICE),
             },
         )
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
-    mach, patch_layers = create_mach_phase2(d_model, n_layers)
+    mach, patch_layers = create_mach_phase2(d_model, n_layers, detach_obs=detach_obs)
     patched_model = MACHPatchedModel(base_model, mach)
 
     save_path = "checkpoints/phase2_fewshot_ablation.pt"
