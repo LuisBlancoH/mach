@@ -17,15 +17,18 @@ except ImportError:
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import config
-from data.arithmetic import generate_arithmetic_problems, extract_number
+from data.arithmetic import (
+    generate_arithmetic_problems, extract_number, generate_few_shot_episode,
+)
 from models.universal_module import MACHPhase4, MACHPatchedModel
 from training.phase4_meta_train import meta_train_phase4
 
 
-EVAL_DIFFICULTIES = {
-    3: "4-digit subtraction",
-    6: "3x2 multiplication",
-    8: "4-digit division",
+EVAL_OPS = {
+    "add": "addition",
+    "sub": "subtraction",
+    "mul": "multiplication",
+    "div": "division",
 }
 
 
@@ -78,38 +81,39 @@ def create_mach_phase4(d_model, n_layers, detach_obs=True,
 
 
 def final_evaluation(base_model, mach, patched_model, tokenizer, device,
-                     n_episodes=20, n_problems=20):
+                     n_episodes=20, n_problems=20, n_demos=5):
     """
-    Final evaluation across all curriculum difficulties.
-    Reports base accuracy, early/late accuracy, delta, critic values,
-    and surprise statistics.
+    Final few-shot evaluation across all operations.
+    For each operation, generates episodes with hidden '?' operator,
+    provides n_demos demonstrations, then evaluates test problems.
     """
     print(f"\n{'='*60}")
-    print(f"FINAL EVALUATION — {n_episodes} episodes x "
-          f"{n_problems} problems per difficulty")
+    print(f"FINAL FEW-SHOT EVALUATION — {n_episodes} episodes x "
+          f"{n_problems} problems ({n_demos} demos + "
+          f"{n_problems - n_demos} test) per operation")
     print(f"{'='*60}")
 
     any_passed = False
+    n_test = n_problems - n_demos
 
-    for difficulty, label in EVAL_DIFFICULTIES.items():
-        base_correct = 0
-        base_total = 0
-        meta_correct_early = 0
-        meta_correct_late = 0
-        meta_total_early = 0
-        meta_total_late = 0
-        all_rewards = []
-        all_values = []
+    for op_type, label in EVAL_OPS.items():
+        test_correct = 0
+        test_total = 0
+        test_correct_early = 0
+        test_correct_late = 0
+        test_total_early = 0
+        test_total_late = 0
         all_surprises = []
 
         for ep in range(n_episodes):
-            problems = generate_arithmetic_problems(n_problems, difficulty)
+            problems = generate_few_shot_episode(
+                n_problems, n_demos=n_demos, op_type=op_type
+            )
 
-            # --- Meta-learner evaluation ---
             mach.reset_episode()
-            rewards = []
             last_value = torch.tensor(0.0, device=device)
             last_td_error = torch.tensor(0.0, device=device)
+            test_idx = 0
 
             for i, problem in enumerate(problems):
                 input_ids = tokenizer(
@@ -121,9 +125,12 @@ def final_evaluation(base_model, mach, patched_model, tokenizer, device,
 
                 with torch.no_grad():
                     current_value = mach.get_value()
-                all_values.append(current_value.item())
 
                 mach.apply_writes(writes)
+
+                if problem["is_demo"]:
+                    last_value = current_value.detach()
+                    continue
 
                 full_text = problem["prompt"] + problem["answer"]
                 encoding = tokenizer(
@@ -146,61 +153,40 @@ def final_evaluation(base_model, mach, patched_model, tokenizer, device,
                     predicted = extract_number(pred_text)
                     correct = (predicted == problem["answer"])
 
-                reward = 1.0 if correct else -1.0
-                rewards.append(reward)
+                test_correct += int(correct)
+                test_total += 1
 
-                # TD with gamma=0
-                if i > 0:
+                if test_idx < 5:
+                    test_correct_early += int(correct)
+                    test_total_early += 1
+                if test_idx >= n_test - 5:
+                    test_correct_late += int(correct)
+                    test_total_late += 1
+                test_idx += 1
+
+                reward = 1.0 if correct else -1.0
+                if test_idx > 1:
                     td_target = torch.tensor(
-                        rewards[-2], device=device, dtype=torch.float32
+                        reward, device=device, dtype=torch.float32
                     )
                     last_td_error = (td_target - last_value).detach()
                 last_value = current_value.detach()
-
-                if i < 5:
-                    meta_correct_early += int(correct)
-                    meta_total_early += 1
-                if i >= n_problems - 5:
-                    meta_correct_late += int(correct)
-                    meta_total_late += 1
 
             cb_diag = mach.get_cerebellum_diagnostics()
             if "avg_surprise" in cb_diag:
                 all_surprises.append(cb_diag["avg_surprise"])
 
-            all_rewards.extend(rewards)
-
-            # --- Base Qwen evaluation (zero patches) ---
-            mach.reset_episode()
-            for problem in problems:
-                full_text = problem["prompt"] + problem["answer"]
-                encoding = tokenizer(
-                    full_text, return_tensors="pt"
-                ).to(device)
-                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
-                with torch.no_grad():
-                    output = patched_model(input_ids=encoding.input_ids)
-                    logits = (
-                        output.logits
-                        if hasattr(output, 'logits') else output[0]
-                    )
-                    pred_tokens = logits[
-                        0, prompt_len - 1:-1
-                    ].argmax(dim=-1)
-                    pred_text = tokenizer.decode(
-                        pred_tokens, skip_special_tokens=True
-                    ).strip()
-                    predicted = extract_number(pred_text)
-                    base_correct += int(predicted == problem["answer"])
-                    base_total += 1
-
-        base_acc = base_correct / base_total
-        early_acc = meta_correct_early / meta_total_early
-        late_acc = meta_correct_late / meta_total_late
+        test_acc = test_correct / test_total if test_total > 0 else 0
+        early_acc = (
+            test_correct_early / test_total_early
+            if test_total_early > 0 else 0
+        )
+        late_acc = (
+            test_correct_late / test_total_late
+            if test_total_late > 0 else 0
+        )
         delta = late_acc - early_acc
-        improvement = late_acc - base_acc
-        passed = delta >= 0.10
-        mean_val = sum(all_values) / len(all_values) if all_values else 0
+        passed = test_acc >= 0.50
         avg_surprise = (
             sum(all_surprises) / len(all_surprises) if all_surprises else 0
         )
@@ -209,31 +195,26 @@ def final_evaluation(base_model, mach, patched_model, tokenizer, device,
             any_passed = True
 
         marker = " <<< PASS" if passed else ""
-        print(f"\n  d{difficulty} ({label}):")
-        print(f"    Base Qwen:    {base_acc:.1%}")
-        print(f"    Early (0-4):  {early_acc:.1%}")
-        print(f"    Late (15-19): {late_acc:.1%}")
-        print(f"    Delta:        {delta:+.1%}{marker}")
-        print(f"    vs Base:      {improvement:+.1%}")
-        print(f"    Avg critic V: {mean_val:.3f}")
-        print(f"    Avg surprise: {avg_surprise:.3f}")
+        print(f"\n  {op_type} ({label}):")
+        print(f"    Test accuracy:  {test_acc:.1%}{marker}")
+        print(f"    Early test:     {early_acc:.1%}")
+        print(f"    Late test:      {late_acc:.1%}")
+        print(f"    Delta:          {delta:+.1%}")
+        print(f"    Avg surprise:   {avg_surprise:.3f}")
 
         if wandb is not None:
             wandb.log({
-                f"final/d{difficulty}_base": base_acc,
-                f"final/d{difficulty}_early": early_acc,
-                f"final/d{difficulty}_late": late_acc,
-                f"final/d{difficulty}_delta": delta,
-                f"final/d{difficulty}_vs_base": improvement,
-                f"final/d{difficulty}_passed": passed,
-                f"final/d{difficulty}_avg_value": mean_val,
-                f"final/d{difficulty}_avg_surprise": avg_surprise,
+                f"final/{op_type}_test": test_acc,
+                f"final/{op_type}_early": early_acc,
+                f"final/{op_type}_late": late_acc,
+                f"final/{op_type}_delta": delta,
+                f"final/{op_type}_passed": passed,
             })
 
     print(f"\n{'='*60}")
     print(f"Phase 4 {'PASS' if any_passed else 'FAIL'}: "
-          f"{'at least one' if any_passed else 'no'} difficulty shows "
-          f"late - early >= 10pp")
+          f"{'at least one' if any_passed else 'no'} operation shows "
+          f"test accuracy >= 50%")
     print(f"{'='*60}")
 
     return any_passed

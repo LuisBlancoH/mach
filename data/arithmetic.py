@@ -71,3 +71,63 @@ def extract_number(text):
     if match:
         return match.group()
     return None
+
+
+def _make_operands(op_type):
+    """Generate operands and answer for a given operation type."""
+    if op_type == "add":
+        a = random.randint(100, 9999)
+        b = random.randint(100, 9999)
+        return a, b, a + b
+    elif op_type == "sub":
+        a = random.randint(100, 9999)
+        b = random.randint(100, a)
+        return a, b, a - b
+    elif op_type == "mul":
+        a = random.randint(10, 99)
+        b = random.randint(10, 99)
+        return a, b, a * b
+    elif op_type == "div":
+        b = random.randint(2, 99)
+        answer = random.randint(10, 999)
+        a = b * answer
+        return a, b, answer
+    else:
+        raise ValueError(f"Unknown op_type: {op_type}")
+
+
+def generate_few_shot_episode(n_problems, n_demos=None, op_type=None):
+    """
+    Generate a few-shot episode with a hidden operation.
+
+    Picks a random operation (add/sub/mul/div) but uses '?' as the
+    symbol. Demo problems show the complete answer; test problems
+    show only the question. The model must infer the operation from
+    demos and apply it to test problems.
+    """
+    if n_demos is None:
+        n_demos = max(2, n_problems // 4)
+    if op_type is None:
+        op_type = random.choice(["add", "sub", "mul", "div"])
+
+    problems = []
+    for i in range(n_problems):
+        a, b, answer = _make_operands(op_type)
+        is_demo = (i < n_demos)
+
+        if is_demo:
+            prompt = f"{a} ? {b} = {answer}"
+        else:
+            prompt = f"{a} ? {b} = "
+
+        problems.append({
+            "prompt": prompt,
+            "answer": str(answer),
+            "a": a,
+            "b": b,
+            "op": op_type,
+            "is_demo": is_demo,
+            "difficulty": op_type,
+        })
+
+    return problems

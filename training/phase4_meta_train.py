@@ -7,13 +7,15 @@ try:
 except ImportError:
     wandb = None
 
-from data.arithmetic import generate_arithmetic_problems, extract_number
+from data.arithmetic import (
+    generate_arithmetic_problems, extract_number, generate_few_shot_episode,
+)
 import config
 
 
 DEFAULT_CURRICULUM = [
-    (0, 300, "single"),      # Warm up on d6 (multiplication)
-    (300, 2000, "diverse"),  # Mix operations: add, subtract, multiply, divide
+    (0, 300, "single"),       # Warm up on d6 (multiplication)
+    (300, 2000, "few_shot"),  # Few-shot: hidden operation, must infer from demos
 ]
 
 
@@ -35,9 +37,8 @@ def generate_episode_problems(n_problems, mode):
             p["difficulty"] = diff
             problems.append(p)
         return problems
-    else:  # diverse: mix operations that need conflicting patches
+    elif mode == "diverse":
         problems = []
-        # add(1), subtract(3), multiply(6), divide(8)
         op_diffs = [1, 3, 6, 8]
         for _ in range(n_problems):
             diff = random.choice(op_diffs)
@@ -45,6 +46,8 @@ def generate_episode_problems(n_problems, mode):
             p["difficulty"] = diff
             problems.append(p)
         return problems
+    else:  # few_shot
+        return generate_few_shot_episode(n_problems)
 
 
 def run_episode_phase4(base_model, mach, patched_model, tokenizer,
@@ -94,6 +97,14 @@ def run_episode_phase4(base_model, mach, patched_model, tokenizer,
 
         # Step 4: Apply writes
         mach.apply_writes(writes)
+
+        # Demo problems: observe and write, but skip evaluation
+        if problem.get("is_demo", False):
+            rewards.append(0.0)
+            problem_losses.append(0.0)
+            last_value = current_value.detach()
+            last_reward = 0.0
+            continue
 
         # Step 5: Forward Qwen with patches
         full_text = problem["prompt"] + problem["answer"]
@@ -277,14 +288,19 @@ def meta_train_phase4(base_model, mach, patched_model, tokenizer, device,
         cerebellum_optimizer.step()
 
         if episode_idx % 10 == 0:
-            avg_reward = sum(rewards) / len(rewards)
-            n_early = min(5, len(rewards))
-            n_late = min(5, len(rewards))
+            # Filter test-only rewards (exclude demos)
+            test_rewards = [r for j, r in enumerate(rewards)
+                           if not problems[j].get("is_demo", False)]
+            if not test_rewards:
+                test_rewards = rewards
+            avg_reward = sum(test_rewards) / len(test_rewards)
+            n_early = min(5, len(test_rewards))
+            n_late = min(5, len(test_rewards))
             early_acc = sum(
-                1 for r in rewards[:n_early] if r > 0
+                1 for r in test_rewards[:n_early] if r > 0
             ) / n_early
             late_acc = sum(
-                1 for r in rewards[-n_late:] if r > 0
+                1 for r in test_rewards[-n_late:] if r > 0
             ) / n_late
 
             surprise_str = ""
@@ -302,16 +318,18 @@ def meta_train_phase4(base_model, mach, patched_model, tokenizer, device,
                 )
 
             diff_str = ""
-            if mode in ("mixed", "diverse"):
+            if mode in ("mixed", "diverse", "few_shot"):
                 diff_correct = {}
                 diff_total = {}
                 for j, p in enumerate(problems):
+                    if p.get("is_demo", False):
+                        continue
                     d = p.get("difficulty", "?")
                     diff_total[d] = diff_total.get(d, 0) + 1
                     if rewards[j] > 0:
                         diff_correct[d] = diff_correct.get(d, 0) + 1
                 diff_str = " | " + " ".join(
-                    f"d{d}={diff_correct.get(d,0)}/{diff_total[d]}"
+                    f"{d}={diff_correct.get(d,0)}/{diff_total[d]}"
                     for d in sorted(diff_total)
                 )
 
@@ -356,11 +374,18 @@ def meta_train_phase4(base_model, mach, patched_model, tokenizer, device,
         if (episode_idx % 200 == 0 and episode_idx > 0) or \
                 episode_idx == n_episodes - 1:
             _log_diagnostics_phase4(mach, meta_params, episode_idx)
-            for eval_diff in [3, 6, 8]:
-                _run_validation_phase4(
-                    base_model, mach, patched_model, tokenizer,
-                    device, eval_diff, episode_idx
-                )
+            if mode == "few_shot":
+                for op in ["add", "sub", "mul", "div"]:
+                    _run_few_shot_validation(
+                        base_model, mach, patched_model, tokenizer,
+                        device, op, episode_idx
+                    )
+            else:
+                for eval_diff in [6, 7]:
+                    _run_validation_phase4(
+                        base_model, mach, patched_model, tokenizer,
+                        device, eval_diff, episode_idx
+                    )
 
 
 def _run_validation_phase4(base_model, mach, patched_model, tokenizer, device,
@@ -488,6 +513,112 @@ def _run_validation_phase4(base_model, mach, patched_model, tokenizer, device,
             f"eval/d{difficulty}_avg_reward": avg_reward,
             f"eval/d{difficulty}_avg_value": mean_val,
             f"eval/d{difficulty}_avg_surprise": avg_surprise,
+        })
+
+
+def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
+                              device, op_type, episode_idx, n_episodes=10,
+                              n_problems=20, n_demos=5):
+    """Evaluate few-shot performance for a specific operation."""
+    test_correct = 0
+    test_total = 0
+    test_correct_early = 0
+    test_correct_late = 0
+    test_total_early = 0
+    test_total_late = 0
+    all_surprises = []
+    n_test = n_problems - n_demos
+
+    for ep in range(n_episodes):
+        problems = generate_few_shot_episode(
+            n_problems, n_demos=n_demos, op_type=op_type
+        )
+        mach.reset_episode()
+        last_value = torch.tensor(0.0, device=device)
+        last_td_error = torch.tensor(0.0, device=device)
+        test_idx = 0
+
+        for i, problem in enumerate(problems):
+            input_ids = tokenizer(
+                problem["prompt"], return_tensors="pt"
+            ).input_ids.to(device)
+
+            gru_memory = mach.observe(base_model, input_ids)
+            writes = mach.fire(gru_memory, last_value, last_td_error)
+
+            with torch.no_grad():
+                current_value = mach.get_value()
+
+            mach.apply_writes(writes)
+
+            if problem["is_demo"]:
+                last_value = current_value.detach()
+                continue
+
+            # Evaluate test problem
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+            if test_idx < 5:
+                test_correct_early += int(correct)
+                test_total_early += 1
+            if test_idx >= n_test - 5:
+                test_correct_late += int(correct)
+                test_total_late += 1
+            test_idx += 1
+
+            reward = 1.0 if correct else -1.0
+            if test_idx > 1:
+                td_target = torch.tensor(
+                    reward, device=device, dtype=torch.float32
+                )
+                last_td_error = (td_target - last_value).detach()
+            last_value = current_value.detach()
+
+        cb_diag = mach.get_cerebellum_diagnostics()
+        if "avg_surprise" in cb_diag:
+            all_surprises.append(cb_diag["avg_surprise"])
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    early_acc = (
+        test_correct_early / test_total_early if test_total_early > 0 else 0
+    )
+    late_acc = (
+        test_correct_late / test_total_late if test_total_late > 0 else 0
+    )
+    delta = late_acc - early_acc
+    avg_surprise = (
+        sum(all_surprises) / len(all_surprises) if all_surprises else 0
+    )
+
+    print(
+        f"  EVAL ep{episode_idx} {op_type:3s} | "
+        f"test={test_acc:.0%} early={early_acc:.0%} late={late_acc:.0%} "
+        f"delta={delta:+.0%} avg_surp={avg_surprise:.3f}"
+    )
+
+    if wandb is not None:
+        wandb.log({
+            f"eval/{op_type}_test": test_acc,
+            f"eval/{op_type}_early": early_acc,
+            f"eval/{op_type}_late": late_acc,
+            f"eval/{op_type}_delta": delta,
         })
 
 
