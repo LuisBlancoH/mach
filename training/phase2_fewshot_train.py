@@ -15,6 +15,7 @@ except ImportError:
 
 from data.arithmetic import (
     generate_arithmetic_problems, extract_number, generate_few_shot_episode,
+    generate_linear_episode, LINEAR_COEFFS,
 )
 import config
 
@@ -35,6 +36,8 @@ def get_episode_mode(episode_idx, curriculum):
 def generate_episode_problems(n_problems, mode):
     if mode == "single":
         return generate_arithmetic_problems(n_problems, 6)
+    elif mode == "linear":
+        return generate_linear_episode(n_problems)
     else:  # few_shot
         return generate_few_shot_episode(n_problems)
 
@@ -257,6 +260,14 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                         device, op, episode_idx,
                         no_rewards=no_rewards,
                     )
+            elif mode == "linear":
+                for c1 in LINEAR_COEFFS:
+                    for c2 in LINEAR_COEFFS:
+                        _run_linear_validation(
+                            base_model, mach, patched_model, tokenizer,
+                            device, (c1, c2), episode_idx,
+                            no_rewards=True,
+                        )
             else:
                 for eval_diff in [6, 7]:
                     _run_standard_validation(
@@ -368,6 +379,63 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
             f"eval/{op_type}_late": late_acc,
             f"eval/{op_type}_delta": delta,
         })
+
+
+def _run_linear_validation(base_model, mach, patched_model, tokenizer,
+                            device, coeffs, episode_idx, n_episodes=10,
+                            n_problems=20, n_demos=5, no_rewards=False):
+    """Evaluate linear combination performance for specific (c1, c2)."""
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_linear_episode(
+            n_problems, n_demos=n_demos, coeffs=coeffs
+        )
+        mach.reset_episode()
+
+        for i, problem in enumerate(problems):
+            input_ids = tokenizer(
+                problem["prompt"], return_tensors="pt"
+            ).input_ids.to(device)
+
+            gru_memory = mach.observe(base_model, input_ids)
+            reward_signals = torch.zeros(3, device=device, dtype=torch.float32)
+            writes = mach.fire(gru_memory, reward_signals)
+            mach.apply_writes(writes)
+
+            if problem["is_demo"]:
+                continue
+
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    c1, c2 = coeffs
+    label = f"{c1}a+{c2}b"
+
+    print(
+        f"  EVAL ep{episode_idx} {label:8s} | test={test_acc:.0%}"
+    )
+
+    if wandb is not None:
+        wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
 
 
 def _run_standard_validation(base_model, mach, patched_model, tokenizer,

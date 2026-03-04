@@ -142,3 +142,53 @@ def generate_few_shot_episode(n_problems, n_demos=None, op_type=None):
         })
 
     return problems
+
+
+# ---- Linear combination episodes ----
+
+LINEAR_COEFFS = [0, 1, 2]
+
+
+def generate_linear_episode(n_problems, n_demos=None, coeffs=None):
+    """
+    Generate a few-shot episode for a random linear combination f(a,b) = c1*a + c2*b.
+
+    Each episode picks random (c1, c2) from LINEAR_COEFFS. Demos show
+    the complete answer; test problems show only the question. The model
+    must infer the coefficients from demos and apply them.
+
+    Same "a ? b = " format as few-shot episodes.
+    """
+    if n_demos is None:
+        n_demos = max(2, n_problems // 4)
+    if coeffs is None:
+        c1 = random.choice(LINEAR_COEFFS)
+        c2 = random.choice(LINEAR_COEFFS)
+    else:
+        c1, c2 = coeffs
+
+    problems = []
+    for i in range(n_problems):
+        a = random.randint(10, 99)
+        b = random.randint(10, 99)
+        answer = c1 * a + c2 * b
+        is_demo = (i < n_demos)
+
+        if is_demo:
+            prompt = f"{a} ? {b} = {answer}"
+        else:
+            prompt = f"{a} ? {b} = "
+
+        problems.append({
+            "prompt": prompt,
+            "answer": str(answer),
+            "a": a,
+            "b": b,
+            "op": f"linear_{c1}_{c2}",
+            "is_demo": is_demo,
+            "difficulty": "linear",
+            "c1": c1,
+            "c2": c2,
+        })
+
+    return problems
