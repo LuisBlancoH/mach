@@ -30,47 +30,33 @@ from models.universal_module import MACHPhase2, MACHPhase3, MACHPatchedModel
 # ---- Held-out operation generators ----
 
 def _make_operands_heldout(op_type):
-    """Generate operands and answer for held-out operations."""
-    if op_type == "mod":
-        # Modular arithmetic: a % b
-        a = random.randint(100, 9999)
-        b = random.randint(2, 99)
-        return a, b, a % b
-    elif op_type == "max":
-        a = random.randint(100, 9999)
-        b = random.randint(100, 9999)
-        return a, b, max(a, b)
-    elif op_type == "min":
-        a = random.randint(100, 9999)
-        b = random.randint(100, 9999)
-        return a, b, min(a, b)
-    elif op_type == "add_mul":
-        # a*b + a
-        a = random.randint(10, 99)
-        b = random.randint(10, 99)
-        return a, b, a * b + a
-    elif op_type == "square_diff":
-        # a^2 - b^2
-        a = random.randint(10, 99)
-        b = random.randint(10, a)
-        return a, b, a * a - b * b
-    elif op_type == "add":
-        a = random.randint(100, 9999)
-        b = random.randint(100, 9999)
+    """Generate operands and answer for held-out operations.
+
+    All ops use a,b in [10, 99] with a >= b to match training ranges.
+    """
+    a = random.randint(10, 99)
+    b = random.randint(10, 99)
+    if b > a:
+        a, b = b, a
+
+    if op_type == "add":
         return a, b, a + b
     elif op_type == "sub":
-        a = random.randint(100, 9999)
-        b = random.randint(100, a)
         return a, b, a - b
     elif op_type == "mul":
-        a = random.randint(10, 99)
-        b = random.randint(10, 99)
         return a, b, a * b
     elif op_type == "div":
-        b = random.randint(2, 99)
-        answer = random.randint(10, 999)
-        a = b * answer
-        return a, b, answer
+        return a, b, a // b
+    elif op_type == "mod":
+        return a, b, a % b
+    elif op_type == "max":
+        return a, b, max(a, b)
+    elif op_type == "min":
+        return a, b, min(a, b)
+    elif op_type == "add_mul":
+        return a, b, a * b + a
+    elif op_type == "square_diff":
+        return a, b, a * a - b * b
     else:
         raise ValueError(f"Unknown op_type: {op_type}")
 
