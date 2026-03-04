@@ -334,8 +334,10 @@ class MACHPhase4(MACHPhase3):
     Changes from Phase 3:
     - Replaces SimpleGRU with SurpriseGatedGRU
     - Adds Cerebellum (predictor + correction projection)
+    - Observation-conditioned action head (skip connection from GRU memory)
     - observe() computes surprise and correction from cerebellar prediction error
     - fire() uses accumulated correction at position 2 (was zeros)
+    - fire() passes gru_memory directly to action head for obs-conditioning
     - Cerebellum predictor has its own optimizer (online supervised)
     - correction_proj is in meta_params (gets CE loss gradient)
     """
@@ -350,6 +352,13 @@ class MACHPhase4(MACHPhase3):
 
         # Replace SimpleGRU with SurpriseGatedGRU
         self.gru = SurpriseGatedGRU(d_meta, surprise_scale=surprise_scale)
+
+        # Observation-conditioned action head (skip connection)
+        # GRU memory goes directly to action head, bypassing transformer.
+        # Zero-init obs weights so it starts identical to Phase 3.
+        self.action_head = ActionHead(
+            d_meta, len(patch_layers), n_basis, obs_conditioned=True,
+        )
 
         # Cerebellum
         self.cerebellum = Cerebellum(d_meta, hidden_dim=d_meta)
@@ -462,7 +471,7 @@ class MACHPhase4(MACHPhase3):
         hidden = self.transformer(tokens)  # (7, d_meta)
         self._last_hidden = hidden
 
-        writes = self.action_head(hidden[4])
+        writes = self.action_head(hidden[4], gru_memory)
         self._tf_mem = self.memory_head(hidden[5], self._tf_mem)
 
         # Reset accumulated correction after firing
@@ -492,9 +501,20 @@ class MACHPhase4(MACHPhase3):
     def load_phase3_checkpoint(self, checkpoint_path, device='cpu'):
         """
         Load Phase 3 checkpoint. GRU cell weights transfer directly.
-        Cerebellum components start fresh.
+        Cerebellum components start fresh. Action head fc1 is resized:
+        Phase 3 has (64, 128), Phase 4 has (64, 256) — the first 128
+        columns are loaded, the obs half stays zero-initialized.
         """
         state_dict = torch.load(checkpoint_path, map_location=device)
+
+        # Handle action_head.fc1 shape mismatch (128 -> 256 input)
+        key = "action_head.fc1.weight"
+        if key in state_dict and self.action_head.obs_conditioned:
+            old_weight = state_dict[key]  # (64, 128)
+            new_weight = self.action_head.fc1.weight.data.clone()  # (64, 256)
+            new_weight[:, :old_weight.shape[1]] = old_weight
+            state_dict[key] = new_weight
+
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
         print(f"  Loaded Phase 3 checkpoint: {len(state_dict)} keys loaded, "
               f"{len(missing)} missing (new), {len(unexpected)} unexpected")
