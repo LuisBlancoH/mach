@@ -76,6 +76,7 @@ PHASE5_GRAD_CLIP = 1.0
 PHASE5_N_DELIBERATION_STEPS = 0  # 0 = no deliberation, 3+ = iterative refinement
 PHASE5_DECORR_BETA = 0.01        # lateral inhibition: decorrelation loss weight
 PHASE5_TASK_NOISE = 0.0          # forgetting: noise std on task state (0 = off)
+PHASE5_ENERGY_BETA = 0.0         # free energy: unified metabolic cost (0 = use separate losses)
 
 # Future phases
 MAX_INTERVAL = 16

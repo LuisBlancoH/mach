@@ -110,6 +110,10 @@ def main():
         "--task-noise", type=float, default=None,
         help="Noise std on task state for forgetting regularization"
     )
+    parser.add_argument(
+        "--energy-beta", type=float, default=None,
+        help="Unified metabolic cost weight (replaces sparsity + decorr)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -139,6 +143,7 @@ def main():
                 "architecture": "phase5",
                 "deliberation_steps": args.deliberation_steps or config.PHASE5_N_DELIBERATION_STEPS,
                 "task_noise": args.task_noise or config.PHASE5_TASK_NOISE,
+                "energy_beta": args.energy_beta or config.PHASE5_ENERGY_BETA,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -166,6 +171,7 @@ def main():
         curriculum=curriculum,
         sparsity_beta=args.sparsity_beta,
         decorr_beta=args.decorr_beta,
+        energy_beta=args.energy_beta,
     )
 
     torch.save(mach.state_dict(), save_path)

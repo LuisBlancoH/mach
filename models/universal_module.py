@@ -874,6 +874,40 @@ class MACHPhase5(nn.Module):
             )
             self.patches[patch_idx].accumulate_write(weight_name, delta_W)
 
+    def metabolic_cost(self):
+        """
+        Free energy principle: total activation cost across the meta-learner.
+
+        Replaces separate sparsity + decorrelation losses with a single
+        cost: how much energy is the system expending? Less is better,
+        subject to being accurate.
+
+        Components:
+        - Task state activation (PFC firing cost)
+        - Patch delta magnitude (motor execution cost)
+        - GRU hidden state (memory maintenance cost)
+
+        Sparsity, decorrelation, and robustness emerge naturally from
+        minimizing this single cost under prediction error pressure.
+        """
+        cost = torch.tensor(0.0, device=self._task_state.device)
+
+        # PFC firing cost: activation magnitude
+        cost = cost + self._task_state.abs().mean()
+
+        # Motor execution cost: patch modification magnitude
+        for patch in self.patches:
+            if patch.delta_down is not None:
+                cost = cost + patch.delta_down.abs().mean()
+            if patch.delta_up is not None:
+                cost = cost + patch.delta_up.abs().mean()
+
+        # Memory maintenance cost: GRU hidden state
+        if self.gru.memory is not None:
+            cost = cost + self.gru.memory.abs().mean()
+
+        return cost
+
 
 class MACHPatchedModel(nn.Module):
     """Wraps Qwen with MACH differentiable patches hooked into residual stream."""

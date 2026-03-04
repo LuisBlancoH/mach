@@ -148,7 +148,8 @@ def compute_decorrelation_loss(task_state_buffer, current_task_state):
 def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       device, n_episodes=None, lr=None, curriculum=None,
                       checkpoint_path=None, save_path=None,
-                      sparsity_beta=None, decorr_beta=None):
+                      sparsity_beta=None, decorr_beta=None,
+                      energy_beta=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -160,6 +161,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         sparsity_beta = config.PHASE5_SPARSITY_BETA
     if decorr_beta is None:
         decorr_beta = config.PHASE5_DECORR_BETA
+    if energy_beta is None:
+        energy_beta = config.PHASE5_ENERGY_BETA
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -169,9 +172,13 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
     meta_params = list(mach.parameters())
     optimizer = torch.optim.Adam(meta_params, lr=lr)
 
+    use_energy = energy_beta > 0
     n_meta = sum(p.numel() for p in meta_params)
     print(f"Phase 5 trainable parameters: {n_meta:,}")
-    print(f"Sparsity beta: {sparsity_beta}, decorr beta: {decorr_beta}")
+    if use_energy:
+        print(f"Using unified energy loss (beta={energy_beta})")
+    else:
+        print(f"Sparsity beta: {sparsity_beta}, decorr beta: {decorr_beta}")
 
     # Rolling buffer of task states for decorrelation loss
     task_state_buffer = []
@@ -200,26 +207,36 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                 )
-            # Decorrelation loss (lateral inhibition)
-            task_state = mach.get_task_state()
-            if task_state is not None:
-                decorr_loss = compute_decorrelation_loss(
-                    task_state_buffer, task_state
-                )
-                decorr_loss = decorr_loss.to(device)
-                # Update buffer with detached copy
-                task_state_buffer.append(task_state.detach())
-                if len(task_state_buffer) > BUFFER_SIZE:
-                    task_state_buffer.pop(0)
-            else:
-                decorr_loss = torch.tensor(0.0, device=device)
 
-            total_loss = ce_loss + sparsity_beta * sparsity_loss \
-                + decorr_beta * decorr_loss
+            if use_energy:
+                # Unified free energy: prediction error + metabolic cost
+                metabolic = mach.metabolic_cost()
+                total_loss = ce_loss + energy_beta * metabolic
+                energy_scalar = metabolic.item()
+                sparsity_scalar = sparsity_loss.item()
+                decorr_scalar = 0.0
+            else:
+                # Separate losses: sparsity + decorrelation
+                task_state = mach.get_task_state()
+                if task_state is not None:
+                    decorr_loss = compute_decorrelation_loss(
+                        task_state_buffer, task_state
+                    )
+                    decorr_loss = decorr_loss.to(device)
+                    task_state_buffer.append(task_state.detach())
+                    if len(task_state_buffer) > BUFFER_SIZE:
+                        task_state_buffer.pop(0)
+                else:
+                    decorr_loss = torch.tensor(0.0, device=device)
+
+                total_loss = ce_loss + sparsity_beta * sparsity_loss \
+                    + decorr_beta * decorr_loss
+                energy_scalar = 0.0
+                decorr_scalar = decorr_loss.item()
+                sparsity_scalar = sparsity_loss.item()
+
             total_loss.backward()
             loss_scalar = ce_loss.item()
-            sparsity_scalar = sparsity_loss.item()
-            decorr_scalar = decorr_loss.item()
 
         except torch.cuda.OutOfMemoryError:
             print(f"\n  OOM at episode {episode_idx}. Reducing problems.")
@@ -236,6 +253,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             loss_scalar = ce_loss.item()
             sparsity_scalar = sparsity_loss.item()
             decorr_scalar = 0.0
+            energy_scalar = 0.0
 
         torch.nn.utils.clip_grad_norm_(
             meta_params, max_norm=config.PHASE5_GRAD_CLIP
@@ -283,10 +301,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     for d in sorted(diff_total)
                 )
 
+            if use_energy:
+                cost_str = f"energy={energy_scalar:.3f}"
+            else:
+                cost_str = f"sp={sparsity_scalar:.3f} dc={decorr_scalar:.3f}"
+
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
-                f"ce={loss_scalar:.4f} sp={sparsity_scalar:.3f} "
-                f"dc={decorr_scalar:.3f} | "
+                f"ce={loss_scalar:.4f} {cost_str} | "
                 f"avg_r={avg_reward:.2f} "
                 f"early={early_acc:.0%} late={late_acc:.0%} | "
                 f"active={n_active:.0f}/{mach.d_task} max={ts_max:.2f}"
@@ -299,6 +321,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     "ce_loss": loss_scalar,
                     "sparsity_loss": sparsity_scalar,
                     "decorr_loss": decorr_scalar,
+                    "energy_cost": energy_scalar,
                     "avg_reward": avg_reward,
                     "early_accuracy": early_acc,
                     "late_accuracy": late_acc,
