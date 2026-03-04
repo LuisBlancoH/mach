@@ -77,15 +77,16 @@ def _make_operands(op_type):
     """
     Generate operands with UNIFORM ranges across all operations.
 
-    All ops use a, b in [10, 99] with a >= b. The test prompt
-    "a ? b = " is indistinguishable across operations — the model
-    MUST read demos to determine which operation to apply.
+    All ops use a, b in [10, 99]. Order is random EXCEPT for sub/div
+    where a >= b is enforced (to keep answers non-negative / meaningful).
 
-    Division uses integer floor division (a // b), giving answers 1-9.
+    The test prompt "a ? b = " is indistinguishable across operations —
+    the model MUST read demos to determine which operation to apply.
     """
     a = random.randint(10, 99)
     b = random.randint(10, 99)
-    if b > a:
+
+    if op_type in ("sub", "div") and b > a:
         a, b = b, a
 
     if op_type == "add":
@@ -96,6 +97,12 @@ def _make_operands(op_type):
         return a, b, a * b
     elif op_type == "div":
         return a, b, a // b
+    elif op_type == "mod":
+        return a, b, a % b
+    elif op_type == "max":
+        return a, b, max(a, b)
+    elif op_type == "min":
+        return a, b, min(a, b)
     else:
         raise ValueError(f"Unknown op_type: {op_type}")
 
@@ -112,7 +119,7 @@ def generate_few_shot_episode(n_problems, n_demos=None, op_type=None):
     if n_demos is None:
         n_demos = max(2, n_problems // 4)
     if op_type is None:
-        op_type = random.choice(["add", "sub", "mul", "div"])
+        op_type = random.choice(["add", "sub", "mul", "div", "mod", "max", "min"])
 
     problems = []
     for i in range(n_problems):

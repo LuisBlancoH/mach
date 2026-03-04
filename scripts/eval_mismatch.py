@@ -182,7 +182,7 @@ def main():
 
     patched_model = MACHPatchedModel(base_model, mach)
 
-    ops = ["add", "sub", "mul", "div"]
+    ops = ["add", "sub", "mul", "div", "mod", "max", "min"]
 
     print(f"\n{'='*70}")
     print(f"MISMATCH EVALUATION — Phase {args.phase}")

@@ -32,11 +32,12 @@ from models.universal_module import MACHPhase2, MACHPhase3, MACHPatchedModel
 def _make_operands_heldout(op_type):
     """Generate operands and answer for held-out operations.
 
-    All ops use a,b in [10, 99] with a >= b to match training ranges.
+    All ops use a,b in [10, 99]. Only sub/div enforce a >= b.
+    Matches training distribution in _make_operands().
     """
     a = random.randint(10, 99)
     b = random.randint(10, 99)
-    if b > a:
+    if op_type in ("sub", "div") and b > a:
         a, b = b, a
 
     if op_type == "add":
@@ -204,8 +205,8 @@ def main():
 
     patched_model = MACHPatchedModel(base_model, mach)
 
-    trained_ops = ["add", "sub", "mul", "div"]
-    heldout_ops = ["mod", "max", "min", "add_mul", "square_diff"]
+    trained_ops = ["add", "sub", "mul", "div", "mod", "max", "min"]
+    heldout_ops = ["add_mul", "square_diff"]
 
     print(f"\n{'='*70}")
     print(f"HELD-OUT EVALUATION — Phase {args.phase}")

@@ -27,6 +27,9 @@ EVAL_OPS = {
     "sub": "subtraction",
     "mul": "multiplication",
     "div": "division",
+    "mod": "modulo",
+    "max": "maximum",
+    "min": "minimum",
 }
 
 

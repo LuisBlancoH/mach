@@ -251,7 +251,7 @@ def meta_train_phase2_fewshot(base_model, mach, patched_model, tokenizer,
                 episode_idx == n_episodes - 1:
             _log_diagnostics(mach, meta_params, episode_idx)
             if mode == "few_shot":
-                for op in ["add", "sub", "mul", "div"]:
+                for op in ["add", "sub", "mul", "div", "mod", "max", "min"]:
                     _run_few_shot_validation(
                         base_model, mach, patched_model, tokenizer,
                         device, op, episode_idx,
