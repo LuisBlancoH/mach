@@ -37,7 +37,7 @@ def _make_operands_heldout(op_type):
     """
     a = random.randint(10, 99)
     b = random.randint(10, 99)
-    if op_type in ("sub", "div") and b > a:
+    if op_type in ("sub", "div", "square_diff") and b > a:
         a, b = b, a
 
     if op_type == "add":
