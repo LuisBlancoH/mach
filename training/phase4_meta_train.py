@@ -12,8 +12,8 @@ import config
 
 
 DEFAULT_CURRICULUM = [
-    (0, 300, "single"),      # Warm up on d6 while cerebellum learns predictions
-    (300, 2000, "mixed"),    # Mixed d5/d6/d7
+    (0, 300, "single"),      # Warm up on d6 (multiplication)
+    (300, 2000, "diverse"),  # Mix operations: add, subtract, multiply, divide
 ]
 
 
@@ -27,10 +27,20 @@ def get_episode_mode(episode_idx, curriculum):
 def generate_episode_problems(n_problems, mode):
     if mode == "single":
         return generate_arithmetic_problems(n_problems, 6)
-    else:
+    elif mode == "mixed":
         problems = []
         for _ in range(n_problems):
             diff = random.choice([5, 6, 7])
+            p = generate_arithmetic_problems(1, diff)[0]
+            p["difficulty"] = diff
+            problems.append(p)
+        return problems
+    else:  # diverse: mix operations that need conflicting patches
+        problems = []
+        # add(1), subtract(3), multiply(6), divide(8)
+        op_diffs = [1, 3, 6, 8]
+        for _ in range(n_problems):
+            diff = random.choice(op_diffs)
             p = generate_arithmetic_problems(1, diff)[0]
             p["difficulty"] = diff
             problems.append(p)
@@ -292,7 +302,7 @@ def meta_train_phase4(base_model, mach, patched_model, tokenizer, device,
                 )
 
             diff_str = ""
-            if mode == "mixed":
+            if mode in ("mixed", "diverse"):
                 diff_correct = {}
                 diff_total = {}
                 for j, p in enumerate(problems):
@@ -346,7 +356,7 @@ def meta_train_phase4(base_model, mach, patched_model, tokenizer, device,
         if (episode_idx % 200 == 0 and episode_idx > 0) or \
                 episode_idx == n_episodes - 1:
             _log_diagnostics_phase4(mach, meta_params, episode_idx)
-            for eval_diff in [5, 6, 7]:
+            for eval_diff in [3, 6, 8]:
                 _run_validation_phase4(
                     base_model, mach, patched_model, tokenizer,
                     device, eval_diff, episode_idx

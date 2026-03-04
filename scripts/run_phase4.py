@@ -23,10 +23,9 @@ from training.phase4_meta_train import meta_train_phase4
 
 
 EVAL_DIFFICULTIES = {
-    5: "2x2 multiplication",
+    3: "4-digit subtraction",
     6: "3x2 multiplication",
-    7: "3x3 multiplication",
-    9: "mixed hard",
+    8: "4-digit division",
 }
 
 
