@@ -19,6 +19,16 @@ for _ in range(n_think_steps):
 
 Cheap (d_task=32), and the model learns effective iteration count via gating (gate→0 = stop changing).
 
+**How the brain stops deliberating**: PFC recurrent dynamics settle into attractor states — stable patterns that stop changing. Deliberation IS the settling process, not a timed loop. Additional mechanisms:
+- **Basal ganglia threshold**: Evidence accumulates until crossing a threshold, then BG "releases" the decision. Drift-diffusion model.
+- **Urgency signal**: Over time the threshold drops — willingness to act on less certainty. Time pressure.
+
+**Stopping in our architecture**: Two options:
+- **Option A — Fixed steps, learned gating** (recommended): Run exactly N steps. Gate learns to go to zero when done. No explicit stopping — model just stops changing on later steps. Simplest, fully differentiable.
+- **Option B — Halting probability** (Universal Transformers / ACT): Model outputs halt probability each step. Accumulate until crossing 1.0. Final output = weighted blend. Differentiable, model explicitly learns how much to think.
+
+Option A first. It's just a recurrent loop on task state with a gate network. If the model needs 2 iterations it uses 2 and gates the rest to zero.
+
 **Priority**: HIGH — cheapest change, most likely to help immediately.
 
 ## 2. Self-Evaluation (anterior cingulate cortex, error monitoring)
@@ -133,3 +143,74 @@ Like skill automatization — a pianist doesn't re-derive hand positions each ti
 7. **Consolidation** — sleep, skill permanence
 
 Each step makes the meta-learner more general without changing what Qwen provides. The frozen LLM already knows how to do most things — the meta-learner just needs to learn how to steer it.
+
+## Critic as Basal Ganglia (Revised Understanding)
+
+The critic should NOT be an input to fire() (our old Phase 4 mistake). In the brain, dopamine neurons in the basal ganglia compute reward prediction error (TD error) that does two things:
+
+1. **Modulates plasticity** — how much synapses change, not what they change to
+2. **Gates PFC updating** — basal ganglia literally opens/closes the gate that lets new information into working memory
+
+It does NOT tell PFC what to think. It tells PFC when to update and how strongly to learn.
+
+### Mapping to our architecture
+
+**Task state gate modulation** (BG gates PFC):
+```python
+td_error = critic(gru_memory)
+gate_modulation = sigmoid(td_error)  # scales the gate
+effective_gate = base_gate * gate_modulation
+```
+High TD error → "this observation was surprising/valuable, update your task representation more."
+Low TD error → "expected outcome, gate stays closed, you already understand this."
+
+**Learning rate modulation** (dopamine scales plasticity):
+```python
+ce_loss = cross_entropy(predicted, target)
+td_weight = 1.0 + td_error.abs()  # surprise amplifies learning
+total_loss = ce_loss * td_weight
+```
+We had this in Phase 4 (TD modulation of CE loss). What we were missing was the gating function.
+
+**Deliberation control**: The critic tells the deliberation loop "you haven't figured it out yet, keep thinking" vs "you've got it, stop and act."
+
+### When to add the critic back
+
+Not yet. The critic adds value when the model needs to *manage* its learning (decide what's worth attending to, when to stop thinking). First the bottleneck needs to prove it can learn at all. Add critic when:
+- Train combos saturate but held-out is still 0% (critic might help gating)
+- Deliberation is added (critic controls when to stop)
+- Tasks vary in difficulty (critic prioritizes hard examples)
+
+## Phase 5 Early Results (ep600, linear combinations)
+
+### Observation path is alive
+| Component | Phase 5 | Old Architecture | Ratio |
+|-----------|---------|-----------------|-------|
+| obs_proj  | 0.574   | 0.000089        | 6400x |
+| gru       | 0.086   | 0.000040        | 2150x |
+| task_state| 0.096   | —               | new   |
+
+The bottleneck forces gradient through observation — with 32 sparse dims, the action compiler can't memorize, so the gradient HAS to flow back through obs_proj and GRU to figure out what to put in those dims.
+
+### Training accuracy (Phase 5 vs old at ep600)
+| Combo | Phase 5 | Old |
+|-------|---------|-----|
+| 0a+1b | **100%** | 44% |
+| 1a+1b | **43%** | 12% |
+| 0a+2b | **28%** | 2% |
+| 2a+0b | **21%** | 3% |
+| 1a+0b | 1% | 39% |
+| 2a+2b | 2% | 0% |
+
+Learning faster overall. Learns 2x scaling (28% on 0a+2b), which old architecture couldn't touch.
+
+### Task state diagnostics
+- 8 dims active (>0.5 threshold), 22 active (>0.1)
+- L1 norm = 0.29, max abs = 0.74
+- Using ~quarter of the 32 dims strongly
+
+### Asymmetry
+0a+1b=100% but 1a+0b=1%. Model finds second operand (b) much easier to extract. Likely because in "a ? b = answer" format, b is closer to the answer position.
+
+### Held-out: still 0%
+Expected at ep600 — train combos not saturated yet. Generalization typically kicks in once model is forced to share representations across all training tasks.
