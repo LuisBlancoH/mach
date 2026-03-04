@@ -114,6 +114,10 @@ def main():
         "--energy-beta", type=float, default=None,
         help="Unified metabolic cost weight (replaces sparsity + decorr)"
     )
+    parser.add_argument(
+        "--self-eval-steps", type=int, default=None,
+        help="Self-evaluation rounds: observe own patched output on demos"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -172,6 +176,7 @@ def main():
         sparsity_beta=args.sparsity_beta,
         decorr_beta=args.decorr_beta,
         energy_beta=args.energy_beta,
+        n_self_eval_steps=args.self_eval_steps,
     )
 
     torch.save(mach.state_dict(), save_path)

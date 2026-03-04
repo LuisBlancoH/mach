@@ -874,6 +874,39 @@ class MACHPhase5(nn.Module):
             )
             self.patches[patch_idx].accumulate_write(weight_name, delta_W)
 
+    def observe_patched(self, patched_model, input_ids):
+        """
+        Self-evaluation: observe own output through patched model.
+
+        Same observation pathway (obs_proj → GRU) but runs through
+        patched_model instead of base_model, so hidden states reflect
+        current patches. The meta-learner sees what its modifications
+        produce and can compare with earlier demo observations.
+
+        Task-agnostic: no explicit error computation, the model learns
+        to detect its own errors through the same pathway it uses for
+        everything else.
+        """
+        with torch.no_grad():
+            hidden_state = None
+            target_layer = self.patch_layers[len(self.patch_layers) // 2]
+
+            def hook(module, input, output):
+                nonlocal hidden_state
+                if isinstance(output, tuple):
+                    hidden_state = output[0][:, -1, :]
+                else:
+                    hidden_state = output[:, -1, :]
+
+            h = patched_model.base_model.model.layers[target_layer] \
+                .register_forward_hook(hook)
+            patched_model(input_ids=input_ids)
+            h.remove()
+
+        projected = self.obs_proj(hidden_state.float().unsqueeze(1)).squeeze(0)
+        gru_memory = self.gru.integrate(projected)
+        return gru_memory
+
     def metabolic_cost(self):
         """
         Free energy principle: total activation cost across the meta-learner.

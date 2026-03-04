@@ -54,9 +54,11 @@ def generate_episode_problems(n_problems, mode):
 
 
 def run_episode_phase5(base_model, mach, patched_model, tokenizer,
-                       problems, device):
+                       problems, device, n_self_eval_steps=0):
     """
     Phase 5 episode. No reward signals. Sparsity loss on task state.
+    Optional self-evaluation: after demos, observe own patched output
+    on demo problems to detect and correct errors.
     """
     mach.reset_episode()
 
@@ -64,6 +66,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     problem_losses = []
     sparsity_losses = []
     qwen_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    demo_problems = []
 
     for i, problem in enumerate(problems):
         input_ids = tokenizer(
@@ -85,8 +88,30 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
 
         # Skip demo evaluation
         if problem.get("is_demo", False):
+            demo_problems.append(problem)
             rewards.append(0.0)
             problem_losses.append(0.0)
+
+            # Self-evaluation after last demo
+            if n_self_eval_steps > 0 and i == len(problems) - 1 or \
+                    (i + 1 < len(problems) and
+                     not problems[i + 1].get("is_demo", False)):
+                for step in range(n_self_eval_steps):
+                    demo = demo_problems[step % len(demo_problems)]
+                    demo_ids = tokenizer(
+                        demo["prompt"], return_tensors="pt"
+                    ).input_ids.to(device)
+
+                    # Observe own patched output on demo
+                    gru_memory = mach.observe_patched(
+                        patched_model, demo_ids
+                    )
+                    writes = mach.fire(gru_memory)
+                    sparsity_losses.append(
+                        mach.get_task_state().abs().mean()
+                    )
+                    mach.apply_writes(writes)
+
             continue
 
         # Evaluate with patches
@@ -149,7 +174,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       device, n_episodes=None, lr=None, curriculum=None,
                       checkpoint_path=None, save_path=None,
                       sparsity_beta=None, decorr_beta=None,
-                      energy_beta=None):
+                      energy_beta=None, n_self_eval_steps=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -163,6 +188,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         decorr_beta = config.PHASE5_DECORR_BETA
     if energy_beta is None:
         energy_beta = config.PHASE5_ENERGY_BETA
+    if n_self_eval_steps is None:
+        n_self_eval_steps = config.PHASE5_N_SELF_EVAL_STEPS
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -206,6 +233,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
+                    n_self_eval_steps=n_self_eval_steps,
                 )
 
             if use_energy:
@@ -247,6 +275,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
+                    n_self_eval_steps=n_self_eval_steps,
                 )
             total_loss = ce_loss + sparsity_beta * sparsity_loss
             total_loss.backward()
@@ -346,12 +375,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     _run_linear_validation(
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
+                        n_self_eval_steps=n_self_eval_steps,
                     )
                 print(f"  --- HELD-OUT combos ---")
                 for coeffs in LINEAR_HELDOUT:
                     _run_linear_validation(
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
+                        n_self_eval_steps=n_self_eval_steps,
                     )
                 if mode == "continuous_linear":
                     print(f"  --- NOVEL combos (never in fixed pool) ---")
@@ -359,6 +390,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                         _run_linear_validation(
                             base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx,
+                            n_self_eval_steps=n_self_eval_steps,
                         )
             else:
                 for eval_diff in [6, 7]:
@@ -458,7 +490,7 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
 
 def _run_linear_validation(base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx, n_episodes=10,
-                            n_problems=20, n_demos=5):
+                            n_problems=20, n_demos=5, n_self_eval_steps=0):
     """Evaluate linear combination performance for specific (c1, c2)."""
     test_correct = 0
     test_total = 0
@@ -468,6 +500,7 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
             n_problems, n_demos=n_demos, coeffs=coeffs
         )
         mach.reset_episode()
+        demo_problems = []
 
         for i, problem in enumerate(problems):
             input_ids = tokenizer(
@@ -479,6 +512,22 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
             mach.apply_writes(writes)
 
             if problem["is_demo"]:
+                demo_problems.append(problem)
+                # Self-eval after last demo
+                if n_self_eval_steps > 0 and (
+                    i + 1 >= len(problems) or
+                    not problems[i + 1].get("is_demo", False)
+                ):
+                    for step in range(n_self_eval_steps):
+                        demo = demo_problems[step % len(demo_problems)]
+                        demo_ids = tokenizer(
+                            demo["prompt"], return_tensors="pt"
+                        ).input_ids.to(device)
+                        gru_mem = mach.observe_patched(
+                            patched_model, demo_ids
+                        )
+                        w = mach.fire(gru_mem)
+                        mach.apply_writes(w)
                 continue
 
             full_text = problem["prompt"] + problem["answer"]
