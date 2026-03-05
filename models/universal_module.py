@@ -1650,6 +1650,12 @@ class MACHTwoChannel(nn.Module):
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
+        # Cross-attention demo readout: refine task_state with full demo sequence
+        self.wm_proj = nn.Linear(d_model, d_obs, bias=False)
+        self.demo_cross_attn = WorkingMemoryCrossAttention(d_task, d_obs)
+        # Middle patch layer used for full-sequence capture
+        self._mid_layer_idx = patch_layers[len(patch_layers) // 2]
+
         # Basal ganglia: value estimator
         self.critic = TaskStateCritic(d_task)
 
@@ -1668,9 +1674,11 @@ class MACHTwoChannel(nn.Module):
     def process_demos(self, base_model, demo_input_ids):
         """
         One-shot demo processing: single Qwen forward pass → project → both channels.
+        Cross-attention over full demo sequence refines the rough task_state.
         """
         # Extract hidden states from all patch layers (frozen)
         hidden_states = {}
+        full_seq = {}  # full sequence from middle layer for cross-attention
         hooks = []
 
         with torch.no_grad():
@@ -1679,6 +1687,8 @@ class MACHTwoChannel(nn.Module):
                     def hook(module, input, output):
                         t = output[0] if isinstance(output, tuple) else output
                         hidden_states[idx] = t[:, -1, :]  # last token
+                        if idx == self._mid_layer_idx:
+                            full_seq[idx] = t[0]  # (seq_len, d_model)
                     return hook
                 h = base_model.model.layers[layer_idx].register_forward_hook(
                     make_hook(layer_idx)
@@ -1695,8 +1705,12 @@ class MACHTwoChannel(nn.Module):
             layer_obs.append(proj)
         obs = torch.cat(layer_obs, dim=-1).squeeze(0)  # (d_obs,)
 
-        # Project to task state
+        # Rough task state from DemoProjection
         self._task_state = self.demo_projection(obs)
+
+        # Refine task state with cross-attention over full demo sequence
+        demo_memory = self.wm_proj(full_seq[self._mid_layer_idx].float())  # (seq_len, d_obs)
+        self._task_state = self.demo_cross_attn(self._task_state, demo_memory)
 
         # Channel 1: Modulation
         prim_weights = self.modulation_head(self._task_state)
