@@ -1853,6 +1853,7 @@ class MACHIterative(nn.Module):
 
         # Error observation
         self.error_proj = ErrorProjection(n_error_features=4, d_meta=d_meta)
+        self.error_norm = nn.LayerNorm(d_meta)
 
         # Working memory
         self.gru = SimpleGRU(d_meta)
@@ -1860,8 +1861,10 @@ class MACHIterative(nn.Module):
         # Meta-learner: [gru_mem, error_obs, tf_mem, think_0, think_1]
         self.transformer = MetaLearnerTransformer(d_meta, n_tokens=5)
 
-        # Patch writing
-        self.action_head = ActionHead(d_meta, len(patch_layers), n_basis)
+        # Patch writing — obs_conditioned for skip connection from error_obs
+        self.action_head = ActionHead(
+            d_meta, len(patch_layers), n_basis, obs_conditioned=True
+        )
         self.memory_head = MemoryHead(d_meta)
         self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
         self.patches = nn.ModuleList([
@@ -1962,8 +1965,8 @@ class MACHIterative(nn.Module):
             )
             step_accuracies.append(error_features[1].item())
 
-            # 2. Project error → GRU
-            error_obs = self.error_proj(error_features)
+            # 2. Project error → LayerNorm → GRU
+            error_obs = self.error_norm(self.error_proj(error_features))
             gru_mem = self.gru.integrate(error_obs)
 
             # 3. Meta-learner decides adjustment
@@ -1977,7 +1980,8 @@ class MACHIterative(nn.Module):
             hidden = self.transformer(tokens)  # (5, d_meta)
 
             # 4. Write patch adjustments (accumulate on top of previous)
-            writes = self.action_head(hidden[3])  # think_0 position
+            #    Skip connection: error_obs → action_head (short gradient path)
+            writes = self.action_head(hidden[3], gru_memory=error_obs)
             self.apply_writes(writes)
 
             # 5. Update transformer memory

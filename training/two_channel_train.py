@@ -695,30 +695,11 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
         state_dict = torch.load(checkpoint_path, map_location=device)
         mach.load_state_dict(state_dict, strict=False)
 
-    # Per-component learning rates: boost error observation path
-    # so it learns to read error signals, not just write static patches.
-    observation_params = []  # error_proj, gru, transformer, memory_head
-    write_params = []        # action_head, basis, patches
-    for name, param in mach.named_parameters():
-        component = name.split('.')[0]
-        if component in ('error_proj', 'gru', 'transformer', 'memory_head'):
-            observation_params.append(param)
-        else:
-            write_params.append(param)
+    meta_params = list(mach.parameters())
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
 
-    obs_lr = lr * 10  # 10x higher for observation path
-    optimizer = torch.optim.Adam([
-        {'params': observation_params, 'lr': obs_lr},
-        {'params': write_params, 'lr': lr},
-    ])
-
-    n_obs = sum(p.numel() for p in observation_params)
-    n_write = sum(p.numel() for p in write_params)
-    n_meta = n_obs + n_write
-    meta_params = observation_params + write_params
+    n_meta = sum(p.numel() for p in meta_params)
     print(f"MACHIterative trainable parameters: {n_meta:,}")
-    print(f"  observation path: {n_obs:,} params @ lr={obs_lr}")
-    print(f"  write path: {n_write:,} params @ lr={lr}")
     print(f"Inner steps: {mach.n_inner_steps}")
 
     def get_n_problems(episode_idx):
