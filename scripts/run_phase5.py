@@ -46,7 +46,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
                        d_task=None, task_noise=0.0, multi_layer_obs=False,
                        n_patch_layers=None, n_basis=None, d_obs=None,
                        consolidation=False, ema_decay=None,
-                       n_planning_steps=None, planning_temperature=None):
+                       n_planning_steps=None, planning_temperature=None,
+                       n_thinking_steps=None):
     if d_task is None:
         d_task = config.PHASE5_D_TASK
     if n_patch_layers is None:
@@ -61,6 +62,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         n_planning_steps = config.PHASE5_N_PLANNING_STEPS
     if planning_temperature is None:
         planning_temperature = config.PHASE5_PLANNING_TEMPERATURE
+    if n_thinking_steps is None:
+        n_thinking_steps = config.PHASE5_N_THINKING_STEPS
 
     # Generate evenly-spaced patch layers
     if n_patch_layers == 4:
@@ -91,7 +94,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
     print(f"d_obs={d_obs}, d_gru={d_gru}, d_task={d_task}, n_basis={n_basis}, "
           f"deliberation_steps={n_deliberation_steps}, "
           f"task_noise={task_noise}, multi_layer_obs={multi_layer_obs}, "
-          f"consolidation={consolidation}, planning_steps={n_planning_steps}")
+          f"consolidation={consolidation}, planning_steps={n_planning_steps}, "
+          f"thinking_steps={n_thinking_steps}")
 
     mach = MACHPhase5(
         d_model=d_model,
@@ -109,6 +113,7 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         ema_decay=ema_decay,
         n_planning_steps=n_planning_steps,
         planning_temperature=planning_temperature,
+        n_thinking_steps=n_thinking_steps,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -205,6 +210,10 @@ def main():
         "--planning-temperature", type=float, default=None,
         help="Softmax temperature for planning candidate selection (default: 1.0)"
     )
+    parser.add_argument(
+        "--thinking-steps", type=int, default=None,
+        help="Working memory cross-attention steps after demos (0=off, 3=recommended)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -250,6 +259,7 @@ def main():
                 "ema_decay": args.ema_decay or config.PHASE5_EMA_DECAY,
                 "planning_steps": args.planning_steps or config.PHASE5_N_PLANNING_STEPS,
                 "planning_temperature": args.planning_temperature or config.PHASE5_PLANNING_TEMPERATURE,
+                "thinking_steps": args.thinking_steps or config.PHASE5_N_THINKING_STEPS,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -271,6 +281,7 @@ def main():
         consolidation=args.consolidation, ema_decay=args.ema_decay,
         n_planning_steps=args.planning_steps,
         planning_temperature=args.planning_temperature,
+        n_thinking_steps=args.thinking_steps,
     )
     patched_model = MACHPatchedModel(base_model, mach)
 
@@ -290,6 +301,7 @@ def main():
         td_modulation=args.td_modulation,
         critic_beta=args.critic_beta,
         satisfaction_threshold=args.satisfaction_threshold,
+        n_thinking_steps=args.thinking_steps,
     )
 
     torch.save(mach.state_dict(), save_path)

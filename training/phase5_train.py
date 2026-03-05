@@ -71,7 +71,8 @@ def generate_episode_problems(n_problems, mode):
 def run_episode_phase5(base_model, mach, patched_model, tokenizer,
                        problems, device, n_self_eval_steps=0,
                        td_modulation=0.0, gamma=0.0,
-                       satisfaction_threshold=0.5):
+                       satisfaction_threshold=0.5,
+                       n_thinking_steps=0):
     """
     Phase 5 episode. No reward signals to fire(). Sparsity loss on task state.
     Optional TD-weighted CE loss: critic modulates gradient magnitude.
@@ -101,13 +102,17 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
 
         # Observe (store embedding for demos, for active learning)
         is_demo = problem.get("is_demo", False)
+        store_wm = is_demo and n_thinking_steps > 0
         if is_demo and n_self_eval_steps > 0:
             gru_memory, obs_embedding = mach.observe(
-                base_model, input_ids, return_embedding=True
+                base_model, input_ids, return_embedding=True,
+                store_working_memory=store_wm,
             )
             demo_obs_embeddings.append(obs_embedding)
         else:
-            gru_memory = mach.observe(base_model, input_ids)
+            gru_memory = mach.observe(
+                base_model, input_ids, store_working_memory=store_wm,
+            )
 
         # Fire (no reward signals)
         writes = mach.fire(gru_memory)
@@ -166,6 +171,13 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
                         satisfaction = mach.get_value()
                         if satisfaction.item() > satisfaction_threshold:
                             break
+
+            # Working memory thinking: cross-attend over demo tokens
+            if n_thinking_steps > 0 and (
+                i + 1 >= len(problems) or
+                not problems[i + 1].get("is_demo", False)
+            ):
+                mach.think(n_thinking_steps)
 
             continue
 
@@ -262,7 +274,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       sparsity_beta=None, decorr_beta=None,
                       energy_beta=None, n_self_eval_steps=None,
                       td_modulation=None, critic_beta=None,
-                      satisfaction_threshold=None):
+                      satisfaction_threshold=None,
+                      n_thinking_steps=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -284,6 +297,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         critic_beta = config.PHASE5_CRITIC_BETA
     if satisfaction_threshold is None:
         satisfaction_threshold = config.PHASE5_SATISFACTION_THRESHOLD
+    if n_thinking_steps is None:
+        n_thinking_steps = config.PHASE5_N_THINKING_STEPS
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -336,6 +351,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     td_modulation=td_modulation,
                     gamma=gamma,
                     satisfaction_threshold=satisfaction_threshold,
+                    n_thinking_steps=n_thinking_steps,
                 )
 
             if use_energy:
@@ -392,6 +408,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     td_modulation=td_modulation,
                     gamma=gamma,
                     satisfaction_threshold=satisfaction_threshold,
+                    n_thinking_steps=n_thinking_steps,
                 )
             total_loss = ce_loss + sparsity_beta * sparsity_loss
             if use_critic:
@@ -507,6 +524,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                         n_self_eval_steps=n_self_eval_steps,
+                        n_thinking_steps=n_thinking_steps,
                     )
                 print(f"  --- HELD-OUT combos ---")
                 for coeffs in LINEAR_HELDOUT:
@@ -514,6 +532,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                         n_self_eval_steps=n_self_eval_steps,
+                        n_thinking_steps=n_thinking_steps,
                     )
                 if mode == "continuous_linear":
                     print(f"  --- NOVEL combos (never in fixed pool) ---")
@@ -522,12 +541,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                             base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx,
                             n_self_eval_steps=n_self_eval_steps,
+                            n_thinking_steps=n_thinking_steps,
                         )
             elif mode in ("token_map", "mixed"):
                 _run_token_map_validation(
                     base_model, mach, patched_model, tokenizer,
                     device, episode_idx,
                     n_self_eval_steps=n_self_eval_steps,
+                    n_thinking_steps=n_thinking_steps,
                 )
                 if mode == "mixed":
                     # Also eval linear combos
@@ -537,6 +558,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                             base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx,
                             n_self_eval_steps=n_self_eval_steps,
+                            n_thinking_steps=n_thinking_steps,
                         )
             else:
                 for eval_diff in [6, 7]:
@@ -636,7 +658,8 @@ def _run_few_shot_validation(base_model, mach, patched_model, tokenizer,
 
 def _run_linear_validation(base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx, n_episodes=10,
-                            n_problems=20, n_demos=5, n_self_eval_steps=0):
+                            n_problems=20, n_demos=5, n_self_eval_steps=0,
+                            n_thinking_steps=0):
     """Evaluate linear combination performance for specific (c1, c2)."""
     test_correct = 0
     test_total = 0
@@ -654,23 +677,29 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
                 problem["prompt"], return_tensors="pt"
             ).input_ids.to(device)
 
+            store_wm = problem["is_demo"] and n_thinking_steps > 0
             if problem["is_demo"] and n_self_eval_steps > 0:
                 gru_memory, obs_emb = mach.observe(
-                    base_model, input_ids, return_embedding=True
+                    base_model, input_ids, return_embedding=True,
+                    store_working_memory=store_wm,
                 )
                 demo_obs_embs.append(obs_emb)
             else:
-                gru_memory = mach.observe(base_model, input_ids)
+                gru_memory = mach.observe(
+                    base_model, input_ids,
+                    store_working_memory=store_wm,
+                )
             writes = mach.fire(gru_memory)
             mach.apply_writes(writes)
 
             if problem["is_demo"]:
                 demo_problems.append(problem)
                 # Self-eval after last demo
-                if n_self_eval_steps > 0 and (
+                is_last_demo = (
                     i + 1 >= len(problems) or
                     not problems[i + 1].get("is_demo", False)
-                ):
+                )
+                if n_self_eval_steps > 0 and is_last_demo:
                     stacked = torch.stack(demo_obs_embs) \
                         if demo_obs_embs else None
                     for step in range(n_self_eval_steps):
@@ -688,6 +717,8 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
                         )
                         w = mach.fire(gru_mem)
                         mach.apply_writes(w)
+                if n_thinking_steps > 0 and is_last_demo:
+                    mach.think(n_thinking_steps)
                 continue
 
             full_text = problem["prompt"] + problem["answer"]
@@ -722,7 +753,7 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
 def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
                                device, episode_idx, n_episodes=10,
                                n_problems=20, n_demos=5,
-                               n_self_eval_steps=0):
+                               n_self_eval_steps=0, n_thinking_steps=0):
     """Evaluate token mapping performance across random permutations."""
     test_correct = 0
     test_total = 0
@@ -743,23 +774,29 @@ def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
                 problem["prompt"], return_tensors="pt"
             ).input_ids.to(device)
 
+            store_wm = problem["is_demo"] and n_thinking_steps > 0
             if problem["is_demo"] and n_self_eval_steps > 0:
                 gru_memory, obs_emb = mach.observe(
-                    base_model, input_ids, return_embedding=True
+                    base_model, input_ids, return_embedding=True,
+                    store_working_memory=store_wm,
                 )
                 demo_obs_embs.append(obs_emb)
             else:
-                gru_memory = mach.observe(base_model, input_ids)
+                gru_memory = mach.observe(
+                    base_model, input_ids,
+                    store_working_memory=store_wm,
+                )
             writes = mach.fire(gru_memory)
             mach.apply_writes(writes)
 
             if problem["is_demo"]:
                 demo_problems.append(problem)
                 # Self-eval after last demo
-                if n_self_eval_steps > 0 and (
+                is_last_demo = (
                     i + 1 >= len(problems) or
                     not problems[i + 1].get("is_demo", False)
-                ):
+                )
+                if n_self_eval_steps > 0 and is_last_demo:
                     stacked = torch.stack(demo_obs_embs) \
                         if demo_obs_embs else None
                     for step in range(n_self_eval_steps):
@@ -777,6 +814,8 @@ def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
                         )
                         w = mach.fire(gru_mem)
                         mach.apply_writes(w)
+                if n_thinking_steps > 0 and is_last_demo:
+                    mach.think(n_thinking_steps)
                 continue
 
             full_text = problem["prompt"] + problem["answer"]

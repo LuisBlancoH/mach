@@ -88,6 +88,7 @@ PHASE5_N_PLANNING_STEPS = 0         # 0 = no planning, 3+ = critic-gated deliber
 PHASE5_PLANNING_TEMPERATURE = 1.0   # softmax temperature for candidate selection
 PHASE5_MULTI_LAYER_OBS = False  # observe all 4 patch layers (vs just middle)
 PHASE5_N_PATCH_LAYERS = 4      # how many evenly-spaced layers (4=default, 12=searchable)
+PHASE5_N_THINKING_STEPS = 0   # working memory cross-attention steps (0 = off)
 
 # Future phases
 MAX_INTERVAL = 16

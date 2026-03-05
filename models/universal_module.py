@@ -848,6 +848,40 @@ class SlowMemory(nn.Module):
         return gate * self.memory
 
 
+class WorkingMemoryCrossAttention(nn.Module):
+    """
+    Token-level cross-attention for working memory.
+
+    Task state queries over stored demo token representations to extract
+    fine-grained information (e.g., numerical relationships between tokens).
+    Single-head attention with gated residual connection.
+
+    Gate bias=-3.0 → starts near-identity. Safe for existing checkpoints.
+    """
+
+    def __init__(self, d_task, d_obs):
+        super().__init__()
+        self.q_proj = nn.Linear(d_task, d_obs)       # task state → query
+        self.out_proj = nn.Linear(d_obs, d_task)      # context → task update
+        self.gate = nn.Linear(d_obs + d_task, d_task)  # gated residual
+        self.scale = d_obs ** -0.5
+        # Start near-identity so existing checkpoints aren't disrupted
+        nn.init.constant_(self.gate.bias, -3.0)
+
+    def forward(self, task_state, memory):
+        """
+        task_state: (d_task,)
+        memory: (n_tokens, d_obs)
+        Returns: updated task_state (d_task,)
+        """
+        q = self.q_proj(task_state)                   # (d_obs,)
+        attn = torch.softmax(memory @ q * self.scale, dim=0)  # (n_tokens,)
+        context = attn @ memory                       # (d_obs,)
+        out = self.out_proj(context)                   # (d_task,)
+        g = torch.sigmoid(self.gate(torch.cat([context, task_state])))
+        return g * out + (1 - g) * task_state
+
+
 class MACHPhase5(nn.Module):
     """
     Phase 5: Brain-like meta-learner with structured task bottleneck.
@@ -874,7 +908,7 @@ class MACHPhase5(nn.Module):
                  n_deliberation_steps=0, task_noise=0.0,
                  multi_layer_obs=False, consolidation=False,
                  ema_decay=0.95, n_planning_steps=0,
-                 planning_temperature=1.0):
+                 planning_temperature=1.0, n_thinking_steps=0):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -940,6 +974,13 @@ class MACHPhase5(nn.Module):
         # Attentional selection: choose which demo to re-examine
         self.demo_selector = DemoSelector(d_task, d_obs)
 
+        # Working memory: token-level cross-attention over demo representations
+        self.n_thinking_steps = n_thinking_steps
+        if n_thinking_steps > 0:
+            self.wm_proj = nn.Linear(d_model, d_obs, bias=False)
+            self.wm_cross_attn = WorkingMemoryCrossAttention(d_task, d_obs)
+        self._working_memory_buffer = []
+
         # Neocortical consolidation: cross-episode slow memory
         self.consolidation = consolidation
         if consolidation:
@@ -953,6 +994,7 @@ class MACHPhase5(nn.Module):
         self.gru.reset()
         for patch in self.patches:
             patch.reset_deltas()
+        self._working_memory_buffer = []
         if self.consolidation:
             # Warm start from consolidated slow memory
             self._task_state = self.slow_memory.retrieve()
@@ -961,21 +1003,33 @@ class MACHPhase5(nn.Module):
                 self.d_task, device=next(self.parameters()).device
             )
 
-    def _extract_hidden_states(self, model_layers, input_ids, run_model):
+    def _extract_hidden_states(self, model_layers, input_ids, run_model,
+                               capture_all_tokens=False):
         """
         Extract hidden states from Qwen layers (frozen forward pass).
         Returns dict of {layer_idx: hidden_state} if multi_layer_obs,
         or single hidden_state tensor if not.
+
+        If capture_all_tokens=True, additionally captures ALL token positions
+        from the middle layer (for working memory). Returns (hidden, all_tokens)
+        where all_tokens is (seq_len, d_model) or None.
         """
+        all_tokens = None
+
         with torch.no_grad():
             if self.multi_layer_obs:
                 hidden_states = {}
                 hooks = []
+                middle_layer = self.patch_layers[len(self.patch_layers) // 2]
+
                 for layer_idx in self.patch_layers:
                     def make_hook(idx):
                         def hook(module, input, output):
+                            nonlocal all_tokens
                             t = output[0] if isinstance(output, tuple) else output
                             hidden_states[idx] = t[:, -1, :]
+                            if capture_all_tokens and idx == middle_layer:
+                                all_tokens = t[0].detach()  # (seq_len, d_model)
                         return hook
                     h = model_layers[layer_idx].register_forward_hook(
                         make_hook(layer_idx)
@@ -984,21 +1038,25 @@ class MACHPhase5(nn.Module):
                 run_model(input_ids=input_ids)
                 for h in hooks:
                     h.remove()
+                if capture_all_tokens:
+                    return hidden_states, all_tokens
                 return hidden_states
             else:
                 hidden_state = None
                 target_layer = self.patch_layers[len(self.patch_layers) // 2]
 
                 def hook(module, input, output):
-                    nonlocal hidden_state
-                    if isinstance(output, tuple):
-                        hidden_state = output[0][:, -1, :]
-                    else:
-                        hidden_state = output[:, -1, :]
+                    nonlocal hidden_state, all_tokens
+                    t = output[0] if isinstance(output, tuple) else output
+                    hidden_state = t[:, -1, :]
+                    if capture_all_tokens:
+                        all_tokens = t[0].detach()  # (seq_len, d_model)
 
                 h = model_layers[target_layer].register_forward_hook(hook)
                 run_model(input_ids=input_ids)
                 h.remove()
+                if capture_all_tokens:
+                    return hidden_state, all_tokens
                 return hidden_state
 
     def _project_hidden(self, hidden):
@@ -1017,17 +1075,29 @@ class MACHPhase5(nn.Module):
         else:
             return self.obs_proj(hidden.float().unsqueeze(1)).squeeze(0)
 
-    def observe(self, base_model, input_ids, return_embedding=False):
+    def observe(self, base_model, input_ids, return_embedding=False,
+                store_working_memory=False):
         """
         Sensory processing: Qwen forward (frozen) -> project -> GRU.
         Gradient flows through obs_proj/layer_projs and GRU (always undetached).
 
         If return_embedding=True, also returns the projected observation
         (for active learning demo selection).
+        If store_working_memory=True, captures all token positions from middle
+        layer and stores projected tokens in working memory buffer.
         """
-        hidden = self._extract_hidden_states(
-            base_model.model.layers, input_ids, base_model
+        capture = store_working_memory and self.n_thinking_steps > 0
+        result = self._extract_hidden_states(
+            base_model.model.layers, input_ids, base_model,
+            capture_all_tokens=capture,
         )
+        if capture:
+            hidden, all_tokens = result
+            # Project all tokens with dedicated wm_proj and store
+            wm_tokens = self.wm_proj(all_tokens.float())  # (seq_len, d_obs)
+            self._working_memory_buffer.append(wm_tokens.detach())
+        else:
+            hidden = result
         projected = self._project_hidden(hidden)
         gru_memory = self.gru.integrate(projected)
         if return_embedding:
@@ -1102,6 +1172,25 @@ class MACHPhase5(nn.Module):
         Returns: scores (n_demos,) — higher = more informative
         """
         return self.demo_selector(self._task_state, demo_embeddings)
+
+    def think(self, n_steps=None):
+        """
+        Working memory thinking phase: cross-attend over stored demo tokens,
+        then compile writes. Called after all demos, before test problems.
+
+        No new Qwen forward pass — purely re-reads stored representations.
+        Bypasses fire() (no GRU update, no task_state_module).
+        """
+        if n_steps is None:
+            n_steps = self.n_thinking_steps
+        if n_steps <= 0 or not self._working_memory_buffer:
+            return
+        # Concatenate all stored demo tokens
+        memory = torch.cat(self._working_memory_buffer, dim=0)  # (total_tokens, d_obs)
+        for _ in range(n_steps):
+            self._task_state = self.wm_cross_attn(self._task_state, memory)
+            writes = self.action_compiler(self._task_state)
+            self.apply_writes(writes)
 
     def consolidate(self, success_rate):
         """Consolidate current task state into slow memory (after episode)."""
