@@ -1878,6 +1878,9 @@ class MACHDemoRead(nn.Module):
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
+        # Diagnostic: supervised coefficient predictor (training only)
+        self.coeff_head = nn.Linear(d_meta, 2)
+
         # State
         self._tf_mem = None
         self._task_state = None
@@ -1933,6 +1936,12 @@ class MACHDemoRead(nn.Module):
                 patch_idx, weight_name, coefficients, gate
             )
             self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+    def predict_coeffs(self):
+        """Predict c1, c2 from task_state. Training diagnostic only."""
+        if self._task_state is None:
+            return None
+        return self.coeff_head(self._task_state)
 
     def get_task_state(self):
         return self._task_state

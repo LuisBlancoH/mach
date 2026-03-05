@@ -729,7 +729,24 @@ def meta_train_demoread(base_model, mach, patched_model, tokenizer,
                 problems, device,
             )
 
-            ce_loss.backward()
+            total_loss = ce_loss
+            coeff_loss_scalar = 0.0
+
+            # Supervised auxiliary: predict c1, c2 from task_state
+            c1 = problems[0].get("c1")
+            c2 = problems[0].get("c2")
+            pred_coeffs = mach.predict_coeffs()
+            if c1 is not None and pred_coeffs is not None:
+                target = torch.tensor(
+                    [float(c1), float(c2)], device=device
+                )
+                coeff_loss = torch.nn.functional.mse_loss(
+                    pred_coeffs, target
+                )
+                coeff_loss_scalar = coeff_loss.item()
+                total_loss = total_loss + 0.1 * coeff_loss
+
+            total_loss.backward()
             loss_scalar = ce_loss.item()
 
         except torch.cuda.OutOfMemoryError:
@@ -743,6 +760,7 @@ def meta_train_demoread(base_model, mach, patched_model, tokenizer,
             )
             ce_loss.backward()
             loss_scalar = ce_loss.item()
+            coeff_loss_scalar = 0.0
 
         torch.nn.utils.clip_grad_norm_(
             meta_params, max_norm=config.PHASE5_GRAD_CLIP
@@ -762,11 +780,24 @@ def meta_train_demoread(base_model, mach, patched_model, tokenizer,
                 ts = task_state.detach()
                 ts_info = f"ts_max={ts.abs().max():.2f}"
 
+            coeff_info = ""
+            if coeff_loss_scalar > 0:
+                pred = mach.predict_coeffs()
+                if pred is not None:
+                    p = pred.detach()
+                    c1 = problems[0].get("c1", "?")
+                    c2 = problems[0].get("c2", "?")
+                    coeff_info = (
+                        f"coeff={coeff_loss_scalar:.3f} "
+                        f"pred=[{p[0]:.1f},{p[1]:.1f}] "
+                        f"true=[{c1},{c2}]"
+                    )
+
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
                 f"ce={loss_scalar:.4f} | "
                 f"test={test_acc:.0%} avg_r={avg_reward:.2f} | "
-                f"{ts_info}"
+                f"{ts_info} {coeff_info}"
             )
 
             if wandb is not None:
