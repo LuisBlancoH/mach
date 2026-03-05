@@ -89,6 +89,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     critic_loss = torch.tensor(0.0, device=device, requires_grad=True)
     td_errors = []
     demo_problems = []
+    demo_obs_embeddings = []  # stored observation embeddings for active learning
     use_critic = td_modulation > 0
     self_eval_steps_used = 0
 
@@ -100,8 +101,15 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
             problem["prompt"], return_tensors="pt"
         ).input_ids.to(device)
 
-        # Observe
-        gru_memory = mach.observe(base_model, input_ids)
+        # Observe (store embedding for demos, for active learning)
+        is_demo = problem.get("is_demo", False)
+        if is_demo and n_self_eval_steps > 0:
+            gru_memory, obs_embedding = mach.observe(
+                base_model, input_ids, return_embedding=True
+            )
+            demo_obs_embeddings.append(obs_embedding)
+        else:
+            gru_memory = mach.observe(base_model, input_ids)
 
         # Fire (no reward signals)
         writes = mach.fire(gru_memory)
@@ -118,7 +126,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
         mach.apply_writes(writes)
 
         # Skip demo evaluation
-        if problem.get("is_demo", False):
+        if is_demo:
             demo_problems.append(problem)
             rewards.append(0.0)
             problem_losses.append(0.0)
@@ -128,8 +136,18 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
             if n_self_eval_steps > 0 and i == len(problems) - 1 or \
                     (i + 1 < len(problems) and
                      not problems[i + 1].get("is_demo", False)):
+                # Stack demo embeddings for active selection
+                stacked_demo_embs = torch.stack(demo_obs_embeddings) \
+                    if demo_obs_embeddings else None
+
                 for step in range(n_self_eval_steps):
-                    demo = demo_problems[step % len(demo_problems)]
+                    # Active learning: task state selects most informative demo
+                    if stacked_demo_embs is not None and len(demo_problems) > 1:
+                        scores = mach.select_demo(stacked_demo_embs)
+                        selected_idx = scores.argmax().item()
+                    else:
+                        selected_idx = step % len(demo_problems)
+                    demo = demo_problems[selected_idx]
                     demo_ids = tokenizer(
                         demo["prompt"], return_tensors="pt"
                     ).input_ids.to(device)
@@ -630,13 +648,20 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
         )
         mach.reset_episode()
         demo_problems = []
+        demo_obs_embs = []
 
         for i, problem in enumerate(problems):
             input_ids = tokenizer(
                 problem["prompt"], return_tensors="pt"
             ).input_ids.to(device)
 
-            gru_memory = mach.observe(base_model, input_ids)
+            if problem["is_demo"] and n_self_eval_steps > 0:
+                gru_memory, obs_emb = mach.observe(
+                    base_model, input_ids, return_embedding=True
+                )
+                demo_obs_embs.append(obs_emb)
+            else:
+                gru_memory = mach.observe(base_model, input_ids)
             writes = mach.fire(gru_memory)
             mach.apply_writes(writes)
 
@@ -647,8 +672,15 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
                     i + 1 >= len(problems) or
                     not problems[i + 1].get("is_demo", False)
                 ):
+                    stacked = torch.stack(demo_obs_embs) \
+                        if demo_obs_embs else None
                     for step in range(n_self_eval_steps):
-                        demo = demo_problems[step % len(demo_problems)]
+                        if stacked is not None and len(demo_problems) > 1:
+                            scores = mach.select_demo(stacked)
+                            sel_idx = scores.argmax().item()
+                        else:
+                            sel_idx = step % len(demo_problems)
+                        demo = demo_problems[sel_idx]
                         demo_ids = tokenizer(
                             demo["prompt"], return_tensors="pt"
                         ).input_ids.to(device)
@@ -705,13 +737,20 @@ def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
         )
         mach.reset_episode()
         demo_problems = []
+        demo_obs_embs = []
 
         for i, problem in enumerate(problems):
             input_ids = tokenizer(
                 problem["prompt"], return_tensors="pt"
             ).input_ids.to(device)
 
-            gru_memory = mach.observe(base_model, input_ids)
+            if problem["is_demo"] and n_self_eval_steps > 0:
+                gru_memory, obs_emb = mach.observe(
+                    base_model, input_ids, return_embedding=True
+                )
+                demo_obs_embs.append(obs_emb)
+            else:
+                gru_memory = mach.observe(base_model, input_ids)
             writes = mach.fire(gru_memory)
             mach.apply_writes(writes)
 
@@ -722,8 +761,15 @@ def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
                     i + 1 >= len(problems) or
                     not problems[i + 1].get("is_demo", False)
                 ):
+                    stacked = torch.stack(demo_obs_embs) \
+                        if demo_obs_embs else None
                     for step in range(n_self_eval_steps):
-                        demo = demo_problems[step % len(demo_problems)]
+                        if stacked is not None and len(demo_problems) > 1:
+                            scores = mach.select_demo(stacked)
+                            sel_idx = scores.argmax().item()
+                        else:
+                            sel_idx = step % len(demo_problems)
+                        demo = demo_problems[sel_idx]
                         demo_ids = tokenizer(
                             demo["prompt"], return_tensors="pt"
                         ).input_ids.to(device)

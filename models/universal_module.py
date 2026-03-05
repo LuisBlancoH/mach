@@ -766,6 +766,29 @@ class ActionCompiler(nn.Module):
         return writes
 
 
+class DemoSelector(nn.Module):
+    """
+    Attentional selection: task state queries over demo embeddings
+    to choose which demo is most informative to re-examine.
+
+    Like PFC directing attention to task-relevant stimuli.
+    """
+
+    def __init__(self, d_task, d_obs):
+        super().__init__()
+        self.query = nn.Linear(d_task, d_obs)
+
+    def forward(self, task_state, demo_embeddings):
+        """
+        task_state: (d_task,)
+        demo_embeddings: (n_demos, d_obs)
+        Returns: scores (n_demos,)
+        """
+        q = self.query(task_state)  # (d_obs,)
+        scores = torch.mv(demo_embeddings, q)  # (n_demos,)
+        return scores
+
+
 class TaskStateCritic(nn.Module):
     """
     Basal ganglia: value estimator over task state.
@@ -911,6 +934,9 @@ class MACHPhase5(nn.Module):
         # Basal ganglia: value estimator (shapes gradient, not input to fire)
         self.critic = TaskStateCritic(d_task)
 
+        # Attentional selection: choose which demo to re-examine
+        self.demo_selector = DemoSelector(d_task, d_obs)
+
         # Neocortical consolidation: cross-episode slow memory
         self.consolidation = consolidation
         if consolidation:
@@ -988,16 +1014,21 @@ class MACHPhase5(nn.Module):
         else:
             return self.obs_proj(hidden.float().unsqueeze(1)).squeeze(0)
 
-    def observe(self, base_model, input_ids):
+    def observe(self, base_model, input_ids, return_embedding=False):
         """
         Sensory processing: Qwen forward (frozen) -> project -> GRU.
         Gradient flows through obs_proj/layer_projs and GRU (always undetached).
+
+        If return_embedding=True, also returns the projected observation
+        (for active learning demo selection).
         """
         hidden = self._extract_hidden_states(
             base_model.model.layers, input_ids, base_model
         )
         projected = self._project_hidden(hidden)
         gru_memory = self.gru.integrate(projected)
+        if return_embedding:
+            return gru_memory, projected.detach()
         return gru_memory
 
     def fire(self, gru_memory):
@@ -1058,6 +1089,16 @@ class MACHPhase5(nn.Module):
         if self._task_state is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.critic(self._task_state)
+
+    def select_demo(self, demo_embeddings):
+        """
+        Active learning: task state attends over stored demo observation
+        embeddings to select the most informative demo for self-eval.
+
+        demo_embeddings: (n_demos, d_obs) — detached projected observations
+        Returns: scores (n_demos,) — higher = more informative
+        """
+        return self.demo_selector(self._task_state, demo_embeddings)
 
     def consolidate(self, success_rate):
         """Consolidate current task state into slow memory (after episode)."""
