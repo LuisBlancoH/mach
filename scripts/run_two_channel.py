@@ -20,9 +20,10 @@ import config
 from models.universal_module import (
     MACHTwoChannel, TwoChannelPatchedModel,
     MACHDemoRead, MACHOracleMinimal, IterativePatchedModel,
+    MACHHebbian, HebbianPatchedModel,
 )
 from training.two_channel_train import (
-    meta_train_two_channel, meta_train_demoread,
+    meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
     CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
 )
 
@@ -125,6 +126,8 @@ def main():
                         help="Oracle mode: feed true [c1,c2] instead of demos")
     parser.add_argument("--oracle-minimal", action="store_true",
                         help="Minimal oracle: Linear(2) → patches, no GRU/transformer")
+    parser.add_argument("--hebbian", action="store_true",
+                        help="Three-factor Hebbian learning with critic")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -139,7 +142,72 @@ def main():
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
-    if args.demoread or args.oracle or args.oracle_minimal:
+    if args.hebbian:
+        # MACHHebbian: three-factor Hebbian learning with critic
+        arch_name = "hebbian"
+        run_name = (
+            f"hebbian-{args.task}"
+            f"-L{n_patch_layers_actual}-B{n_basis_actual}"
+        )
+
+        # Generate patch layers
+        if n_patch_layers_actual == 4:
+            patch_layers = [
+                n_layers // 4, n_layers // 2,
+                3 * n_layers // 4, n_layers - 2,
+            ]
+        else:
+            step = n_layers // n_patch_layers_actual
+            patch_layers = [i * step for i in range(n_patch_layers_actual)]
+            patch_layers = [min(l, n_layers - 2) for l in patch_layers]
+
+        print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
+        print(f"n_basis={n_basis_actual}")
+
+        mach = MACHHebbian(
+            d_model=d_model,
+            n_layers=n_layers,
+            patch_layers=patch_layers,
+            hidden_dim=config.PATCH_HIDDEN_DIM,
+            n_basis=n_basis_actual,
+        ).to(config.DEVICE)
+
+        n_params = sum(p.numel() for p in mach.parameters())
+        print(f"MACHHebbian total parameters: {n_params:,}")
+
+        patched_model = HebbianPatchedModel(base_model, mach)
+
+        save_path = (
+            f"checkpoints/hebbian_{args.task}"
+            f"_L{n_patch_layers_actual}_B{n_basis_actual}.pt"
+        )
+        os.makedirs("checkpoints", exist_ok=True)
+
+        if wandb is not None:
+            wandb.init(
+                project="mach",
+                name=run_name,
+                config={
+                    "base_model": config.BASE_MODEL,
+                    "n_basis": n_basis_actual,
+                    "n_patch_layers": n_patch_layers_actual,
+                    "lr": args.lr or config.PHASE5_LR,
+                    "episodes": args.episodes or config.PHASE5_EPISODES,
+                    "architecture": "hebbian",
+                    "task": args.task,
+                    "device": str(config.DEVICE),
+                },
+            )
+
+        meta_train_hebbian(
+            base_model, mach, patched_model, tokenizer, config.DEVICE,
+            n_episodes=args.episodes, lr=args.lr,
+            checkpoint_path=args.checkpoint,
+            save_path=save_path,
+            curriculum=curriculum,
+        )
+
+    elif args.demoread or args.oracle or args.oracle_minimal:
         # MACHDemoRead / oracle / oracle-minimal
         if args.oracle_minimal:
             arch_name = "oracle_minimal"

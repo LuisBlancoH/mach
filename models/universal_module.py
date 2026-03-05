@@ -2079,3 +2079,211 @@ class IterativePatchedModel(nn.Module):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+
+class MACHHebbian(nn.Module):
+    """
+    Three-factor Hebbian learning with critic modulation.
+
+    Instead of a meta-learner computing write coefficients, patches learn via
+    local Hebbian updates: Δw = η × δ × pre_h × post_h, where δ is the critic's
+    TD error (dopamine analogue).
+
+    Meta-training learns the FORM of the rule (projections, basis vectors,
+    critic, learning rate). At inference: forward passes + local updates only.
+
+    Gradient path (meta-training):
+      loss → patches → delta_W → basis U,V + coefficients → pre_projs, post_projs
+      Activations from Qwen are DETACHED — no backprop through frozen model.
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 n_basis=8):
+        super().__init__()
+        from config import GATE_SCALE
+        self.d_model = d_model
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.n_basis = n_basis
+        self.gate_scale = GATE_SCALE
+
+        # Patches
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Basis vectors (reuse existing infrastructure)
+        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+
+        # Hebbian projections: compress activations to correlation signals
+        # d_model → n_basis, so correlation signal directly drives basis coefficients
+        self.pre_projs = nn.ModuleList([
+            nn.Linear(d_model, n_basis, bias=False) for _ in patch_layers
+        ])
+        self.post_projs = nn.ModuleList([
+            nn.Linear(d_model, n_basis, bias=False) for _ in patch_layers
+        ])
+
+        # Critic (basal ganglia): patch activation summary → value
+        self.critic_proj = nn.Linear(len(patch_layers) * n_basis, 64)
+        self.critic = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        # Adaptive learning rate: scalar features → per-patch eta
+        self.eta_head = nn.Sequential(
+            nn.Linear(3, 32),  # [td_error, reward, step_frac]
+            nn.GELU(),
+            nn.Linear(32, len(patch_layers)),
+            nn.Softplus(),
+        )
+
+        # State (set by hooks during forward pass)
+        self._pre_activations = {}
+        self._post_activations = {}
+        self._last_value = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._pre_activations.clear()
+        self._post_activations.clear()
+        self._last_value = None
+
+    def get_activation_summary(self):
+        """Summarize captured activations for critic input."""
+        summaries = []
+        for i in range(self.n_patches):
+            pre = self._pre_activations.get(i)
+            if pre is not None:
+                pre_h = self.pre_projs[i](pre.float()).mean(dim=-2)
+                if pre_h.dim() > 1:
+                    pre_h = pre_h.squeeze(0)
+                summaries.append(pre_h)
+            else:
+                summaries.append(torch.zeros(
+                    self.n_basis, device=self.basis.down_U[0].device
+                ))
+        return torch.cat(summaries)  # (n_patches * n_basis,)
+
+    def compute_hebbian_update(self, patch_idx, td_error, eta):
+        """
+        Three-factor Hebbian: coefficients = pre_h * post_h, gate = η × δ.
+        Uses basis vectors for low-rank structure.
+        """
+        pre = self._pre_activations[patch_idx]
+        post = self._post_activations[patch_idx]
+
+        # Project to n_basis dims and pool
+        pre_h = self.pre_projs[patch_idx](pre.float())
+        post_h = self.post_projs[patch_idx](post.float())
+
+        while pre_h.dim() > 1:
+            pre_h = pre_h.mean(dim=0)
+        while post_h.dim() > 1:
+            post_h = post_h.mean(dim=0)
+
+        # Correlation signal: element-wise product (Hebbian)
+        coefficients = pre_h * post_h  # (n_basis,)
+
+        # Gate = learning rate × TD error (dopamine modulation)
+        gate = eta * td_error * self.gate_scale
+
+        delta_down = self.basis.compute_delta_W(
+            patch_idx, "down", coefficients, gate
+        )
+        delta_up = self.basis.compute_delta_W(
+            patch_idx, "up", coefficients, gate
+        )
+        return delta_down, delta_up
+
+    def hebbian_step(self, reward, step_idx, n_steps, device):
+        """
+        Compute critic value, TD error, and apply Hebbian updates.
+        Called after each problem's forward pass.
+        """
+        act_summary = self.get_activation_summary()
+        value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
+
+        if self._last_value is not None:
+            td_error = reward - self._last_value.detach()
+        else:
+            td_error = torch.tensor(reward, device=device, dtype=torch.float32)
+        self._last_value = value
+
+        step_frac = step_idx / max(n_steps, 1)
+        td_scalar = td_error.item() if isinstance(td_error, torch.Tensor) else td_error
+        eta_input = torch.tensor(
+            [td_scalar, reward, step_frac], device=device,
+        )
+        etas = self.eta_head(eta_input)  # (n_patches,)
+
+        for patch_idx in range(self.n_patches):
+            if patch_idx in self._pre_activations:
+                delta_down, delta_up = self.compute_hebbian_update(
+                    patch_idx, td_error, etas[patch_idx]
+                )
+                self.patches[patch_idx].accumulate_write("down", delta_down)
+                self.patches[patch_idx].accumulate_write("up", delta_up)
+
+        return value, td_error
+
+
+class HebbianPatchedModel(nn.Module):
+    """Wraps Qwen with patches that capture pre/post activations for Hebbian learning."""
+
+    def __init__(self, base_model, mach):
+        super().__init__()
+        self.base_model = base_model
+        self.mach = mach
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for i, layer_idx in enumerate(self.mach.patch_layers):
+            layer = self.base_model.model.layers[layer_idx]
+
+            def make_hook(patch_idx):
+                def hook(module, input, output):
+                    patch = self.mach.patches[patch_idx]
+
+                    if isinstance(output, tuple):
+                        h = output[0]
+                    else:
+                        h = output
+
+                    # Capture pre-activation (detached)
+                    self.mach._pre_activations[patch_idx] = h.detach()
+
+                    # Apply patch
+                    patch_out = patch(h.float())
+                    gain = patch.get_gain()
+                    h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+
+                    # Capture post-activation (detached)
+                    self.mach._post_activations[patch_idx] = h_new.detach()
+
+                    if isinstance(output, tuple):
+                        return (h_new,) + output[1:]
+                    return h_new
+                return hook
+
+            handle = layer.register_forward_hook(make_hook(i))
+            self._hooks.append(handle)
+
+    @property
+    def device(self):
+        return self.base_model.device
+
+    def forward(self, input_ids, labels=None, attention_mask=None):
+        return self.base_model(
+            input_ids=input_ids, labels=labels, attention_mask=attention_mask
+        )
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()

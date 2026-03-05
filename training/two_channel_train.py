@@ -995,3 +995,278 @@ def _run_token_map_validation_demoread(base_model, mach, patched_model,
 
     if wandb is not None:
         wandb.log({"eval/token_map_exact": test_acc})
+
+
+# ---- Hebbian Training ----
+
+
+def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
+                        problems, device):
+    """
+    Hebbian episode: for each problem, forward pass → reward → TD error → local update.
+    Every problem is both a learning opportunity and a test.
+    """
+    mach.reset_episode()
+
+    rewards = []
+    problem_losses = []
+    total_ce = torch.tensor(0.0, device=device, requires_grad=True)
+    critic_losses = []
+
+    for step, problem in enumerate(problems):
+        # 1. Forward pass (hooks capture pre/post activations)
+        full_text = problem["prompt"] + problem["answer"]
+        encoding = tokenizer(full_text, return_tensors="pt").to(device)
+        prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+        labels = encoding.input_ids.clone()
+        labels[0, :prompt_len] = -100
+
+        output = patched_model(input_ids=encoding.input_ids, labels=labels)
+        total_ce = total_ce + output.loss
+        problem_losses.append(output.loss.item())
+
+        # 2. Compute reward
+        with torch.no_grad():
+            logits = output.logits
+            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+            pred_text = tokenizer.decode(
+                pred_tokens, skip_special_tokens=True
+            ).strip()
+            if problem.get("difficulty") == "token_map":
+                correct = (pred_text == problem["answer"])
+            else:
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+            reward = 1.0 if correct else -1.0
+        rewards.append(reward)
+
+        # 3. Hebbian step: critic → TD error → local weight updates
+        value, td_error = mach.hebbian_step(
+            reward, step, len(problems), device
+        )
+
+        # 4. Critic loss (TD learning)
+        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
+        critic_loss = (value - critic_target) ** 2
+        critic_losses.append(critic_loss)
+
+    avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
+
+    return total_ce, rewards, problem_losses, avg_critic_loss
+
+
+def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
+                       device, n_episodes=None, lr=None,
+                       curriculum=None, checkpoint_path=None,
+                       save_path=None):
+    """Hebbian meta-training loop."""
+    if n_episodes is None:
+        n_episodes = config.PHASE5_EPISODES
+    if lr is None:
+        lr = config.PHASE5_LR
+    if curriculum is None:
+        curriculum = CONTINUOUS_LINEAR_CURRICULUM
+
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        mach.load_state_dict(state_dict, strict=False)
+
+    meta_params = list(mach.parameters())
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
+
+    n_meta = sum(p.numel() for p in meta_params)
+    print(f"MACHHebbian trainable parameters: {n_meta:,}")
+
+    def get_n_problems(episode_idx):
+        if episode_idx < 100:
+            return 10
+        elif episode_idx < 300:
+            return 15
+        else:
+            return config.PHASE5_PROBLEMS_PER_EPISODE
+
+    for episode_idx in range(n_episodes):
+        mode = get_episode_mode(episode_idx, curriculum)
+        n_problems = get_n_problems(episode_idx)
+        problems = generate_episode_problems(n_problems, mode)
+
+        optimizer.zero_grad()
+
+        try:
+            ce_loss, rewards, problem_losses, critic_loss = run_episode_hebbian(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
+
+            total_loss = ce_loss + 0.1 * critic_loss
+            total_loss.backward()
+            loss_scalar = ce_loss.item()
+            critic_scalar = critic_loss.item()
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n  OOM at episode {episode_idx}. Reducing problems.")
+            torch.cuda.empty_cache()
+            optimizer.zero_grad()
+            problems = problems[:max(5, len(problems) // 2)]
+            ce_loss, rewards, problem_losses, critic_loss = run_episode_hebbian(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
+            total_loss = ce_loss + 0.1 * critic_loss
+            total_loss.backward()
+            loss_scalar = ce_loss.item()
+            critic_scalar = critic_loss.item()
+
+        torch.nn.utils.clip_grad_norm_(
+            meta_params, max_norm=config.PHASE5_GRAD_CLIP
+        )
+        optimizer.step()
+
+        if episode_idx % 10 == 0:
+            n_total = len(rewards)
+            n_correct = sum(1 for r in rewards if r > 0)
+            test_acc = n_correct / max(n_total, 1)
+            avg_reward = sum(rewards) / max(n_total, 1)
+
+            # Within-episode improvement: compare first half vs second half
+            mid = max(1, n_total // 2)
+            first_half = sum(1 for r in rewards[:mid] if r > 0) / max(mid, 1)
+            second_half = sum(1 for r in rewards[mid:] if r > 0) / max(n_total - mid, 1)
+
+            print(
+                f"Episode {episode_idx:4d} | {mode} n={n_total:2d} | "
+                f"ce={loss_scalar:.4f} critic={critic_scalar:.4f} | "
+                f"acc={test_acc:.0%} 1st={first_half:.0%} 2nd={second_half:.0%} | "
+                f"avg_r={avg_reward:.2f}"
+            )
+
+            if wandb is not None:
+                wandb.log({
+                    "episode": episode_idx,
+                    "ce_loss": loss_scalar,
+                    "critic_loss": critic_scalar,
+                    "accuracy": test_acc,
+                    "first_half_acc": first_half,
+                    "second_half_acc": second_half,
+                    "avg_reward": avg_reward,
+                })
+
+        # Diagnostics + validation
+        if (episode_idx % 200 == 0 and episode_idx > 0) or \
+                episode_idx == n_episodes - 1:
+            _log_hebbian_diagnostics(mach, meta_params, episode_idx)
+
+            if mode in ("continuous_linear",):
+                print(f"  --- TRAIN combos ---")
+                for coeffs in LINEAR_TRAIN:
+                    _run_linear_validation_hebbian(
+                        base_model, mach, patched_model,
+                        tokenizer, device, coeffs, episode_idx,
+                    )
+
+                print(f"  --- HELD-OUT combos ---")
+                for coeffs in LINEAR_HELDOUT:
+                    _run_linear_validation_hebbian(
+                        base_model, mach, patched_model,
+                        tokenizer, device, coeffs, episode_idx,
+                    )
+
+                print(f"  --- NOVEL combos ---")
+                novel = [(3, 1), (1, 4), (4, 3), (5, 0), (0, 5)]
+                for coeffs in novel:
+                    _run_linear_validation_hebbian(
+                        base_model, mach, patched_model,
+                        tokenizer, device, coeffs, episode_idx,
+                    )
+
+            if save_path:
+                torch.save(mach.state_dict(), save_path)
+                print(f"  Checkpoint saved to {save_path}")
+
+
+def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
+    """Log gradient norms and weight stats for Hebbian architecture."""
+    diag = {}
+
+    component_grad_norms = {}
+    for name, param in mach.named_parameters():
+        if param.grad is not None:
+            component = name.split('.')[0]
+            norm = param.grad.norm().item()
+            if component not in component_grad_norms:
+                component_grad_norms[component] = []
+            component_grad_norms[component].append(norm)
+
+    for component, norms in component_grad_norms.items():
+        avg_norm = sum(norms) / len(norms)
+        diag[f"grad_norm/{component}"] = avg_norm
+
+    # Patch delta stats
+    for i, patch in enumerate(mach.patches):
+        if patch.delta_down is not None:
+            diag[f"patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
+            diag[f"patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
+
+    # Basis vector norms
+    for i in range(mach.basis.n_patches):
+        diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
+        diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
+
+    print(f"  Diagnostics at episode {episode_idx}:")
+    for k, v in sorted(diag.items()):
+        print(f"    {k}: {v:.6f}")
+
+    if wandb is not None:
+        wandb.log({f"diag/{k}": v for k, v in diag.items()})
+
+
+def _run_linear_validation_hebbian(base_model, mach, patched_model,
+                                   tokenizer, device, coeffs, episode_idx,
+                                   n_episodes=10, n_problems=20):
+    """Evaluate linear combination performance with Hebbian architecture.
+    Uses first few problems as learning opportunities, evaluates later ones."""
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_linear_episode(
+            n_problems, n_demos=0, coeffs=coeffs
+        )
+        mach.reset_episode()
+
+        for step, problem in enumerate(problems):
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = 1.0 if correct else -1.0
+
+            # Hebbian update (inference mode — no gradient)
+            with torch.no_grad():
+                mach.hebbian_step(reward, step, n_problems, device)
+
+            # Only count second half as test accuracy
+            if step >= n_problems // 2:
+                test_correct += int(correct)
+                test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    c1, c2 = coeffs
+    label = f"{c1}a+{c2}b"
+
+    print(f"  EVAL ep{episode_idx} {label:8s} | test={test_acc:.0%}")
+
+    if wandb is not None:
+        wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
