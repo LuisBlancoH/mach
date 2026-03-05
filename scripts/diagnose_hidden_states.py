@@ -119,16 +119,29 @@ def analyze(X, all_c1, all_c2, all_labels, n_samples_per_coeff):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen3-4B",
+                        help="HuggingFace model name")
+    parser.add_argument("--gen-only", action="store_true",
+                        help="Skip probe analysis, just show generations")
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    print("Loading Qwen3-4B...")
-    model_name = "Qwen/Qwen3-4B"
+    model_name = args.model
+    print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device)
     model.eval()
+
+    # Auto-detect architecture
+    n_layers = model.config.num_hidden_layers
+    d_model = model.config.hidden_size
+    print(f"Architecture: {n_layers} layers, d_model={d_model}")
 
     coeff_pairs = [
         (0, 1), (0, 2), (0, 3),
@@ -136,13 +149,18 @@ def main():
         (1, 1), (2, 2), (1, 2), (2, 1),
     ]
 
-    layer_indices = [9, 18, 27, 34]
-    n_samples_per_coeff = 20
+    # Pick ~4 evenly-spaced layers
+    layer_indices = [
+        n_layers // 4, n_layers // 2,
+        3 * n_layers // 4, n_layers - 2
+    ]
+    print(f"Probe layers: {layer_indices}")
 
-    # Fix random seed for fair comparison across prompt types
+    n_samples_per_coeff = 20
     base_seed = 42
 
-    for prompt_name, prompt_suffix in PROMPTS.items():
+    if not args.gen_only:
+      for prompt_name, prompt_suffix in PROMPTS.items():
         print(f"\n{'#'*70}")
         print(f"# PROMPT: {prompt_name!r}  suffix={prompt_suffix!r}")
         print(f"{'#'*70}")
@@ -196,7 +214,7 @@ def main():
     print(f"{'#'*70}")
 
     random.seed(99)
-    for c1, c2 in [(1, 0), (2, 0), (0, 1), (1, 1)]:
+    for c1, c2 in [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (1, 1), (2, 1), (1, 2)]:
         demo_text = generate_demo_text(c1, c2, n_demos=5)
         print(f"\n  Demos ({c1}a+{c2}b):")
         for line in demo_text.split("\n"):
