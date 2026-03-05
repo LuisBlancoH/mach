@@ -1849,18 +1849,29 @@ class MACHDemoRead(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_meta=128, n_basis=8):
+                 d_meta=128, n_basis=8, oracle=False):
         super().__init__()
         self.d_model = d_model
         self.d_meta = d_meta
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
+        self.oracle = oracle
 
-        # Demo encoder: token embeddings → task_state
-        self.demo_encoder = DemoEncoder(
-            d_embed=d_model, d_enc=d_meta, d_task=d_meta,
-            n_layers=2, n_heads=4,
-        )
+        if not oracle:
+            # Demo encoder: token embeddings → task_state
+            self.demo_encoder = DemoEncoder(
+                d_embed=d_model, d_enc=d_meta, d_task=d_meta,
+                n_layers=2, n_heads=4,
+            )
+            # Diagnostic: supervised coefficient predictor (training only)
+            self.coeff_head = nn.Linear(d_meta, 2)
+        else:
+            # Oracle mode: embed [c1, c2] directly → task_state
+            self.coeff_embed = nn.Sequential(
+                nn.Linear(2, d_meta),
+                nn.GELU(),
+                nn.Linear(d_meta, d_meta),
+            )
 
         # Working memory (integrates task_state, provides context)
         self.gru = SimpleGRU(d_meta)
@@ -1877,9 +1888,6 @@ class MACHDemoRead(nn.Module):
         self.patches = nn.ModuleList([
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
-
-        # Diagnostic: supervised coefficient predictor (training only)
-        self.coeff_head = nn.Linear(d_meta, 2)
 
         # State
         self._tf_mem = None
@@ -1908,7 +1916,16 @@ class MACHDemoRead(nn.Module):
 
         # Learned encoder: token_embeds → task_state (NOT detached)
         self._task_state = self.demo_encoder(token_embeds.float())
+        self._write_from_task_state()
 
+    def process_oracle(self, c1, c2, device):
+        """Oracle mode: embed true [c1, c2] directly as task_state."""
+        coeffs = torch.tensor([float(c1), float(c2)], device=device)
+        self._task_state = self.coeff_embed(coeffs)
+        self._write_from_task_state()
+
+    def _write_from_task_state(self):
+        """Shared: task_state → GRU → transformer → action_head → patches."""
         # GRU integration (provides memory context)
         gru_mem = self.gru.integrate(self._task_state)
 
@@ -1939,7 +1956,7 @@ class MACHDemoRead(nn.Module):
 
     def predict_coeffs(self):
         """Predict c1, c2 from task_state. Training diagnostic only."""
-        if self._task_state is None:
+        if self._task_state is None or self.oracle:
             return None
         return self.coeff_head(self._task_state)
 

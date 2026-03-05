@@ -645,8 +645,12 @@ def run_episode_demoread(base_model, mach, patched_model, tokenizer,
     demos = [p for p in problems if p.get("is_demo", False)]
     tests = [p for p in problems if not p.get("is_demo", False)]
 
-    # Encode demos → write patches (NOT detached)
-    if demos:
+    # Oracle mode: feed true coefficients directly
+    if mach.oracle:
+        c1 = problems[0].get("c1", 1)
+        c2 = problems[0].get("c2", 0)
+        mach.process_oracle(c1, c2, device)
+    elif demos:
         _encode_demos(base_model, mach, tokenizer, demos, device)
 
     # Evaluate on test problems (gradient flows through patches → encoder)
@@ -906,7 +910,10 @@ def _run_linear_validation_demoread(base_model, mach, patched_model,
         demos = [p for p in problems if p["is_demo"]]
         tests = [p for p in problems if not p["is_demo"]]
 
-        if demos:
+        if mach.oracle:
+            with torch.no_grad():
+                mach.process_oracle(coeffs[0], coeffs[1], device)
+        elif demos:
             with torch.no_grad():
                 _encode_demos(base_model, mach, tokenizer, demos, device)
 

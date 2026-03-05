@@ -121,6 +121,8 @@ def main():
     parser.add_argument("--energy-beta", type=float, default=None)
     parser.add_argument("--demoread", action="store_true",
                         help="Use MACHDemoRead (DemoEncoder + skip connection)")
+    parser.add_argument("--oracle", action="store_true",
+                        help="Oracle mode: feed true [c1,c2] instead of demos")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -135,11 +137,11 @@ def main():
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
-    if args.demoread:
-        # MACHDemoRead: DemoEncoder + skip connection
-        arch_name = "demoread"
+    if args.demoread or args.oracle:
+        # MACHDemoRead: DemoEncoder + skip connection (or oracle mode)
+        arch_name = "oracle" if args.oracle else "demoread"
         run_name = (
-            f"demoread-{args.task}"
+            f"{arch_name}-{args.task}"
             f"-L{n_patch_layers_actual}-B{n_basis_actual}"
         )
 
@@ -164,6 +166,7 @@ def main():
             hidden_dim=config.PATCH_HIDDEN_DIM,
             d_meta=config.D_META,
             n_basis=n_basis_actual,
+            oracle=args.oracle,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -172,7 +175,7 @@ def main():
         patched_model = IterativePatchedModel(base_model, mach)
 
         save_path = (
-            f"checkpoints/demoread_{args.task}"
+            f"checkpoints/{arch_name}_{args.task}"
             f"_L{n_patch_layers_actual}_B{n_basis_actual}.pt"
         )
         os.makedirs("checkpoints", exist_ok=True)
@@ -188,7 +191,7 @@ def main():
                     "d_meta": config.D_META,
                     "lr": args.lr or config.PHASE5_LR,
                     "episodes": args.episodes or config.PHASE5_EPISODES,
-                    "architecture": "demoread",
+                    "architecture": arch_name,
                     "task": args.task,
                     "device": str(config.DEVICE),
                 },
