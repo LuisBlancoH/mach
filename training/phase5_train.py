@@ -35,8 +35,7 @@ CONTINUOUS_LINEAR_CURRICULUM = [
 ]
 
 TOKEN_MAP_CURRICULUM = [
-    (0, 300, "single"),
-    (300, 2000, "token_map"),
+    (0, 5000, "token_map"),
 ]
 
 MIXED_CURRICULUM = [
