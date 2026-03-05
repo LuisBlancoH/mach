@@ -2095,7 +2095,7 @@ class MACHHebbian(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 n_basis=8, exploration_noise=0.3, init_std=0.01):
+                 n_basis=8, exploration_noise=0.3, init_std=0.001):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
