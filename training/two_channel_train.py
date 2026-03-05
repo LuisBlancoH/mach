@@ -32,6 +32,14 @@ MIXED_CURRICULUM = [
     (0, 5000, "mixed"),
 ]
 
+FEW_SHOT_CURRICULUM = [
+    (0, 5000, "few_shot"),
+]
+
+FEW_SHOT_BASIC_CURRICULUM = [
+    (0, 5000, "few_shot_basic"),
+]
+
 
 def get_episode_mode(episode_idx, curriculum):
     for start, end, mode in curriculum:
@@ -48,7 +56,13 @@ def generate_episode_problems(n_problems, mode):
     elif mode == "mixed":
         sub_mode = random.choice(["continuous_linear", "token_map"])
         return generate_episode_problems(n_problems, sub_mode)
-    else:  # few_shot
+    elif mode == "few_shot":
+        return generate_few_shot_episode(n_problems)
+    elif mode == "few_shot_basic":
+        # Only basic ops (add/sub/mul/div), all as test problems (no demos)
+        op = random.choice(["add", "sub", "mul", "div"])
+        return generate_few_shot_episode(n_problems, n_demos=0, op_type=op)
+    else:
         return generate_few_shot_episode(n_problems)
 
 
@@ -1180,9 +1194,65 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                         tokenizer, device, coeffs, episode_idx,
                     )
 
+            if mode in ("few_shot_basic", "few_shot"):
+                print(f"  --- Operation classification ---")
+                for op in ["add", "sub", "mul", "div"]:
+                    _run_op_validation_hebbian(
+                        base_model, mach, patched_model,
+                        tokenizer, device, op, episode_idx,
+                    )
+
             if save_path:
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
+
+
+def _run_op_validation_hebbian(base_model, mach, patched_model,
+                               tokenizer, device, op_type, episode_idx,
+                               n_episodes=10, n_problems=20):
+    """Evaluate operation classification with Hebbian learning.
+    First half: learning. Second half: evaluation."""
+    second_half_correct = 0
+    second_half_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_few_shot_episode(
+            n_problems, n_demos=0, op_type=op_type
+        )
+        mach.reset_episode()
+
+        for step, problem in enumerate(problems):
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = 1.0 if correct else -1.0
+
+            # Hebbian update (inference mode)
+            with torch.no_grad():
+                mach.hebbian_step(reward, step, n_problems, device)
+
+            # Count second half only
+            if step >= n_problems // 2:
+                second_half_correct += int(correct)
+                second_half_total += 1
+
+    acc = second_half_correct / second_half_total if second_half_total > 0 else 0
+    print(f"  EVAL ep{episode_idx} {op_type:4s} | 2nd_half={acc:.0%}")
+
+    if wandb is not None:
+        wandb.log({f"eval/op_{op_type}": acc})
 
 
 def _log_hebbian_diagnostics(mach, meta_params, episode_idx):

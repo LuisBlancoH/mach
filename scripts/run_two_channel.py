@@ -25,6 +25,7 @@ from models.universal_module import (
 from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
     CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
+    FEW_SHOT_BASIC_CURRICULUM,
 )
 
 
@@ -111,7 +112,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument(
         "--task", type=str, default="continuous_linear",
-        choices=["continuous_linear", "token_map", "mixed"],
+        choices=["continuous_linear", "token_map", "mixed", "few_shot_basic"],
     )
     parser.add_argument("--d-task", type=int, default=None)
     parser.add_argument("--d-obs", type=int, default=96)
@@ -134,6 +135,8 @@ def main():
         curriculum = TOKEN_MAP_CURRICULUM
     elif args.task == "mixed":
         curriculum = MIXED_CURRICULUM
+    elif args.task == "few_shot_basic":
+        curriculum = FEW_SHOT_BASIC_CURRICULUM
     else:
         curriculum = CONTINUOUS_LINEAR_CURRICULUM
 
