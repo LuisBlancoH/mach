@@ -792,9 +792,13 @@ class MACHPhase5(nn.Module):
                 nn.Linear(d_model, d_per_layer, bias=False)
                 for _ in patch_layers
             ])
-            # Per-layer observation gates — model discovers which layers matter
-            # Initialized to 0 → sigmoid = 0.5, all layers contribute equally
-            self.obs_gates = nn.Parameter(torch.zeros(len(patch_layers)))
+            # Top-down attention: task state controls which layers to observe
+            # PFC tells sensory cortex what to look for — per-task, per-episode
+            # When task_state is zero (episode start), all gates = 0.5 (uniform)
+            self.obs_gate_net = nn.Linear(d_task, len(patch_layers))
+            # Initialize bias to 0 → sigmoid = 0.5 at episode start
+            nn.init.zeros_(self.obs_gate_net.bias)
+            nn.init.zeros_(self.obs_gate_net.weight)
         else:
             self.obs_proj = ObservationProjection(d_model, d_obs)
 
@@ -874,7 +878,10 @@ class MACHPhase5(nn.Module):
     def _project_hidden(self, hidden):
         """Project extracted hidden states to d_obs. Returns (d_obs,) 1D."""
         if self.multi_layer_obs:
-            gates = torch.sigmoid(self.obs_gates)
+            # Top-down attention: task state modulates observation gates
+            # At episode start (task_state=zeros) → all gates 0.5 (observe everything)
+            # After first fire() → gates become task-specific
+            gates = torch.sigmoid(self.obs_gate_net(self._task_state))
             layer_obs = []
             for i, layer_idx in enumerate(self.patch_layers):
                 proj = gates[i] * self.layer_projs[i](hidden[layer_idx].float())
@@ -984,15 +991,18 @@ class MACHPhase5(nn.Module):
             cost = cost + self.gru.memory.abs().mean()
 
         # Observation gate cost: push unused layers toward zero
-        if self.multi_layer_obs:
-            cost = cost + torch.sigmoid(self.obs_gates).mean()
+        if self.multi_layer_obs and self._task_state is not None:
+            gates = torch.sigmoid(self.obs_gate_net(self._task_state))
+            cost = cost + gates.mean()
 
         return cost
 
     def get_obs_gates(self):
-        """Return sigmoid(obs_gates) for diagnostics. None if single-layer."""
-        if self.multi_layer_obs:
-            return torch.sigmoid(self.obs_gates).detach()
+        """Return current obs gate values for diagnostics. None if single-layer."""
+        if self.multi_layer_obs and self._task_state is not None:
+            return torch.sigmoid(
+                self.obs_gate_net(self._task_state)
+            ).detach()
         return None
 
 
