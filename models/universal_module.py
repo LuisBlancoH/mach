@@ -1346,6 +1346,7 @@ class DemoProjection(nn.Module):
     """
     Replaces GRU + TaskStateModule for concat architecture.
     Projects concatenated multi-layer observation to task_state in one shot.
+    Output bounded by tanh to [-1, 1] to prevent task_state explosion.
     """
 
     def __init__(self, d_obs, d_task):
@@ -1354,6 +1355,7 @@ class DemoProjection(nn.Module):
             nn.Linear(d_obs, d_obs),
             nn.GELU(),
             nn.Linear(d_obs, d_task),
+            nn.Tanh(),
         )
 
     def forward(self, obs):
@@ -1517,11 +1519,12 @@ class ActivationPrimitives(nn.Module):
     Interpolation is natural: w=3.0 means "3x this primitive".
     """
 
-    def __init__(self, n_layers, n_prims, d_model):
+    def __init__(self, n_layers, n_prims, d_model, modulation_scale=0.1):
         super().__init__()
         self.n_layers = n_layers
         self.n_prims = n_prims
         self.d_model = d_model
+        self.modulation_scale = modulation_scale
 
         # (n_layers, n_prims, d_model) — learned end-to-end across episodes
         self.bias = nn.Parameter(torch.randn(n_layers, n_prims, d_model) * 0.01)
@@ -1554,9 +1557,9 @@ class ActivationPrimitives(nn.Module):
         b = self.bias[layer_idx]      # (n_prims, d_model)
         g = self.gain[layer_idx]      # (n_prims, d_model)
 
-        # Weighted sum of primitives
-        bias_mod = torch.einsum('k,kd->d', w, b)   # (d_model,)
-        gain_mod = torch.einsum('k,kd->d', w, g)    # (d_model,)
+        # Weighted sum of primitives, scaled to keep initial modulation small
+        bias_mod = self.modulation_scale * torch.einsum('k,kd->d', w, b)   # (d_model,)
+        gain_mod = self.modulation_scale * torch.einsum('k,kd->d', w, g)    # (d_model,)
 
         # Apply: gain first (multiplicative context), then bias (additive steering)
         h = hidden_states * (1 + gain_mod).to(hidden_states.dtype)
