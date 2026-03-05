@@ -165,7 +165,7 @@ def generate_linear_episode(n_problems, n_demos=None, coeffs=None,
     Same "a ? b = " format as few-shot episodes.
     """
     if n_demos is None:
-        n_demos = max(2, n_problems // 4)
+        n_demos = max(5, n_problems // 3)
     if coeffs is None:
         if continuous:
             c1 = random.randint(0, max_coeff)
