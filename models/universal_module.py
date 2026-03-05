@@ -10,6 +10,7 @@ from models.memory_head import MemoryHead
 from models.reward_projection import RewardProjection
 from models.critic import Critic, CriticSignalProjection
 from models.cerebellum import Cerebellum
+from models.error_observation import ErrorProjection
 
 
 class DifferentiablePatch(nn.Module):
@@ -1803,6 +1804,235 @@ class TwoChannelPatchedModel(nn.Module):
                         patch_out = patch(h.float())
                         gain = patch.get_gain()
                         return h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+                return hook
+
+            handle = layer.register_forward_hook(make_hook(i))
+            self._hooks.append(handle)
+
+    @property
+    def device(self):
+        return self.base_model.device
+
+    def forward(self, input_ids, labels=None, attention_mask=None):
+        return self.base_model(
+            input_ids=input_ids, labels=labels, attention_mask=attention_mask
+        )
+
+    def generate(self, *args, **kwargs):
+        return self.base_model.generate(*args, **kwargs)
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
+class MACHIterative(nn.Module):
+    """
+    Iterative error-correction meta-learner.
+
+    Instead of one-shot demo processing, iterates K times:
+      1. Run patched Qwen on demos → compute error features
+      2. GRU integrates error features
+      3. Transformer decides corrective writes
+      4. Patches accumulate writes (additive, not reset)
+    Then evaluate on test problems; gradient flows through all K steps.
+
+    Error features are detached (computed with no_grad on demo eval).
+    Gradient flows: test_loss → patches → writes → transformer → GRU → error_proj.
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_meta=128, n_basis=8, n_inner_steps=3):
+        super().__init__()
+        self.d_model = d_model
+        self.d_meta = d_meta
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.n_inner_steps = n_inner_steps
+
+        # Error observation
+        self.error_proj = ErrorProjection(n_error_features=4, d_meta=d_meta)
+
+        # Working memory
+        self.gru = SimpleGRU(d_meta)
+
+        # Meta-learner: [gru_mem, error_obs, tf_mem, think_0, think_1]
+        self.transformer = MetaLearnerTransformer(d_meta, n_tokens=5)
+
+        # Patch writing
+        self.action_head = ActionHead(d_meta, len(patch_layers), n_basis)
+        self.memory_head = MemoryHead(d_meta)
+        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Transformer memory state
+        self._tf_mem = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        self.gru.reset()
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._tf_mem = self.transformer.tf_mem_init.clone()
+
+    def _compute_error_features(self, patched_model, tokenizer,
+                                demos, device, step_idx):
+        """
+        Run patched Qwen on demos, compare to known answers.
+        Returns detached error feature tensor (4,).
+        """
+        from data.arithmetic import extract_number
+
+        total_loss = 0.0
+        n_correct = 0
+        total_conf = 0.0
+        n = 0
+
+        for demo in demos:
+            # Parse demo prompt to separate input from answer
+            # Demo format: "a ? b = answer" (full prompt includes answer)
+            parts = demo["prompt"].rsplit("= ", 1)
+            if len(parts) != 2:
+                continue
+
+            prompt_part = parts[0] + "= "
+            answer_part = parts[1].strip()
+            full_text = prompt_part + answer_part
+
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_ids = tokenizer(prompt_part, return_tensors="pt").input_ids
+            prompt_len = prompt_ids.shape[1]
+            labels = encoding.input_ids.clone()
+            labels[0, :prompt_len] = -100
+
+            with torch.no_grad():
+                output = patched_model(
+                    input_ids=encoding.input_ids, labels=labels
+                )
+                total_loss += output.loss.item()
+
+                logits = output.logits
+                # Confidence: avg max prob over answer tokens
+                if logits.shape[1] > prompt_len:
+                    probs = torch.softmax(
+                        logits[0, prompt_len - 1:-1], dim=-1
+                    )
+                    total_conf += probs.max(dim=-1).values.mean().item()
+
+                # Accuracy check
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+
+                if demo.get("difficulty") == "token_map":
+                    correct = (pred_text == answer_part)
+                else:
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == demo.get("answer", ""))
+
+                n_correct += int(correct)
+
+            n += 1
+
+        n = max(n, 1)
+        features = torch.tensor([
+            total_loss / n,                        # avg CE loss
+            n_correct / n,                         # fraction correct
+            total_conf / n,                        # avg confidence
+            step_idx / max(self.n_inner_steps, 1), # progress
+        ], device=device)
+
+        return features
+
+    def inner_loop(self, patched_model, tokenizer, demos, device):
+        """
+        K-step inner loop: observe error → decide → write → repeat.
+        Patches accumulate across steps.
+        """
+        step_accuracies = []
+
+        for step in range(self.n_inner_steps):
+            # 1. Compute error on demos with current patches (detached)
+            error_features = self._compute_error_features(
+                patched_model, tokenizer, demos, device, step
+            )
+            step_accuracies.append(error_features[1].item())
+
+            # 2. Project error → GRU
+            error_obs = self.error_proj(error_features)
+            gru_mem = self.gru.integrate(error_obs)
+
+            # 3. Meta-learner decides adjustment
+            tokens = torch.stack([
+                gru_mem,
+                error_obs,
+                self._tf_mem,
+                self.transformer.think_0_init,
+                self.transformer.think_1_init,
+            ])  # (5, d_meta)
+            hidden = self.transformer(tokens)  # (5, d_meta)
+
+            # 4. Write patch adjustments (accumulate on top of previous)
+            writes = self.action_head(hidden[3])  # think_0 position
+            self.apply_writes(writes)
+
+            # 5. Update transformer memory
+            self._tf_mem = self.memory_head(hidden[4], self._tf_mem)
+
+        return step_accuracies
+
+    def process_demos(self, patched_model, tokenizer, demos, device):
+        """Public API: run inner loop on demos."""
+        return self.inner_loop(patched_model, tokenizer, demos, device)
+
+    def apply_writes(self, writes):
+        """Apply differentiable patch weight modifications via basis vectors."""
+        for (patch_idx, weight_name, coefficients, gate) in writes:
+            delta_W = self.basis.compute_delta_W(
+                patch_idx, weight_name, coefficients, gate
+            )
+            self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+    def get_task_state(self):
+        """Return GRU memory as the task state (for diagnostics)."""
+        return self.gru.get_memory()
+
+
+class IterativePatchedModel(nn.Module):
+    """
+    Wraps Qwen with DifferentiablePatch hooks for MACHIterative.
+    Simpler than TwoChannelPatchedModel — no modulation channel.
+    """
+
+    def __init__(self, base_model, mach):
+        super().__init__()
+        self.base_model = base_model
+        self.mach = mach
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for i, layer_idx in enumerate(self.mach.patch_layers):
+            layer = self.base_model.model.layers[layer_idx]
+
+            def make_hook(patch_idx):
+                def hook(module, input, output):
+                    patch = self.mach.patches[patch_idx]
+
+                    if isinstance(output, tuple):
+                        h = output[0]
+                        patch_out = patch(h.float())
+                        gain = patch.get_gain()
+                        h = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+                        return (h,) + output[1:]
+                    else:
+                        patch_out = patch(output.float())
+                        gain = patch.get_gain()
+                        return output * (1 + gain).to(output.dtype) + patch_out.to(output.dtype)
                 return hook
 
             handle = layer.register_forward_hook(make_hook(i))

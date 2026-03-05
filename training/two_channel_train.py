@@ -622,3 +622,336 @@ def _log_diagnostics(mach, meta_params, episode_idx):
 
     if wandb is not None:
         wandb.log({f"diag/{k}": v for k, v in diag.items()})
+
+
+# ---- Iterative Error-Correction Training ----
+
+
+def run_episode_iterative(base_model, mach, patched_model, tokenizer,
+                          problems, device):
+    """
+    Iterative episode: K inner steps on demos, then evaluate on tests.
+    """
+    mach.reset_episode()
+
+    demos = [p for p in problems if p.get("is_demo", False)]
+    tests = [p for p in problems if not p.get("is_demo", False)]
+
+    # Inner loop: iterate on demos (no test leakage)
+    step_accuracies = []
+    if demos:
+        step_accuracies = mach.process_demos(
+            patched_model, tokenizer, demos, device
+        )
+
+    # Evaluate on test problems (gradient flows through patches)
+    rewards = []
+    problem_losses = []
+    qwen_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    for problem in tests:
+        full_text = problem["prompt"] + problem["answer"]
+        encoding = tokenizer(full_text, return_tensors="pt").to(device)
+        prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+        labels = encoding.input_ids.clone()
+        labels[0, :prompt_len] = -100
+
+        output = patched_model(input_ids=encoding.input_ids, labels=labels)
+
+        with torch.no_grad():
+            logits = output.logits
+            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+            pred_text = tokenizer.decode(
+                pred_tokens, skip_special_tokens=True
+            ).strip()
+            if problem.get("difficulty") == "token_map":
+                correct = (pred_text == problem["answer"])
+            else:
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+            reward = 1.0 if correct else -1.0
+
+        rewards.append(reward)
+        problem_losses.append(output.loss.item())
+        qwen_loss = qwen_loss + output.loss
+
+    return qwen_loss, rewards, problem_losses, step_accuracies
+
+
+def meta_train_iterative(base_model, mach, patched_model, tokenizer,
+                         device, n_episodes=None, lr=None,
+                         curriculum=None, checkpoint_path=None,
+                         save_path=None):
+    """Iterative error-correction meta-training loop."""
+    if n_episodes is None:
+        n_episodes = config.PHASE5_EPISODES
+    if lr is None:
+        lr = config.PHASE5_LR
+    if curriculum is None:
+        curriculum = CONTINUOUS_LINEAR_CURRICULUM
+
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        mach.load_state_dict(state_dict, strict=False)
+
+    meta_params = list(mach.parameters())
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
+
+    n_meta = sum(p.numel() for p in meta_params)
+    print(f"MACHIterative trainable parameters: {n_meta:,}")
+    print(f"Inner steps: {mach.n_inner_steps}")
+
+    def get_n_problems(episode_idx):
+        if episode_idx < 100:
+            return 5
+        elif episode_idx < 300:
+            return 10
+        elif episode_idx < 600:
+            return 15
+        else:
+            return config.PHASE5_PROBLEMS_PER_EPISODE
+
+    for episode_idx in range(n_episodes):
+        mode = get_episode_mode(episode_idx, curriculum)
+        n_problems = get_n_problems(episode_idx)
+        problems = generate_episode_problems(n_problems, mode)
+
+        optimizer.zero_grad()
+
+        try:
+            ce_loss, rewards, problem_losses, step_accs = \
+                run_episode_iterative(
+                    base_model, mach, patched_model, tokenizer,
+                    problems, device,
+                )
+
+            ce_loss.backward()
+            loss_scalar = ce_loss.item()
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n  OOM at episode {episode_idx}. Reducing problems.")
+            torch.cuda.empty_cache()
+            optimizer.zero_grad()
+            problems = problems[:max(5, len(problems) // 2)]
+            ce_loss, rewards, problem_losses, step_accs = \
+                run_episode_iterative(
+                    base_model, mach, patched_model, tokenizer,
+                    problems, device,
+                )
+            ce_loss.backward()
+            loss_scalar = ce_loss.item()
+
+        torch.nn.utils.clip_grad_norm_(
+            meta_params, max_norm=config.PHASE5_GRAD_CLIP
+        )
+        optimizer.step()
+
+        if episode_idx % 10 == 0:
+            test_rewards = list(rewards)
+            avg_reward = sum(test_rewards) / max(len(test_rewards), 1)
+            test_acc = sum(1 for r in test_rewards if r > 0) / max(
+                len(test_rewards), 1
+            )
+
+            # Inner step accuracies
+            step_str = " → ".join(f"{a:.0%}" for a in step_accs) if step_accs else "n/a"
+
+            print(
+                f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
+                f"ce={loss_scalar:.4f} | "
+                f"test={test_acc:.0%} avg_r={avg_reward:.2f} | "
+                f"inner: {step_str}"
+            )
+
+            if wandb is not None:
+                log_dict = {
+                    "episode": episode_idx,
+                    "ce_loss": loss_scalar,
+                    "avg_reward": avg_reward,
+                    "test_accuracy": test_acc,
+                }
+                for si, sa in enumerate(step_accs):
+                    log_dict[f"inner_step/{si}"] = sa
+                wandb.log(log_dict)
+
+        # Diagnostics + validation + checkpoint
+        if (episode_idx % 200 == 0 and episode_idx > 0) or \
+                episode_idx == n_episodes - 1:
+            _log_iterative_diagnostics(mach, meta_params, episode_idx)
+
+            if mode in ("continuous_linear",):
+                print(f"  --- TRAIN combos ---")
+                for coeffs in LINEAR_TRAIN:
+                    _run_linear_validation_iterative(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+                print(f"  --- HELD-OUT combos ---")
+                for coeffs in LINEAR_HELDOUT:
+                    _run_linear_validation_iterative(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+                print(f"  --- NOVEL combos ---")
+                for coeffs in [(3, 1), (1, 4), (4, 3), (5, 0), (0, 5)]:
+                    _run_linear_validation_iterative(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+            elif mode == "token_map":
+                _run_token_map_validation_iterative(
+                    base_model, mach, patched_model, tokenizer,
+                    device, episode_idx,
+                )
+
+            if save_path is not None:
+                import os
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(mach.state_dict(), save_path)
+                print(f"  Checkpoint saved to {save_path}")
+
+
+def _log_iterative_diagnostics(mach, meta_params, episode_idx):
+    """Log gradient norms and weight stats for iterative architecture."""
+    diag = {}
+
+    component_grad_norms = {}
+    for name, param in mach.named_parameters():
+        if param.grad is not None:
+            component = name.split('.')[0]
+            norm = param.grad.norm().item()
+            if component not in component_grad_norms:
+                component_grad_norms[component] = []
+            component_grad_norms[component].append(norm)
+
+    for component, norms in component_grad_norms.items():
+        avg_norm = sum(norms) / len(norms)
+        diag[f"grad_norm/{component}"] = avg_norm
+
+    # Task state (GRU memory)
+    task_state = mach.get_task_state()
+    if task_state is not None:
+        ts = task_state.detach()
+        diag["gru_memory/l1_norm"] = ts.abs().mean().item()
+        diag["gru_memory/max_abs"] = ts.abs().max().item()
+
+    # Patch delta stats
+    for i, patch in enumerate(mach.patches):
+        if patch.delta_down is not None:
+            diag[f"patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
+            diag[f"patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
+        if patch.delta_gain is not None:
+            diag[f"patch_delta/patch{i}_gain"] = patch.delta_gain.norm().item()
+
+    # Basis vector norms
+    for i in range(mach.basis.n_patches):
+        diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
+        diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
+
+    print(f"  Diagnostics at episode {episode_idx}:")
+    for k, v in sorted(diag.items()):
+        print(f"    {k}: {v:.6f}")
+
+    if wandb is not None:
+        wandb.log({f"diag/{k}": v for k, v in diag.items()})
+
+
+def _run_linear_validation_iterative(base_model, mach, patched_model,
+                                     tokenizer, device, coeffs, episode_idx,
+                                     n_episodes=10, n_problems=20, n_demos=5):
+    """Evaluate linear combination performance with iterative architecture."""
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_linear_episode(
+            n_problems, n_demos=n_demos, coeffs=coeffs
+        )
+        mach.reset_episode()
+
+        demos = [p for p in problems if p["is_demo"]]
+        tests = [p for p in problems if not p["is_demo"]]
+
+        if demos:
+            with torch.no_grad():
+                mach.process_demos(patched_model, tokenizer, demos, device)
+
+        for problem in tests:
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    c1, c2 = coeffs
+    label = f"{c1}a+{c2}b"
+
+    print(f"  EVAL ep{episode_idx} {label:8s} | test={test_acc:.0%}")
+
+    if wandb is not None:
+        wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
+
+
+def _run_token_map_validation_iterative(base_model, mach, patched_model,
+                                        tokenizer, device, episode_idx,
+                                        n_episodes=10, n_problems=20,
+                                        n_demos=5):
+    """Evaluate token mapping performance with iterative architecture."""
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_token_mapping_episode(
+            n_problems, n_demos=n_demos
+        )
+        mach.reset_episode()
+
+        demos = [p for p in problems if p["is_demo"]]
+        tests = [p for p in problems if not p["is_demo"]]
+
+        if demos:
+            with torch.no_grad():
+                mach.process_demos(patched_model, tokenizer, demos, device)
+
+        for problem in tests:
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                correct = (pred_text == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+
+    print(
+        f"  EVAL ep{episode_idx} token_map | exact={test_acc:.0%}"
+    )
+
+    if wandb is not None:
+        wandb.log({"eval/token_map_exact": test_acc})
