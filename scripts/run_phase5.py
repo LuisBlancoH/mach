@@ -44,7 +44,8 @@ def load_base_model():
 
 def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
                        d_task=None, task_noise=0.0, multi_layer_obs=False,
-                       n_patch_layers=None, n_basis=None, d_obs=None):
+                       n_patch_layers=None, n_basis=None, d_obs=None,
+                       consolidation=False, ema_decay=None):
     if d_task is None:
         d_task = config.PHASE5_D_TASK
     if n_patch_layers is None:
@@ -53,6 +54,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         n_basis = config.N_BASIS
     if d_obs is None:
         d_obs = config.PHASE5_D_OBS
+    if ema_decay is None:
+        ema_decay = config.PHASE5_EMA_DECAY
 
     # Generate evenly-spaced patch layers
     if n_patch_layers == 4:
@@ -82,7 +85,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
     print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
     print(f"d_obs={d_obs}, d_gru={d_gru}, d_task={d_task}, n_basis={n_basis}, "
           f"deliberation_steps={n_deliberation_steps}, "
-          f"task_noise={task_noise}, multi_layer_obs={multi_layer_obs}")
+          f"task_noise={task_noise}, multi_layer_obs={multi_layer_obs}, "
+          f"consolidation={consolidation}")
 
     mach = MACHPhase5(
         d_model=d_model,
@@ -96,6 +100,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         n_deliberation_steps=n_deliberation_steps,
         task_noise=task_noise,
         multi_layer_obs=multi_layer_obs,
+        consolidation=consolidation,
+        ema_decay=ema_decay,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -176,6 +182,14 @@ def main():
         "--satisfaction-threshold", type=float, default=None,
         help="Critic value above which self-eval stops early (default: 0.5)"
     )
+    parser.add_argument(
+        "--consolidation", action="store_true",
+        help="Enable cross-episode slow memory (consolidation/sleep)"
+    )
+    parser.add_argument(
+        "--ema-decay", type=float, default=None,
+        help="Slow memory EMA decay rate (default: 0.95)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -217,6 +231,8 @@ def main():
                 "multi_layer_obs": args.multi_layer_obs,
                 "td_modulation": args.td_modulation or config.PHASE5_TD_MODULATION,
                 "critic_beta": args.critic_beta or config.PHASE5_CRITIC_BETA,
+                "consolidation": args.consolidation,
+                "ema_decay": args.ema_decay or config.PHASE5_EMA_DECAY,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -235,6 +251,7 @@ def main():
         multi_layer_obs=multi_layer_obs,
         n_patch_layers=args.n_patch_layers, n_basis=args.n_basis,
         d_obs=args.d_obs,
+        consolidation=args.consolidation, ema_decay=args.ema_decay,
     )
     patched_model = MACHPatchedModel(base_model, mach)
 

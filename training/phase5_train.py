@@ -204,6 +204,12 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
 
     avg_td_error = sum(td_errors) / len(td_errors) if td_errors else 0.0
 
+    # Consolidation: store successful task states in slow memory
+    test_rewards = [r for j, r in enumerate(rewards)
+                    if not problems[j].get("is_demo", False)]
+    success_rate = sum(1 for r in test_rewards if r > 0) / max(len(test_rewards), 1)
+    mach.consolidate(success_rate)
+
     return qwen_loss, sparsity_loss, rewards, problem_losses, \
         critic_loss, avg_td_error, self_eval_steps_used
 
@@ -881,6 +887,12 @@ def _log_diagnostics(mach, meta_params, episode_idx):
             diag[f"obs_gate/layer{layer_idx}"] = gate_val
         diag["obs_gate/n_active"] = (obs_gates > 0.3).sum().item()
         diag["obs_gate/mean"] = obs_gates.mean().item()
+
+    # Slow memory (consolidation)
+    slow_stats = mach.get_slow_memory_stats()
+    if slow_stats is not None:
+        for k, v in slow_stats.items():
+            diag[f"slow_memory/{k}"] = v
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

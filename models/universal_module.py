@@ -770,6 +770,38 @@ class TaskStateCritic(nn.Module):
         return self.net(task_state).squeeze(-1)
 
 
+class SlowMemory(nn.Module):
+    """
+    Cross-episode consolidation: neocortical long-term storage.
+
+    EMA of successful task states provides warm start for new episodes.
+    Retrieval gate (trainable) learns which dimensions are useful.
+    Memory buffer itself is detached — no gradient through EMA.
+    """
+
+    def __init__(self, d_task, ema_decay=0.95, consolidation_threshold=0.3):
+        super().__init__()
+        self.register_buffer('memory', torch.zeros(d_task))
+        self.retrieval_gate = nn.Linear(d_task, d_task)
+        self.ema_decay = ema_decay
+        self.consolidation_threshold = consolidation_threshold
+        # Initialize gate to near-zero so early episodes start clean
+        nn.init.zeros_(self.retrieval_gate.weight)
+        nn.init.constant_(self.retrieval_gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+
+    def consolidate(self, task_state, success_rate):
+        """Called after episode. Blend successful task states into slow memory."""
+        with torch.no_grad():
+            if success_rate > self.consolidation_threshold:
+                weight = min(success_rate, 1.0) * (1 - self.ema_decay)
+                self.memory = self.ema_decay * self.memory + weight * task_state.detach()
+
+    def retrieve(self):
+        """Called at episode start. Returns gated slow memory as warm start."""
+        gate = torch.sigmoid(self.retrieval_gate(self.memory))
+        return gate * self.memory
+
+
 class MACHPhase5(nn.Module):
     """
     Phase 5: Brain-like meta-learner with structured task bottleneck.
@@ -794,7 +826,8 @@ class MACHPhase5(nn.Module):
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  d_obs=64, d_gru=64, d_task=32, n_basis=8,
                  n_deliberation_steps=0, task_noise=0.0,
-                 multi_layer_obs=False):
+                 multi_layer_obs=False, consolidation=False,
+                 ema_decay=0.95):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -850,6 +883,11 @@ class MACHPhase5(nn.Module):
         # Basal ganglia: value estimator (shapes gradient, not input to fire)
         self.critic = TaskStateCritic(d_task)
 
+        # Neocortical consolidation: cross-episode slow memory
+        self.consolidation = consolidation
+        if consolidation:
+            self.slow_memory = SlowMemory(d_task, ema_decay=ema_decay)
+
         # Persistent state (reset per episode)
         self._task_state = None
 
@@ -858,9 +896,13 @@ class MACHPhase5(nn.Module):
         self.gru.reset()
         for patch in self.patches:
             patch.reset_deltas()
-        self._task_state = torch.zeros(
-            self.d_task, device=next(self.parameters()).device
-        )
+        if self.consolidation:
+            # Warm start from consolidated slow memory
+            self._task_state = self.slow_memory.retrieve()
+        else:
+            self._task_state = torch.zeros(
+                self.d_task, device=next(self.parameters()).device
+            )
 
     def _extract_hidden_states(self, model_layers, input_ids, run_model):
         """
@@ -963,6 +1005,26 @@ class MACHPhase5(nn.Module):
         if self._task_state is None:
             return torch.tensor(0.0, device=next(self.parameters()).device)
         return self.critic(self._task_state)
+
+    def consolidate(self, success_rate):
+        """Consolidate current task state into slow memory (after episode)."""
+        if self.consolidation and self._task_state is not None:
+            self.slow_memory.consolidate(self._task_state, success_rate)
+
+    def get_slow_memory_stats(self):
+        """Return slow memory diagnostics. None if consolidation is off."""
+        if not self.consolidation:
+            return None
+        mem = self.slow_memory.memory
+        gate = torch.sigmoid(
+            self.slow_memory.retrieval_gate(mem)
+        ).detach()
+        return {
+            "norm": mem.norm().item(),
+            "max": mem.abs().max().item(),
+            "gate_mean": gate.mean().item(),
+            "gate_active": (gate > 0.3).sum().item(),
+        }
 
     def apply_writes(self, writes):
         """Apply differentiable patch weight modifications via basis vectors."""
