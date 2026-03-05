@@ -20,7 +20,7 @@ import config
 from models.universal_module import MACHPhase5, MACHPatchedModel
 from training.phase5_train import (
     meta_train_phase5, DEFAULT_CURRICULUM, LINEAR_CURRICULUM,
-    CONTINUOUS_LINEAR_CURRICULUM,
+    CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
 )
 
 
@@ -88,9 +88,12 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument(
         "--task", type=str, default="few_shot",
-        choices=["few_shot", "linear", "continuous_linear"],
+        choices=["few_shot", "linear", "continuous_linear",
+                 "token_map", "mixed"],
         help="Task type: few_shot (7 ops), linear (6 train combos), "
-             "continuous_linear (random coefficients 0-5)"
+             "continuous_linear (random coefficients 0-5), "
+             "token_map (random symbol substitution), "
+             "mixed (random mix of continuous_linear + token_map)"
     )
     parser.add_argument(
         "--sparsity-beta", type=float, default=None,
@@ -130,6 +133,10 @@ def main():
         curriculum = CONTINUOUS_LINEAR_CURRICULUM
     elif args.task == "linear":
         curriculum = LINEAR_CURRICULUM
+    elif args.task == "token_map":
+        curriculum = TOKEN_MAP_CURRICULUM
+    elif args.task == "mixed":
+        curriculum = MIXED_CURRICULUM
     else:
         curriculum = DEFAULT_CURRICULUM
 

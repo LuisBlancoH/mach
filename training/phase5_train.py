@@ -14,7 +14,8 @@ except ImportError:
 
 from data.arithmetic import (
     generate_arithmetic_problems, extract_number, generate_few_shot_episode,
-    generate_linear_episode, LINEAR_TRAIN, LINEAR_HELDOUT,
+    generate_linear_episode, generate_token_mapping_episode,
+    LINEAR_TRAIN, LINEAR_HELDOUT,
 )
 import config
 
@@ -34,6 +35,16 @@ CONTINUOUS_LINEAR_CURRICULUM = [
     (300, 2000, "continuous_linear"),
 ]
 
+TOKEN_MAP_CURRICULUM = [
+    (0, 300, "single"),
+    (300, 2000, "token_map"),
+]
+
+MIXED_CURRICULUM = [
+    (0, 300, "single"),
+    (300, 2000, "mixed"),
+]
+
 
 def get_episode_mode(episode_idx, curriculum):
     for start, end, mode in curriculum:
@@ -49,6 +60,12 @@ def generate_episode_problems(n_problems, mode):
         return generate_linear_episode(n_problems)
     elif mode == "continuous_linear":
         return generate_linear_episode(n_problems, continuous=True, max_coeff=5)
+    elif mode == "token_map":
+        return generate_token_mapping_episode(n_problems)
+    elif mode == "mixed":
+        # Randomly pick a task type each episode
+        sub_mode = random.choice(["continuous_linear", "token_map"])
+        return generate_episode_problems(n_problems, sub_mode)
     else:  # few_shot
         return generate_few_shot_episode(n_problems)
 
@@ -130,8 +147,11 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
             pred_text = tokenizer.decode(
                 pred_tokens, skip_special_tokens=True
             ).strip()
-            predicted = extract_number(pred_text)
-            correct = (predicted == problem["answer"])
+            if problem.get("difficulty") == "token_map":
+                correct = (pred_text == problem["answer"])
+            else:
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
             reward = 1.0 if correct else -1.0
 
         rewards.append(reward)
@@ -392,6 +412,21 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                             device, coeffs, episode_idx,
                             n_self_eval_steps=n_self_eval_steps,
                         )
+            elif mode in ("token_map", "mixed"):
+                _run_token_map_validation(
+                    base_model, mach, patched_model, tokenizer,
+                    device, episode_idx,
+                    n_self_eval_steps=n_self_eval_steps,
+                )
+                if mode == "mixed":
+                    # Also eval linear combos
+                    print(f"  --- LINEAR sample ---")
+                    for coeffs in [(1, 0), (0, 1), (1, 1), (2, 1)]:
+                        _run_linear_validation(
+                            base_model, mach, patched_model, tokenizer,
+                            device, coeffs, episode_idx,
+                            n_self_eval_steps=n_self_eval_steps,
+                        )
             else:
                 for eval_diff in [6, 7]:
                     _run_standard_validation(
@@ -557,6 +592,93 @@ def _run_linear_validation(base_model, mach, patched_model, tokenizer,
 
     if wandb is not None:
         wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
+
+
+def _run_token_map_validation(base_model, mach, patched_model, tokenizer,
+                               device, episode_idx, n_episodes=10,
+                               n_problems=20, n_demos=5,
+                               n_self_eval_steps=0):
+    """Evaluate token mapping performance across random permutations."""
+    test_correct = 0
+    test_total = 0
+    # Track per-symbol accuracy
+    symbol_correct = 0
+    symbol_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_token_mapping_episode(
+            n_problems, n_demos=n_demos
+        )
+        mach.reset_episode()
+        demo_problems = []
+
+        for i, problem in enumerate(problems):
+            input_ids = tokenizer(
+                problem["prompt"], return_tensors="pt"
+            ).input_ids.to(device)
+
+            gru_memory = mach.observe(base_model, input_ids)
+            writes = mach.fire(gru_memory)
+            mach.apply_writes(writes)
+
+            if problem["is_demo"]:
+                demo_problems.append(problem)
+                # Self-eval after last demo
+                if n_self_eval_steps > 0 and (
+                    i + 1 >= len(problems) or
+                    not problems[i + 1].get("is_demo", False)
+                ):
+                    for step in range(n_self_eval_steps):
+                        demo = demo_problems[step % len(demo_problems)]
+                        demo_ids = tokenizer(
+                            demo["prompt"], return_tensors="pt"
+                        ).input_ids.to(device)
+                        gru_mem = mach.observe_patched(
+                            patched_model, demo_ids
+                        )
+                        w = mach.fire(gru_mem)
+                        mach.apply_writes(w)
+                continue
+
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                correct = (pred_text == problem["answer"])
+
+                # Per-symbol accuracy
+                pred_syms = pred_text.split()
+                answer_syms = problem["answer"].split()
+                for j, ans_sym in enumerate(answer_syms):
+                    symbol_total += 1
+                    if j < len(pred_syms) and pred_syms[j] == ans_sym:
+                        symbol_correct += 1
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    sym_acc = symbol_correct / symbol_total if symbol_total > 0 else 0
+
+    print(
+        f"  EVAL ep{episode_idx} token_map | "
+        f"exact={test_acc:.0%} per_symbol={sym_acc:.0%}"
+    )
+
+    if wandb is not None:
+        wandb.log({
+            "eval/token_map_exact": test_acc,
+            "eval/token_map_symbol": sym_acc,
+        })
 
 
 def _run_standard_validation(base_model, mach, patched_model, tokenizer,

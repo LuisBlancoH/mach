@@ -1,5 +1,6 @@
 import random
 import re
+import string
 
 
 def generate_arithmetic_problems(n, difficulty):
@@ -197,6 +198,58 @@ def generate_linear_episode(n_problems, n_demos=None, coeffs=None,
             "difficulty": "linear",
             "c1": c1,
             "c2": c2,
+        })
+
+    return problems
+
+
+# ---- Token mapping episodes ----
+
+# Vocabulary of symbols that tokenize cleanly as single tokens
+TOKEN_MAP_SYMBOLS = list(string.ascii_uppercase)  # A-Z
+
+
+def generate_token_mapping_episode(n_problems, n_demos=None, n_symbols=6):
+    """
+    Generate a few-shot episode with a random symbol substitution.
+
+    Each episode picks a random permutation: e.g. A→X, B→Q, C→M, D→R, E→T, F→L.
+    Demos show "A B C → X Q M", test problems show "D E → " and expect "R T".
+
+    Impossible to memorize — must read demos to learn the mapping.
+    Exponentially many permutations (26! for full alphabet).
+    """
+    if n_demos is None:
+        n_demos = max(2, n_problems // 4)
+
+    # Pick n_symbols source symbols and a random target permutation
+    sources = random.sample(TOKEN_MAP_SYMBOLS, n_symbols)
+    targets = random.sample(TOKEN_MAP_SYMBOLS, n_symbols)
+    mapping = dict(zip(sources, targets))
+
+    problems = []
+    for i in range(n_problems):
+        is_demo = (i < n_demos)
+        # Each problem maps 2-4 symbols
+        seq_len = random.randint(2, min(4, n_symbols))
+        input_syms = random.sample(sources, seq_len)
+        output_syms = [mapping[s] for s in input_syms]
+
+        input_str = " ".join(input_syms)
+        output_str = " ".join(output_syms)
+
+        if is_demo:
+            prompt = f"{input_str} → {output_str}"
+        else:
+            prompt = f"{input_str} → "
+
+        problems.append({
+            "prompt": prompt,
+            "answer": output_str,
+            "is_demo": is_demo,
+            "difficulty": "token_map",
+            "op": "token_map",
+            "mapping": mapping,
         })
 
     return problems
