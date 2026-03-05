@@ -1340,3 +1340,166 @@ class MACHPatchedModel(nn.Module):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+
+class DemoProjection(nn.Module):
+    """
+    Replaces GRU + TaskStateModule for concat architecture.
+    Projects concatenated multi-layer observation to task_state in one shot.
+    """
+
+    def __init__(self, d_obs, d_task):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_obs, d_obs),
+            nn.GELU(),
+            nn.Linear(d_obs, d_task),
+        )
+
+    def forward(self, obs):
+        return self.net(obs)
+
+
+class MACHPhase5Concat(nn.Module):
+    """
+    Concatenated demo architecture: all demos processed in one Qwen forward pass.
+
+    Qwen's attention does cross-demo integration (free — frozen 4B params).
+    Meta-learner is just: layer_projs → DemoProjection → ActionCompiler → writes.
+    ~410K params total.
+
+    Episode flow:
+    1. Concatenate demo strings with newline
+    2. One Qwen forward pass → hook hidden states at patch layers
+    3. Last-token hidden from each layer → layer_projs → concat → (d_obs,)
+    4. DemoProjection → task_state (d_task,)
+    5. ActionCompiler → writes → patches get delta_W
+    6. Evaluate test problems through patched model (patches fixed)
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_obs=96, d_task=32, n_basis=8):
+        super().__init__()
+        self.d_model = d_model
+        self.d_obs = d_obs
+        self.d_task = d_task
+        self.n_basis = n_basis
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+
+        # Sensory cortex: per-layer projection (multi-layer always)
+        d_per_layer = d_obs // len(patch_layers)
+        self.d_per_layer = d_per_layer
+        self.layer_projs = nn.ModuleList([
+            nn.Linear(d_model, d_per_layer, bias=False)
+            for _ in patch_layers
+        ])
+
+        # DemoProjection: replaces GRU + TaskStateModule
+        self.demo_projection = DemoProjection(d_obs, d_task)
+
+        # Premotor: compile task state into patch writes
+        n_gain_basis = 4
+        self.action_compiler = ActionCompiler(
+            d_task, len(patch_layers), n_basis, n_gain_basis
+        )
+
+        # Motor execution: basis vectors + patches
+        self.basis = BasisVectors(
+            d_model, hidden_dim, len(patch_layers), n_basis, n_gain_basis
+        )
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Basal ganglia: value estimator
+        self.critic = TaskStateCritic(d_task)
+
+        # Persistent state
+        self._task_state = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._task_state = torch.zeros(
+            self.d_task, device=next(self.parameters()).device
+        )
+
+    def process_demos(self, base_model, demo_input_ids):
+        """
+        One-shot demo processing: single Qwen forward pass → project → write.
+
+        demo_input_ids: tokenized concatenated demo string (1, seq_len)
+        """
+        # Extract hidden states from all patch layers (frozen)
+        hidden_states = {}
+        hooks = []
+
+        with torch.no_grad():
+            for layer_idx in self.patch_layers:
+                def make_hook(idx):
+                    def hook(module, input, output):
+                        t = output[0] if isinstance(output, tuple) else output
+                        hidden_states[idx] = t[:, -1, :]  # last token
+                    return hook
+                h = base_model.model.layers[layer_idx].register_forward_hook(
+                    make_hook(layer_idx)
+                )
+                hooks.append(h)
+            base_model(input_ids=demo_input_ids)
+            for h in hooks:
+                h.remove()
+
+        # Project each layer and concatenate
+        layer_obs = []
+        for i, layer_idx in enumerate(self.patch_layers):
+            proj = self.layer_projs[i](hidden_states[layer_idx].float())
+            layer_obs.append(proj)
+        obs = torch.cat(layer_obs, dim=-1).squeeze(0)  # (d_obs,)
+
+        # Project to task state
+        self._task_state = self.demo_projection(obs)
+
+        # Compile writes and apply
+        writes = self.action_compiler(self._task_state)
+        self.apply_writes(writes)
+
+    def get_task_state(self):
+        """Return current task state for sparsity/energy loss."""
+        return self._task_state
+
+    def get_value(self):
+        """Critic value estimate of current task state."""
+        if self._task_state is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.critic(self._task_state)
+
+    def apply_writes(self, writes):
+        """Apply differentiable patch weight modifications via basis vectors."""
+        for (patch_idx, weight_name, coefficients, gate) in writes:
+            delta_W = self.basis.compute_delta_W(
+                patch_idx, weight_name, coefficients, gate
+            )
+            self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+    def metabolic_cost(self):
+        """
+        Free energy: total activation cost across the meta-learner.
+        Task state + patch deltas.
+        """
+        cost = torch.tensor(0.0, device=self._task_state.device)
+
+        # PFC firing cost
+        cost = cost + self._task_state.abs().mean()
+
+        # Motor execution cost
+        for patch in self.patches:
+            if patch.delta_down is not None:
+                cost = cost + patch.delta_down.abs().mean()
+            if patch.delta_up is not None:
+                cost = cost + patch.delta_up.abs().mean()
+            if patch.delta_gain is not None:
+                cost = cost + patch.delta_gain.abs().mean()
+
+        return cost

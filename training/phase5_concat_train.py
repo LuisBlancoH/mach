@@ -1,0 +1,475 @@
+"""
+Phase 5 Concat: Concatenated demo architecture training.
+All demos in one Qwen forward pass — Qwen's attention does cross-demo integration.
+"""
+
+import random
+
+import torch
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+from data.arithmetic import (
+    generate_arithmetic_problems, extract_number, generate_few_shot_episode,
+    generate_linear_episode, generate_token_mapping_episode,
+    LINEAR_TRAIN, LINEAR_HELDOUT,
+)
+import config
+
+
+CONTINUOUS_LINEAR_CURRICULUM = [
+    (0, 5000, "continuous_linear"),
+]
+
+TOKEN_MAP_CURRICULUM = [
+    (0, 5000, "token_map"),
+]
+
+MIXED_CURRICULUM = [
+    (0, 5000, "mixed"),
+]
+
+
+def get_episode_mode(episode_idx, curriculum):
+    for start, end, mode in curriculum:
+        if start <= episode_idx < end:
+            return mode
+    return curriculum[-1][2]
+
+
+def generate_episode_problems(n_problems, mode):
+    if mode == "continuous_linear":
+        return generate_linear_episode(n_problems, continuous=True, max_coeff=5)
+    elif mode == "token_map":
+        return generate_token_mapping_episode(n_problems)
+    elif mode == "mixed":
+        sub_mode = random.choice(["continuous_linear", "token_map"])
+        return generate_episode_problems(n_problems, sub_mode)
+    else:  # few_shot
+        return generate_few_shot_episode(n_problems)
+
+
+def run_episode_phase5_concat(base_model, mach, patched_model, tokenizer,
+                               problems, device):
+    """
+    Phase 5 Concat episode: concatenate demos → one Qwen pass → write → evaluate.
+
+    No adaptation during test. One-shot write from demos.
+    """
+    mach.reset_episode()
+
+    # Split demos and test problems
+    demos = [p for p in problems if p.get("is_demo", False)]
+    tests = [p for p in problems if not p.get("is_demo", False)]
+
+    # Phase A: Demo processing (one Qwen forward pass)
+    if demos:
+        # Concatenate demo prompts with newline
+        demo_text = "\n".join(p["prompt"] for p in demos)
+        demo_ids = tokenizer(demo_text, return_tensors="pt").input_ids.to(device)
+        mach.process_demos(base_model, demo_ids)
+
+    # Phase B: Test evaluation (patches fixed from demo writes)
+    rewards = []
+    problem_losses = []
+    qwen_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+    for problem in tests:
+        full_text = problem["prompt"] + problem["answer"]
+        encoding = tokenizer(full_text, return_tensors="pt").to(device)
+        prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+        labels = encoding.input_ids.clone()
+        labels[0, :prompt_len] = -100
+
+        output = patched_model(input_ids=encoding.input_ids, labels=labels)
+
+        # Reward
+        with torch.no_grad():
+            logits = output.logits
+            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+            pred_text = tokenizer.decode(
+                pred_tokens, skip_special_tokens=True
+            ).strip()
+            if problem.get("difficulty") == "token_map":
+                correct = (pred_text == problem["answer"])
+            else:
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+            reward = 1.0 if correct else -1.0
+
+        rewards.append(reward)
+        problem_losses.append(output.loss.item())
+        qwen_loss = qwen_loss + output.loss
+
+    return qwen_loss, rewards, problem_losses
+
+
+def meta_train_phase5_concat(base_model, mach, patched_model, tokenizer,
+                              device, n_episodes=None, lr=None,
+                              curriculum=None, checkpoint_path=None,
+                              save_path=None, energy_beta=None):
+    """Phase 5 Concat meta-training loop."""
+    if n_episodes is None:
+        n_episodes = config.PHASE5_EPISODES
+    if lr is None:
+        lr = config.PHASE5_LR
+    if curriculum is None:
+        curriculum = CONTINUOUS_LINEAR_CURRICULUM
+    if energy_beta is None:
+        energy_beta = config.PHASE5_ENERGY_BETA
+
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        mach.load_state_dict(state_dict, strict=False)
+
+    meta_params = list(mach.parameters())
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
+
+    use_energy = energy_beta > 0
+    n_meta = sum(p.numel() for p in meta_params)
+    print(f"Phase 5 Concat trainable parameters: {n_meta:,}")
+    if use_energy:
+        print(f"Using unified energy loss (beta={energy_beta})")
+
+    def get_n_problems(episode_idx):
+        if episode_idx < 100:
+            return 5
+        elif episode_idx < 300:
+            return 10
+        elif episode_idx < 600:
+            return 15
+        else:
+            return config.PHASE5_PROBLEMS_PER_EPISODE
+
+    for episode_idx in range(n_episodes):
+        mode = get_episode_mode(episode_idx, curriculum)
+        n_problems = get_n_problems(episode_idx)
+        problems = generate_episode_problems(n_problems, mode)
+
+        optimizer.zero_grad()
+
+        try:
+            ce_loss, rewards, problem_losses = run_episode_phase5_concat(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
+
+            if use_energy:
+                metabolic = mach.metabolic_cost()
+                total_loss = ce_loss + energy_beta * metabolic
+                energy_scalar = metabolic.item()
+            else:
+                total_loss = ce_loss
+                energy_scalar = 0.0
+
+            total_loss.backward()
+            loss_scalar = ce_loss.item()
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"\n  OOM at episode {episode_idx}. Reducing problems.")
+            torch.cuda.empty_cache()
+            optimizer.zero_grad()
+            problems = problems[:max(5, len(problems) // 2)]
+            ce_loss, rewards, problem_losses = run_episode_phase5_concat(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
+            total_loss = ce_loss
+            if use_energy:
+                total_loss = total_loss + energy_beta * mach.metabolic_cost()
+            total_loss.backward()
+            loss_scalar = ce_loss.item()
+            energy_scalar = 0.0
+
+        torch.nn.utils.clip_grad_norm_(
+            meta_params, max_norm=config.PHASE5_GRAD_CLIP
+        )
+        optimizer.step()
+
+        if episode_idx % 10 == 0:
+            test_rewards = [r for j, r in enumerate(rewards)]
+            avg_reward = sum(test_rewards) / max(len(test_rewards), 1)
+            n_early = min(5, len(test_rewards))
+            n_late = min(5, len(test_rewards))
+            early_acc = sum(
+                1 for r in test_rewards[:n_early] if r > 0
+            ) / max(n_early, 1)
+            late_acc = sum(
+                1 for r in test_rewards[-n_late:] if r > 0
+            ) / max(n_late, 1)
+
+            # Task state stats
+            task_state = mach.get_task_state()
+            if task_state is not None:
+                ts = task_state.detach()
+                n_active = (ts.abs() > 0.1).sum().item()
+                ts_max = ts.abs().max().item()
+            else:
+                n_active = 0
+                ts_max = 0.0
+
+            diff_str = ""
+            if mode in ("continuous_linear", "token_map"):
+                diff_correct = {}
+                diff_total = {}
+                for j, p in enumerate(problems):
+                    if p.get("is_demo", False):
+                        continue
+                    d = p.get("difficulty", "?")
+                    diff_total[d] = diff_total.get(d, 0) + 1
+                    if rewards[j - len([x for x in problems[:j]
+                                        if x.get("is_demo")])] > 0:
+                        diff_correct[d] = diff_correct.get(d, 0) + 1
+                # Simpler: just count test rewards by difficulty
+                diff_str = ""
+
+            cost_str = f"energy={energy_scalar:.3f}" if use_energy else ""
+
+            print(
+                f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
+                f"ce={loss_scalar:.4f} {cost_str} | "
+                f"avg_r={avg_reward:.2f} "
+                f"early={early_acc:.0%} late={late_acc:.0%} | "
+                f"active={n_active:.0f}/{mach.d_task} max={ts_max:.2f}"
+            )
+
+            if wandb is not None:
+                log_dict = {
+                    "episode": episode_idx,
+                    "ce_loss": loss_scalar,
+                    "energy_cost": energy_scalar,
+                    "avg_reward": avg_reward,
+                    "early_accuracy": early_acc,
+                    "late_accuracy": late_acc,
+                    "task_state_active": n_active,
+                    "task_state_max": ts_max,
+                }
+                wandb.log(log_dict)
+
+        # Diagnostics + validation + checkpoint
+        if (episode_idx % 200 == 0 and episode_idx > 0) or \
+                episode_idx == n_episodes - 1:
+            _log_diagnostics(mach, meta_params, episode_idx)
+            if mode in ("continuous_linear",):
+                print(f"  --- TRAIN combos ---")
+                for coeffs in LINEAR_TRAIN:
+                    _run_linear_validation_concat(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+                print(f"  --- HELD-OUT combos ---")
+                for coeffs in LINEAR_HELDOUT:
+                    _run_linear_validation_concat(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+                print(f"  --- NOVEL combos (never in fixed pool) ---")
+                for coeffs in [(3, 1), (1, 4), (4, 3), (5, 0), (0, 5)]:
+                    _run_linear_validation_concat(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+            elif mode == "token_map":
+                _run_token_map_validation_concat(
+                    base_model, mach, patched_model, tokenizer,
+                    device, episode_idx,
+                )
+            elif mode == "mixed":
+                _run_token_map_validation_concat(
+                    base_model, mach, patched_model, tokenizer,
+                    device, episode_idx,
+                )
+                print(f"  --- LINEAR sample ---")
+                for coeffs in [(1, 0), (0, 1), (1, 1), (2, 1)]:
+                    _run_linear_validation_concat(
+                        base_model, mach, patched_model, tokenizer,
+                        device, coeffs, episode_idx,
+                    )
+
+            if save_path is not None:
+                import os
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                torch.save(mach.state_dict(), save_path)
+                print(f"  Checkpoint saved to {save_path}")
+
+
+def _run_linear_validation_concat(base_model, mach, patched_model, tokenizer,
+                                   device, coeffs, episode_idx, n_episodes=10,
+                                   n_problems=20, n_demos=5):
+    """Evaluate linear combination performance with concat architecture."""
+    test_correct = 0
+    test_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_linear_episode(
+            n_problems, n_demos=n_demos, coeffs=coeffs
+        )
+        mach.reset_episode()
+
+        # Concat demos
+        demos = [p for p in problems if p["is_demo"]]
+        tests = [p for p in problems if not p["is_demo"]]
+
+        if demos:
+            demo_text = "\n".join(p["prompt"] for p in demos)
+            demo_ids = tokenizer(
+                demo_text, return_tensors="pt"
+            ).input_ids.to(device)
+            with torch.no_grad():
+                mach.process_demos(base_model, demo_ids)
+
+        for problem in tests:
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    c1, c2 = coeffs
+    label = f"{c1}a+{c2}b"
+
+    print(f"  EVAL ep{episode_idx} {label:8s} | test={test_acc:.0%}")
+
+    if wandb is not None:
+        wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
+
+
+def _run_token_map_validation_concat(base_model, mach, patched_model,
+                                      tokenizer, device, episode_idx,
+                                      n_episodes=10, n_problems=20,
+                                      n_demos=5):
+    """Evaluate token mapping performance with concat architecture."""
+    test_correct = 0
+    test_total = 0
+    symbol_correct = 0
+    symbol_total = 0
+
+    for ep in range(n_episodes):
+        problems = generate_token_mapping_episode(
+            n_problems, n_demos=n_demos
+        )
+        mach.reset_episode()
+
+        demos = [p for p in problems if p["is_demo"]]
+        tests = [p for p in problems if not p["is_demo"]]
+
+        if demos:
+            demo_text = "\n".join(p["prompt"] for p in demos)
+            demo_ids = tokenizer(
+                demo_text, return_tensors="pt"
+            ).input_ids.to(device)
+            with torch.no_grad():
+                mach.process_demos(base_model, demo_ids)
+
+        for problem in tests:
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+
+            with torch.no_grad():
+                output = patched_model(input_ids=encoding.input_ids)
+                logits = (
+                    output.logits if hasattr(output, 'logits') else output[0]
+                )
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                correct = (pred_text == problem["answer"])
+
+                pred_syms = pred_text.split()
+                answer_syms = problem["answer"].split()
+                for j, ans_sym in enumerate(answer_syms):
+                    symbol_total += 1
+                    if j < len(pred_syms) and pred_syms[j] == ans_sym:
+                        symbol_correct += 1
+
+            test_correct += int(correct)
+            test_total += 1
+
+    test_acc = test_correct / test_total if test_total > 0 else 0
+    sym_acc = symbol_correct / symbol_total if symbol_total > 0 else 0
+
+    print(
+        f"  EVAL ep{episode_idx} token_map | "
+        f"exact={test_acc:.0%} per_symbol={sym_acc:.0%}"
+    )
+
+    if wandb is not None:
+        wandb.log({
+            "eval/token_map_exact": test_acc,
+            "eval/token_map_symbol": sym_acc,
+        })
+
+
+def _log_diagnostics(mach, meta_params, episode_idx):
+    """Log gradient norms and weight stats."""
+    diag = {}
+
+    component_grad_norms = {}
+    for name, param in mach.named_parameters():
+        if param.grad is not None:
+            component = name.split('.')[0]
+            norm = param.grad.norm().item()
+            if component not in component_grad_norms:
+                component_grad_norms[component] = []
+            component_grad_norms[component].append(norm)
+
+    for component, norms in component_grad_norms.items():
+        avg_norm = sum(norms) / len(norms)
+        diag[f"grad_norm/{component}"] = avg_norm
+
+    # Task state info
+    task_state = mach.get_task_state()
+    if task_state is not None:
+        ts = task_state.detach()
+        diag["task_state/l1_norm"] = ts.abs().mean().item()
+        diag["task_state/n_active_01"] = (ts.abs() > 0.1).sum().item()
+        diag["task_state/n_active_05"] = (ts.abs() > 0.5).sum().item()
+        diag["task_state/max_abs"] = ts.abs().max().item()
+
+    for i in range(mach.basis.n_patches):
+        diag[f"basis_norm/patch{i}_down_U"] = (
+            mach.basis.down_U[i].norm().item()
+        )
+        diag[f"basis_norm/patch{i}_down_V"] = (
+            mach.basis.down_V[i].norm().item()
+        )
+
+    for i, patch in enumerate(mach.patches):
+        if patch.delta_down is not None:
+            diag[f"patch_delta/patch{i}_down"] = (
+                patch.delta_down.norm().item()
+            )
+            diag[f"patch_delta/patch{i}_up"] = (
+                patch.delta_up.norm().item()
+            )
+        if patch.delta_gain is not None:
+            diag[f"patch_delta/patch{i}_gain"] = (
+                patch.delta_gain.norm().item()
+            )
+
+    print(f"  Diagnostics at episode {episode_idx}:")
+    for k, v in sorted(diag.items()):
+        print(f"    {k}: {v:.6f}")
+
+    if wandb is not None:
+        wandb.log({f"diag/{k}": v for k, v in diag.items()})
