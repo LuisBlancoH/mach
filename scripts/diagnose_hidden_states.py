@@ -3,28 +3,34 @@
 Diagnostic: do Qwen's hidden states at the last demo token encode
 coefficient magnitude, or just operation type?
 
-Generates demos for several coefficient pairs, runs them through frozen Qwen,
-extracts last-token hidden states from multiple layers, and checks:
-1. Do hidden states cluster by (c1,c2) pair? (PCA + cosine similarity)
-2. Can a linear probe predict c1 and c2 from the hidden state?
-3. How much variance is explained by operation type vs coefficient magnitude?
+Compares UNPROMPTED (raw demos) vs PROMPTED ("The pattern is:") to see
+if prompting Qwen to reason about the rule improves coefficient encoding.
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import random
 import torch
 import numpy as np
 from sklearn.decomposition import PCA
-from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
+from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+PROMPTS = {
+    "unprompted": "",
+    "pattern": "\nThe pattern is:",
+    "rule": "\nRule: output =",
+    "next": "\nFollowing the same rule,",
+}
 
 
 def generate_demo_text(c1, c2, n_demos=5):
     """Generate demo string for a given coefficient pair."""
-    import random
     lines = []
     for _ in range(n_demos):
         a = random.randint(10, 99)
@@ -34,11 +40,10 @@ def generate_demo_text(c1, c2, n_demos=5):
     return "\n".join(lines)
 
 
-def extract_hidden_states(model, tokenizer, demo_text, layer_indices, device):
-    """Run demo text through Qwen and extract last-token hidden states."""
-    input_ids = tokenizer(demo_text, return_tensors="pt").input_ids.to(device)
+def extract_hidden_states(model, tokenizer, text, layer_indices, device):
+    """Run text through Qwen and extract last-token hidden states."""
+    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
     hidden_states = {}
-    full_seqs = {}
     hooks = []
 
     with torch.no_grad():
@@ -46,8 +51,7 @@ def extract_hidden_states(model, tokenizer, demo_text, layer_indices, device):
             def make_hook(idx):
                 def hook(module, input, output):
                     t = output[0] if isinstance(output, tuple) else output
-                    hidden_states[idx] = t[:, -1, :].cpu()  # last token
-                    full_seqs[idx] = t[0].cpu()  # full sequence
+                    hidden_states[idx] = t[:, -1, :].cpu()
                 return hook
             h = model.model.layers[layer_idx].register_forward_hook(make_hook(layer_idx))
             hooks.append(h)
@@ -55,14 +59,69 @@ def extract_hidden_states(model, tokenizer, demo_text, layer_indices, device):
         for h in hooks:
             h.remove()
 
-    return hidden_states, full_seqs, input_ids.shape[1]
+    return hidden_states
+
+
+def analyze(X, all_c1, all_c2, all_labels, n_samples_per_coeff):
+    """Run linear probe and cosine similarity analysis. Returns dict of metrics."""
+    n_total = len(all_c1)
+
+    # PCA
+    pca = PCA(n_components=10)
+    X_pca = pca.fit_transform(X)
+
+    # Train/test split
+    train_mask = np.array([i % n_samples_per_coeff < 15 for i in range(n_total)])
+    test_mask = ~train_mask
+
+    X_train_pca = X_pca[train_mask, :10]
+    X_test_pca = X_pca[test_mask, :10]
+
+    reg_c1 = Ridge(alpha=1.0).fit(X_train_pca, all_c1[train_mask])
+    reg_c2 = Ridge(alpha=1.0).fit(X_train_pca, all_c2[train_mask])
+
+    r2_c1 = r2_score(all_c1[test_mask], reg_c1.predict(X_test_pca))
+    r2_c2 = r2_score(all_c2[test_mask], reg_c2.predict(X_test_pca))
+
+    mae_c1 = np.mean(np.abs(all_c1[test_mask] - reg_c1.predict(X_test_pca)))
+    mae_c2 = np.mean(np.abs(all_c2[test_mask] - reg_c2.predict(X_test_pca)))
+
+    # Cosine similarity
+    cos_sim = cosine_similarity(X)
+    within_sims = []
+    across_sims = []
+    for i in range(n_total):
+        for j in range(i + 1, n_total):
+            if all_labels[i] == all_labels[j]:
+                within_sims.append(cos_sim[i, j])
+            else:
+                across_sims.append(cos_sim[i, j])
+
+    # Scaling variant similarity
+    scale_sims = {}
+    for l1, l2 in [("1a+0b", "2a+0b"), ("1a+0b", "3a+0b"), ("2a+0b", "3a+0b"),
+                    ("0a+1b", "0a+2b"), ("0a+1b", "0a+3b"), ("0a+2b", "0a+3b")]:
+        idx1 = [i for i, l in enumerate(all_labels) if l == l1]
+        idx2 = [i for i, l in enumerate(all_labels) if l == l2]
+        if idx1 and idx2:
+            sims = [cos_sim[i, j] for i in idx1 for j in idx2]
+            scale_sims[f"{l1}_vs_{l2}"] = np.mean(sims)
+
+    return {
+        "r2_c1": r2_c1, "r2_c2": r2_c2,
+        "mae_c1": mae_c1, "mae_c2": mae_c2,
+        "within_sim": np.mean(within_sims),
+        "across_sim": np.mean(across_sims),
+        "gap": np.mean(within_sims) - np.mean(across_sims),
+        "scale_sims": scale_sims,
+        "pca_var_10": sum(pca.explained_variance_ratio_[:10]),
+    }
 
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Load model
     print("Loading Qwen3-4B...")
     model_name = "Qwen/Qwen3-4B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -71,142 +130,90 @@ def main():
     ).to(device)
     model.eval()
 
-    # Coefficient pairs to test
     coeff_pairs = [
-        (0, 1), (0, 2), (0, 3),  # b-only with different scales
-        (1, 0), (2, 0), (3, 0),  # a-only with different scales
-        (1, 1), (2, 2), (1, 2), (2, 1),  # mixed
+        (0, 1), (0, 2), (0, 3),
+        (1, 0), (2, 0), (3, 0),
+        (1, 1), (2, 2), (1, 2), (2, 1),
     ]
 
-    layer_indices = [9, 18, 27, 34]  # standard patch layers
-    n_samples_per_coeff = 20  # different random demos per coeff pair
+    layer_indices = [9, 18, 27, 34]
+    n_samples_per_coeff = 20
 
-    print(f"\nGenerating {len(coeff_pairs)} coeff pairs x {n_samples_per_coeff} samples each")
-    print(f"Layers: {layer_indices}\n")
+    # Fix random seed for fair comparison across prompt types
+    base_seed = 42
 
-    # Collect hidden states
-    all_hidden = {layer_idx: [] for layer_idx in layer_indices}
-    all_c1 = []
-    all_c2 = []
-    all_labels = []  # string label for each sample
+    for prompt_name, prompt_suffix in PROMPTS.items():
+        print(f"\n{'#'*70}")
+        print(f"# PROMPT: {prompt_name!r}  suffix={prompt_suffix!r}")
+        print(f"{'#'*70}")
 
-    for c1, c2 in coeff_pairs:
-        for _ in range(n_samples_per_coeff):
-            demo_text = generate_demo_text(c1, c2, n_demos=5)
-            hidden_states, _, seq_len = extract_hidden_states(
-                model, tokenizer, demo_text, layer_indices, device
-            )
-            for layer_idx in layer_indices:
-                all_hidden[layer_idx].append(hidden_states[layer_idx].float().squeeze(0))
-            all_c1.append(c1)
-            all_c2.append(c2)
-            all_labels.append(f"{c1}a+{c2}b")
+        all_hidden = {layer_idx: [] for layer_idx in layer_indices}
+        all_c1 = []
+        all_c2 = []
+        all_labels = []
 
-    all_c1 = np.array(all_c1)
-    all_c2 = np.array(all_c2)
-    n_total = len(all_c1)
+        random.seed(base_seed)  # same demos for each prompt type
 
-    print(f"Collected {n_total} samples\n")
+        for c1, c2 in coeff_pairs:
+            for _ in range(n_samples_per_coeff):
+                demo_text = generate_demo_text(c1, c2, n_demos=5)
+                full_text = demo_text + prompt_suffix
 
-    # Analysis per layer
-    for layer_idx in layer_indices:
-        print(f"{'='*60}")
-        print(f"Layer {layer_idx}")
-        print(f"{'='*60}")
+                hidden_states = extract_hidden_states(
+                    model, tokenizer, full_text, layer_indices, device
+                )
+                for layer_idx in layer_indices:
+                    all_hidden[layer_idx].append(
+                        hidden_states[layer_idx].float().squeeze(0)
+                    )
+                all_c1.append(c1)
+                all_c2.append(c2)
+                all_labels.append(f"{c1}a+{c2}b")
 
-        X = torch.stack(all_hidden[layer_idx]).numpy()  # (n_total, d_model)
+        all_c1 = np.array(all_c1)
+        all_c2 = np.array(all_c2)
 
-        # 1. PCA — how much variance in first few components?
-        pca = PCA(n_components=10)
-        X_pca = pca.fit_transform(X)
-        print(f"\nPCA explained variance (first 10):")
-        for i, v in enumerate(pca.explained_variance_ratio_[:10]):
-            print(f"  PC{i+1}: {v:.4f} ({sum(pca.explained_variance_ratio_[:i+1]):.4f} cumulative)")
+        for layer_idx in layer_indices:
+            X = torch.stack(all_hidden[layer_idx]).numpy()
+            metrics = analyze(X, all_c1, all_c2, all_labels, n_samples_per_coeff)
 
-        # 2. Linear probe: can we predict c1, c2 from hidden state?
-        # Train/test split: first 15 samples per coeff = train, last 5 = test
-        train_mask = np.array([i % n_samples_per_coeff < 15 for i in range(n_total)])
-        test_mask = ~train_mask
+            print(f"\n  Layer {layer_idx}:")
+            print(f"    R²  c1={metrics['r2_c1']:.4f}  c2={metrics['r2_c2']:.4f}  "
+                  f"| MAE  c1={metrics['mae_c1']:.4f}  c2={metrics['mae_c2']:.4f}")
+            print(f"    Cosine gap={metrics['gap']:.4f}  "
+                  f"(within={metrics['within_sim']:.4f}  across={metrics['across_sim']:.4f})")
+            print(f"    PCA top-10 var={metrics['pca_var_10']:.4f}")
 
-        X_train, X_test = X[train_mask], X[test_mask]
-        c1_train, c1_test = all_c1[train_mask], all_c1[test_mask]
-        c2_train, c2_test = all_c2[train_mask], all_c2[test_mask]
+            # Compact scaling variant display
+            ss = metrics['scale_sims']
+            a_sims = [ss.get(k, 0) for k in ["1a+0b_vs_2a+0b", "1a+0b_vs_3a+0b", "2a+0b_vs_3a+0b"]]
+            b_sims = [ss.get(k, 0) for k in ["0a+1b_vs_0a+2b", "0a+1b_vs_0a+3b", "0a+2b_vs_0a+3b"]]
+            print(f"    Scale sims: a-variants={np.mean(a_sims):.4f}  b-variants={np.mean(b_sims):.4f}")
 
-        # Use PCA features for stability
-        X_train_pca = X_pca[train_mask, :10]
-        X_test_pca = X_pca[test_mask, :10]
+    # Bonus: check what Qwen actually generates after each prompt
+    print(f"\n{'#'*70}")
+    print(f"# GENERATION CHECK: what does Qwen say after each prompt?")
+    print(f"{'#'*70}")
 
-        reg_c1 = Ridge(alpha=1.0).fit(X_train_pca, c1_train)
-        reg_c2 = Ridge(alpha=1.0).fit(X_train_pca, c2_train)
-
-        c1_pred = reg_c1.predict(X_test_pca)
-        c2_pred = reg_c2.predict(X_test_pca)
-
-        r2_c1 = r2_score(c1_test, c1_pred)
-        r2_c2 = r2_score(c2_test, c2_pred)
-
-        mae_c1 = np.mean(np.abs(c1_test - c1_pred))
-        mae_c2 = np.mean(np.abs(c2_test - c2_pred))
-
-        print(f"\nLinear probe (Ridge on top-10 PCs):")
-        print(f"  c1: R²={r2_c1:.4f}, MAE={mae_c1:.4f}")
-        print(f"  c2: R²={r2_c2:.4f}, MAE={mae_c2:.4f}")
-
-        # 3. Cosine similarity within vs across coefficient pairs
-        from sklearn.metrics.pairwise import cosine_similarity
-        cos_sim = cosine_similarity(X)
-
-        within_sims = []
-        across_sims = []
-        for i in range(n_total):
-            for j in range(i+1, n_total):
-                sim = cos_sim[i, j]
-                if all_labels[i] == all_labels[j]:
-                    within_sims.append(sim)
-                else:
-                    across_sims.append(sim)
-
-        print(f"\nCosine similarity:")
-        print(f"  Within same (c1,c2):  mean={np.mean(within_sims):.4f}, std={np.std(within_sims):.4f}")
-        print(f"  Across diff (c1,c2):  mean={np.mean(across_sims):.4f}, std={np.std(across_sims):.4f}")
-        print(f"  Separation gap:       {np.mean(within_sims) - np.mean(across_sims):.4f}")
-
-        # 4. Check: does magnitude info exist beyond type?
-        # Compare samples with same "type" but different magnitude
-        # e.g., (1,0) vs (2,0) vs (3,0)
-        print(f"\n  Similarity between scaling variants:")
-        for pairs in [
-            ("1a+0b", "2a+0b", "3a+0b"),
-            ("0a+1b", "0a+2b", "0a+3b"),
-            ("1a+1b", "2a+2b"),
-        ]:
-            indices = {label: [i for i, l in enumerate(all_labels) if l == label]
-                      for label in pairs}
-            for l1 in pairs:
-                for l2 in pairs:
-                    if l1 >= l2:
-                        continue
-                    sims = [cos_sim[i, j]
-                           for i in indices[l1] for j in indices[l2]]
-                    print(f"    {l1} vs {l2}: {np.mean(sims):.4f}")
-
-    # 5. Full-sequence analysis at middle layer (18)
-    print(f"\n{'='*60}")
-    print(f"Full-sequence analysis (layer 18)")
-    print(f"{'='*60}")
-
-    # Re-extract with full sequences for a subset
-    test_pairs = [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2)]
-    for c1, c2 in test_pairs:
+    random.seed(99)
+    for c1, c2 in [(1, 0), (2, 0), (0, 1), (1, 1)]:
         demo_text = generate_demo_text(c1, c2, n_demos=5)
-        _, full_seqs, seq_len = extract_hidden_states(
-            model, tokenizer, demo_text, [18], device
-        )
-        seq = full_seqs[18]  # (seq_len, d_model)
-        norms = seq.float().norm(dim=-1)
-        print(f"\n  {c1}a+{c2}b: seq_len={seq_len}, "
-              f"hidden norm range=[{norms.min():.1f}, {norms.max():.1f}], "
-              f"mean={norms.mean():.1f}")
+        print(f"\n  Demos ({c1}a+{c2}b):")
+        for line in demo_text.split("\n"):
+            print(f"    {line}")
+
+        for prompt_name, prompt_suffix in PROMPTS.items():
+            if not prompt_suffix:
+                continue
+            full_text = demo_text + prompt_suffix
+            input_ids = tokenizer(full_text, return_tensors="pt").input_ids.to(device)
+            with torch.no_grad():
+                out = model.generate(
+                    input_ids, max_new_tokens=30, do_sample=False,
+                    temperature=1.0
+                )
+            generated = tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
+            print(f"    {prompt_name}: {generated.strip()[:80]}")
 
     print("\nDone.")
 
