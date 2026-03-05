@@ -1653,6 +1653,7 @@ class MACHTwoChannel(nn.Module):
         # Cross-attention demo readout: refine task_state with full demo sequence
         self.wm_proj = nn.Linear(d_model, d_obs, bias=False)
         self.demo_cross_attn = WorkingMemoryCrossAttention(d_task, d_obs)
+        self.post_cross_attn_norm = nn.LayerNorm(d_task)
         # Middle patch layer used for full-sequence capture
         self._mid_layer_idx = patch_layers[len(patch_layers) // 2]
 
@@ -1711,6 +1712,7 @@ class MACHTwoChannel(nn.Module):
         # Refine task state with cross-attention over full demo sequence
         demo_memory = self.wm_proj(full_seq[self._mid_layer_idx].float())  # (seq_len, d_obs)
         self._task_state = self.demo_cross_attn(self._task_state, demo_memory)
+        self._task_state = self.post_cross_attn_norm(self._task_state)
 
         # Channel 1: Modulation
         prim_weights = self.modulation_head(self._task_state)
