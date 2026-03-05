@@ -812,8 +812,8 @@ class TaskStateCritic(nn.Module):
         nn.init.constant_(self.net[-1].bias, -2.0)
 
     def forward(self, task_state):
-        """Returns scalar value estimate."""
-        return self.net(task_state).squeeze(-1)
+        """Returns scalar value estimate in [0, 1]."""
+        return torch.sigmoid(self.net(task_state).squeeze(-1))
 
 
 class SlowMemory(nn.Module):
