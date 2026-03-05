@@ -2183,11 +2183,13 @@ class MACHHebbian(nn.Module):
         while post_h.dim() > 1:
             post_h = post_h.mean(dim=0)
 
-        # Correlation signal: element-wise product (Hebbian)
+        # Correlation signal: element-wise product (Hebbian), normalized
         coefficients = pre_h * post_h  # (n_basis,)
+        coefficients = coefficients / (coefficients.norm() + 1e-8)
 
-        # Gate = learning rate × TD error (dopamine modulation)
+        # Gate = learning rate × TD error (dopamine modulation), clamped
         gate = eta * td_error * self.gate_scale
+        gate = gate.clamp(-1.0, 1.0)
 
         delta_down = self.basis.compute_delta_W(
             patch_idx, "down", coefficients, gate
@@ -2203,6 +2205,8 @@ class MACHHebbian(nn.Module):
         Called after each problem's forward pass.
         """
         act_summary = self.get_activation_summary()
+        # Normalize activation summary to prevent critic explosion
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
         value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
 
         if self._last_value is not None:
@@ -2216,7 +2220,7 @@ class MACHHebbian(nn.Module):
         eta_input = torch.tensor(
             [td_scalar, reward, step_frac], device=device,
         )
-        etas = self.eta_head(eta_input)  # (n_patches,)
+        etas = self.eta_head(eta_input).clamp(max=1.0)  # cap learning rate
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
