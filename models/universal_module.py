@@ -1984,11 +1984,8 @@ class MACHOracleMinimal(nn.Module):
         self.n_basis = n_basis
 
         # [c1, c2] → patch write coefficients directly
-        self.head = nn.Sequential(
-            nn.Linear(2, 128),
-            nn.GELU(),
-            nn.Linear(128, n_outputs),
-        )
+        # Linear head: guarantees output([1,1]) = output([1,0]) + output([0,1])
+        self.head = nn.Linear(2, n_outputs)
 
         self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
         self.patches = nn.ModuleList([
