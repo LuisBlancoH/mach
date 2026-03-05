@@ -1346,7 +1346,7 @@ class DemoProjection(nn.Module):
     """
     Replaces GRU + TaskStateModule for concat architecture.
     Projects concatenated multi-layer observation to task_state in one shot.
-    Output bounded by tanh to [-1, 1] to prevent task_state explosion.
+    LayerNorm controls magnitude without killing gradients (unlike tanh).
     """
 
     def __init__(self, d_obs, d_task):
@@ -1355,7 +1355,7 @@ class DemoProjection(nn.Module):
             nn.Linear(d_obs, d_obs),
             nn.GELU(),
             nn.Linear(d_obs, d_task),
-            nn.Tanh(),
+            nn.LayerNorm(d_task),
         )
 
     def forward(self, obs):
