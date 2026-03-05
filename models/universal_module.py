@@ -807,6 +807,9 @@ class TaskStateCritic(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Start pessimistic: default to "not satisfied"
+        # Must learn to be confident — like basal ganglia defaulting to low dopamine
+        nn.init.constant_(self.net[-1].bias, -2.0)
 
     def forward(self, task_state):
         """Returns scalar value estimate."""
