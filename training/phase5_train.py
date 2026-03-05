@@ -457,9 +457,10 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
 
             critic_str = ""
             if use_critic:
+                critic_val = mach.get_value().item()
                 eval_str = f" eval={ep_self_eval_steps}" \
                     if n_self_eval_steps > 0 else ""
-                critic_str = f" | td={avg_td_error:.3f}{eval_str}"
+                critic_str = f" | td={avg_td_error:.3f} V={critic_val:.2f}{eval_str}"
 
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
