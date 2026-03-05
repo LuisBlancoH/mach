@@ -703,10 +703,13 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
     print(f"Inner steps: {mach.n_inner_steps}")
 
     def get_n_problems(episode_idx):
+        # Iterative needs both demos AND tests from the start.
+        # generate_linear_episode defaults n_demos=max(5, n//3),
+        # so n_problems must be > 5 to have any test problems.
         if episode_idx < 100:
-            return 5
-        elif episode_idx < 300:
             return 10
+        elif episode_idx < 300:
+            return 15
         elif episode_idx < 600:
             return 15
         else:
