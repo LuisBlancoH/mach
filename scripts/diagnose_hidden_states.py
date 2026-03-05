@@ -134,14 +134,20 @@ def main():
     print(f"Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
+        model_name, dtype=torch.bfloat16, trust_remote_code=True
     ).to(device)
     model.eval()
 
-    # Auto-detect architecture
+    # Verify correct model loaded
     n_layers = model.config.num_hidden_layers
     d_model = model.config.hidden_size
+    actual_name = getattr(model.config, '_name_or_path', 'unknown')
+    print(f"Loaded: {actual_name}")
     print(f"Architecture: {n_layers} layers, d_model={d_model}")
+    n_params = sum(p.numel() for p in model.parameters()) / 1e9
+    print(f"Parameters: {n_params:.1f}B")
+    if model_name != actual_name:
+        print(f"WARNING: requested {model_name} but loaded {actual_name}")
 
     coeff_pairs = [
         (0, 1), (0, 2), (0, 3),
