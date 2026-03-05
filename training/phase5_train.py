@@ -277,8 +277,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 else:
                     decorr_loss = torch.tensor(0.0, device=device)
 
+                # Obs gate sparsity: push unused observation layers toward zero
+                obs_gates = mach.get_obs_gates()
+                obs_gate_loss = obs_gates.mean() if obs_gates is not None \
+                    else torch.tensor(0.0, device=device)
+
                 total_loss = ce_loss + sparsity_beta * sparsity_loss \
-                    + decorr_beta * decorr_loss
+                    + decorr_beta * decorr_loss \
+                    + sparsity_beta * obs_gate_loss
                 energy_scalar = 0.0
                 decorr_scalar = decorr_loss.item()
                 sparsity_scalar = sparsity_loss.item()
@@ -783,6 +789,16 @@ def _log_diagnostics(mach, meta_params, episode_idx):
             diag[f"patch_delta/patch{i}_up"] = (
                 patch.delta_up.norm().item()
             )
+
+    # Observation gates (self-discovering architecture)
+    obs_gates = mach.get_obs_gates()
+    if obs_gates is not None:
+        for i, (layer_idx, gate_val) in enumerate(
+            zip(mach.patch_layers, obs_gates.tolist())
+        ):
+            diag[f"obs_gate/layer{layer_idx}"] = gate_val
+        diag["obs_gate/n_active"] = (obs_gates > 0.3).sum().item()
+        diag["obs_gate/mean"] = obs_gates.mean().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

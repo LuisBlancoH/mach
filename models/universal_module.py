@@ -721,11 +721,13 @@ class ActionCompiler(nn.Module):
         self.n_basis = n_basis
         n_writes = n_patches * 2
         n_outputs = n_writes * (n_basis + 1)
+        # Scale hidden dim with output size, min 64
+        hidden = max(64, n_outputs // 3)
 
         self.head = nn.Sequential(
-            nn.Linear(d_task, 64),
+            nn.Linear(d_task, hidden),
             nn.GELU(),
-            nn.Linear(64, n_outputs),
+            nn.Linear(hidden, n_outputs),
         )
 
     def forward(self, task_state):
@@ -774,6 +776,7 @@ class MACHPhase5(nn.Module):
         self.d_obs = d_obs
         self.d_gru = d_gru
         self.d_task = d_task
+        self.n_basis = n_basis
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
         self.n_deliberation_steps = n_deliberation_steps
@@ -789,6 +792,9 @@ class MACHPhase5(nn.Module):
                 nn.Linear(d_model, d_per_layer, bias=False)
                 for _ in patch_layers
             ])
+            # Per-layer observation gates — model discovers which layers matter
+            # Initialized to 0 → sigmoid = 0.5, all layers contribute equally
+            self.obs_gates = nn.Parameter(torch.zeros(len(patch_layers)))
         else:
             self.obs_proj = ObservationProjection(d_model, d_obs)
 
@@ -868,9 +874,10 @@ class MACHPhase5(nn.Module):
     def _project_hidden(self, hidden):
         """Project extracted hidden states to d_obs. Returns (d_obs,) 1D."""
         if self.multi_layer_obs:
+            gates = torch.sigmoid(self.obs_gates)
             layer_obs = []
             for i, layer_idx in enumerate(self.patch_layers):
-                proj = self.layer_projs[i](hidden[layer_idx].float())
+                proj = gates[i] * self.layer_projs[i](hidden[layer_idx].float())
                 layer_obs.append(proj)
             projected = torch.cat(layer_obs, dim=-1)  # (batch, d_obs)
             return projected.squeeze(0)  # (d_obs,)
@@ -976,7 +983,17 @@ class MACHPhase5(nn.Module):
         if self.gru.memory is not None:
             cost = cost + self.gru.memory.abs().mean()
 
+        # Observation gate cost: push unused layers toward zero
+        if self.multi_layer_obs:
+            cost = cost + torch.sigmoid(self.obs_gates).mean()
+
         return cost
+
+    def get_obs_gates(self):
+        """Return sigmoid(obs_gates) for diagnostics. None if single-layer."""
+        if self.multi_layer_obs:
+            return torch.sigmoid(self.obs_gates).detach()
+        return None
 
 
 class MACHPatchedModel(nn.Module):

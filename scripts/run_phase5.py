@@ -43,31 +43,56 @@ def load_base_model():
 
 
 def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
-                       d_task=None, task_noise=0.0, multi_layer_obs=False):
+                       d_task=None, task_noise=0.0, multi_layer_obs=False,
+                       n_patch_layers=None, n_basis=None, d_obs=None):
     if d_task is None:
         d_task = config.PHASE5_D_TASK
-    patch_layers = [
-        n_layers // 4,
-        n_layers // 2,
-        3 * n_layers // 4,
-        n_layers - 2,
-    ]
-    print(f"Patch layers: {patch_layers}")
-    print(f"d_obs={config.PHASE5_D_OBS}, d_gru={config.PHASE5_D_GRU}, "
-          f"d_task={d_task}, "
+    if n_patch_layers is None:
+        n_patch_layers = config.PHASE5_N_PATCH_LAYERS
+    if n_basis is None:
+        n_basis = config.N_BASIS
+    if d_obs is None:
+        d_obs = config.PHASE5_D_OBS
+
+    # Generate evenly-spaced patch layers
+    if n_patch_layers == 4:
+        patch_layers = [
+            n_layers // 4,
+            n_layers // 2,
+            3 * n_layers // 4,
+            n_layers - 2,
+        ]
+    else:
+        step = n_layers // n_patch_layers
+        patch_layers = [i * step for i in range(n_patch_layers)]
+        # Ensure last layer isn't the very last (output layer)
+        patch_layers = [min(l, n_layers - 2) for l in patch_layers]
+
+    # Auto-enable multi-layer obs when using more than 4 patch layers
+    if n_patch_layers > 4:
+        multi_layer_obs = True
+
+    # Auto-adjust d_obs to be divisible by n_patch_layers when multi-layer
+    if multi_layer_obs and d_obs % len(patch_layers) != 0:
+        d_obs = (d_obs // len(patch_layers) + 1) * len(patch_layers)
+        print(f"  Adjusted d_obs to {d_obs} (divisible by {len(patch_layers)} layers)")
+
+    d_gru = d_obs  # GRU hidden matches obs dim
+
+    print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
+    print(f"d_obs={d_obs}, d_gru={d_gru}, d_task={d_task}, n_basis={n_basis}, "
           f"deliberation_steps={n_deliberation_steps}, "
-          f"task_noise={task_noise}, "
-          f"multi_layer_obs={multi_layer_obs}")
+          f"task_noise={task_noise}, multi_layer_obs={multi_layer_obs}")
 
     mach = MACHPhase5(
         d_model=d_model,
         n_layers=n_layers,
         patch_layers=patch_layers,
         hidden_dim=config.PATCH_HIDDEN_DIM,
-        d_obs=config.PHASE5_D_OBS,
-        d_gru=config.PHASE5_D_GRU,
+        d_obs=d_obs,
+        d_gru=d_gru,
         d_task=d_task,
-        n_basis=config.N_BASIS,
+        n_basis=n_basis,
         n_deliberation_steps=n_deliberation_steps,
         task_noise=task_noise,
         multi_layer_obs=multi_layer_obs,
@@ -127,6 +152,18 @@ def main():
         "--multi-layer-obs", action="store_true",
         help="Observe all 4 patch layers instead of just the middle one"
     )
+    parser.add_argument(
+        "--n-patch-layers", type=int, default=None,
+        help="Number of evenly-spaced patch layers (4=default, 12=searchable)"
+    )
+    parser.add_argument(
+        "--n-basis", type=int, default=None,
+        help="Number of basis vectors per patch (8=default, 16=searchable)"
+    )
+    parser.add_argument(
+        "--d-obs", type=int, default=None,
+        help="Observation projection dimension (64=default, 96=searchable)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -141,7 +178,10 @@ def main():
         curriculum = DEFAULT_CURRICULUM
 
     d_task_actual = args.d_task or config.PHASE5_D_TASK
-    run_name = f"phase5-{args.task}-d{d_task_actual}"
+    n_basis_actual = args.n_basis or config.N_BASIS
+    n_patch_layers_actual = args.n_patch_layers or config.PHASE5_N_PATCH_LAYERS
+    d_obs_actual = args.d_obs or config.PHASE5_D_OBS
+    run_name = f"phase5-{args.task}-d{d_task_actual}-L{n_patch_layers_actual}-B{n_basis_actual}"
 
     if wandb is not None:
         wandb.init(
@@ -149,10 +189,11 @@ def main():
             name=run_name,
             config={
                 "base_model": config.BASE_MODEL,
-                "d_obs": config.PHASE5_D_OBS,
-                "d_gru": config.PHASE5_D_GRU,
+                "d_obs": d_obs_actual,
+                "d_gru": d_obs_actual,
                 "d_task": d_task_actual,
-                "n_basis": config.N_BASIS,
+                "n_basis": n_basis_actual,
+                "n_patch_layers": n_patch_layers_actual,
                 "sparsity_beta": args.sparsity_beta or config.PHASE5_SPARSITY_BETA,
                 "decorr_beta": args.decorr_beta or config.PHASE5_DECORR_BETA,
                 "lr": args.lr or config.PHASE5_LR,
@@ -178,10 +219,12 @@ def main():
     mach, patch_layers = create_mach_phase5(
         d_model, n_layers, n_delib, d_task=args.d_task, task_noise=task_noise,
         multi_layer_obs=multi_layer_obs,
+        n_patch_layers=args.n_patch_layers, n_basis=args.n_basis,
+        d_obs=args.d_obs,
     )
     patched_model = MACHPatchedModel(base_model, mach)
 
-    save_path = f"checkpoints/phase5_{args.task}_d{d_task_actual}.pt"
+    save_path = f"checkpoints/phase5_{args.task}_d{d_task_actual}_L{n_patch_layers_actual}_B{n_basis_actual}.pt"
     os.makedirs("checkpoints", exist_ok=True)
 
     meta_train_phase5(
