@@ -72,12 +72,13 @@ def generate_episode_problems(n_problems, mode):
 
 def run_episode_phase5(base_model, mach, patched_model, tokenizer,
                        problems, device, n_self_eval_steps=0,
-                       td_modulation=0.0, gamma=0.0):
+                       td_modulation=0.0, gamma=0.0,
+                       satisfaction_threshold=0.5):
     """
     Phase 5 episode. No reward signals to fire(). Sparsity loss on task state.
     Optional TD-weighted CE loss: critic modulates gradient magnitude.
-    Optional self-evaluation: after demos, observe own patched output
-    on demo problems to detect and correct errors.
+    Optional self-evaluation: satisfaction-gated when critic is active,
+    fixed-step when critic is inactive.
     """
     mach.reset_episode()
 
@@ -89,6 +90,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     td_errors = []
     demo_problems = []
     use_critic = td_modulation > 0
+    self_eval_steps_used = 0
 
     # Track value from previous test problem for TD targets
     last_value = None
@@ -122,6 +124,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
             problem_losses.append(0.0)
 
             # Self-evaluation after last demo
+            # Satisfaction-gated when critic is active, fixed-step otherwise
             if n_self_eval_steps > 0 and i == len(problems) - 1 or \
                     (i + 1 < len(problems) and
                      not problems[i + 1].get("is_demo", False)):
@@ -140,6 +143,13 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
                         mach.get_task_state().abs().mean()
                     )
                     mach.apply_writes(writes)
+                    self_eval_steps_used += 1
+
+                    # Satisfaction gate: stop early if critic is confident
+                    if use_critic:
+                        satisfaction = mach.get_value()
+                        if satisfaction.item() > satisfaction_threshold:
+                            break
 
             continue
 
@@ -195,7 +205,7 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     avg_td_error = sum(td_errors) / len(td_errors) if td_errors else 0.0
 
     return qwen_loss, sparsity_loss, rewards, problem_losses, \
-        critic_loss, avg_td_error
+        critic_loss, avg_td_error, self_eval_steps_used
 
 
 def compute_decorrelation_loss(task_state_buffer, current_task_state):
@@ -229,7 +239,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       checkpoint_path=None, save_path=None,
                       sparsity_beta=None, decorr_beta=None,
                       energy_beta=None, n_self_eval_steps=None,
-                      td_modulation=None, critic_beta=None):
+                      td_modulation=None, critic_beta=None,
+                      satisfaction_threshold=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -249,6 +260,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         td_modulation = config.PHASE5_TD_MODULATION
     if critic_beta is None:
         critic_beta = config.PHASE5_CRITIC_BETA
+    if satisfaction_threshold is None:
+        satisfaction_threshold = config.PHASE5_SATISFACTION_THRESHOLD
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -293,12 +306,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
 
         try:
             ce_loss, sparsity_loss, rewards, problem_losses, \
-                ep_critic_loss, avg_td_error = run_episode_phase5(
+                ep_critic_loss, avg_td_error, ep_self_eval_steps = \
+                run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                     n_self_eval_steps=n_self_eval_steps,
                     td_modulation=td_modulation,
                     gamma=gamma,
+                    satisfaction_threshold=satisfaction_threshold,
                 )
 
             if use_energy:
@@ -347,12 +362,14 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             optimizer.zero_grad()
             problems = problems[:max(5, len(problems) // 2)]
             ce_loss, sparsity_loss, rewards, problem_losses, \
-                ep_critic_loss, avg_td_error = run_episode_phase5(
+                ep_critic_loss, avg_td_error, ep_self_eval_steps = \
+                run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                     n_self_eval_steps=n_self_eval_steps,
                     td_modulation=td_modulation,
                     gamma=gamma,
+                    satisfaction_threshold=satisfaction_threshold,
                 )
             total_loss = ce_loss + sparsity_beta * sparsity_loss
             if use_critic:
@@ -416,7 +433,9 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
 
             critic_str = ""
             if use_critic:
-                critic_str = f" | td={avg_td_error:.3f}"
+                eval_str = f" eval={ep_self_eval_steps}" \
+                    if n_self_eval_steps > 0 else ""
+                critic_str = f" | td={avg_td_error:.3f}{eval_str}"
 
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
@@ -443,6 +462,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 if use_critic:
                     log_dict["avg_td_error"] = avg_td_error
                     log_dict["critic_loss"] = ep_critic_loss.item()
+                    if n_self_eval_steps > 0:
+                        log_dict["self_eval_steps"] = ep_self_eval_steps
                 wandb.log(log_dict)
 
         # Diagnostics + validation + checkpoint

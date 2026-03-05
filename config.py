@@ -81,6 +81,7 @@ PHASE5_N_SELF_EVAL_STEPS = 0    # self-evaluation: observe own output on demos (
 PHASE5_TD_MODULATION = 0.0      # TD-weighted CE loss (0 = off, 0.5 = moderate)
 PHASE5_CRITIC_BETA = 0.1        # critic loss weight
 PHASE5_GAMMA = 0.0              # discount factor (0 = no discounting, each problem independent)
+PHASE5_SATISFACTION_THRESHOLD = 0.5  # critic value above which self-eval stops early
 PHASE5_MULTI_LAYER_OBS = False  # observe all 4 patch layers (vs just middle)
 PHASE5_N_PATCH_LAYERS = 4      # how many evenly-spaced layers (4=default, 12=searchable)
 

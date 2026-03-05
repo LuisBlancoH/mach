@@ -172,6 +172,10 @@ def main():
         "--critic-beta", type=float, default=None,
         help="Critic loss weight (default: 0.1)"
     )
+    parser.add_argument(
+        "--satisfaction-threshold", type=float, default=None,
+        help="Critic value above which self-eval stops early (default: 0.5)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -249,6 +253,7 @@ def main():
         n_self_eval_steps=args.self_eval_steps,
         td_modulation=args.td_modulation,
         critic_beta=args.critic_beta,
+        satisfaction_threshold=args.satisfaction_threshold,
     )
 
     torch.save(mach.state_dict(), save_path)
