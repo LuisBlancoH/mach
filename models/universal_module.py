@@ -2201,36 +2201,32 @@ class MACHHebbian(nn.Module):
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
         """
-        Compute critic value, TD error, and apply Hebbian updates.
-        Called after each problem's forward pass.
+        Compute Hebbian updates modulated by reward.
+        Uses raw reward as modulator (not TD error) to avoid critic collapse.
+        Critic still trained for future use but doesn't gate updates.
         """
         act_summary = self.get_activation_summary()
-        # Normalize activation summary to prevent critic explosion
         act_summary = act_summary / (act_summary.norm() + 1e-8)
         value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
 
-        if self._last_value is not None:
-            td_error = reward - self._last_value.detach()
-        else:
-            td_error = torch.tensor(reward, device=device, dtype=torch.float32)
-        self._last_value = value
+        # Use raw reward as modulator (can't collapse to zero)
+        modulator = torch.tensor(reward, device=device, dtype=torch.float32)
 
         step_frac = step_idx / max(n_steps, 1)
-        td_scalar = td_error.item() if isinstance(td_error, torch.Tensor) else td_error
         eta_input = torch.tensor(
-            [td_scalar, reward, step_frac], device=device,
+            [reward, reward, step_frac], device=device,
         )
-        etas = self.eta_head(eta_input).clamp(max=1.0)  # cap learning rate
+        etas = self.eta_head(eta_input).clamp(max=1.0)
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
                 delta_down, delta_up = self.compute_hebbian_update(
-                    patch_idx, td_error, etas[patch_idx]
+                    patch_idx, modulator, etas[patch_idx]
                 )
                 self.patches[patch_idx].accumulate_write("down", delta_down)
                 self.patches[patch_idx].accumulate_write("up", delta_up)
 
-        return value, td_error
+        return value, modulator
 
 
 class HebbianPatchedModel(nn.Module):
