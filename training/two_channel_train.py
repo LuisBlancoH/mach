@@ -1202,6 +1202,15 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                         tokenizer, device, op, episode_idx,
                     )
 
+                # Run ablation every 400 episodes
+                if episode_idx % 400 == 0 and episode_idx > 0:
+                    mach.eval()
+                    ablate_hebbian(
+                        base_model, mach, patched_model,
+                        tokenizer, device,
+                    )
+                    mach.train()
+
             if save_path:
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
@@ -1253,6 +1262,121 @@ def _run_op_validation_hebbian(base_model, mach, patched_model,
 
     if wandb is not None:
         wandb.log({f"eval/op_{op_type}": acc})
+
+
+def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
+                   n_episodes=10, n_problems=20):
+    """
+    Ablation: compare Hebbian updates ON vs OFF.
+    - WITH Hebbian: normal eval (reset, forward, hebbian_step each problem)
+    - WITHOUT Hebbian: reset once, forward all problems, NO hebbian_step
+    - INIT ONLY: reset once (gets random init), forward all, NO updates
+    This tells us if the Hebbian updates contribute beyond random init + static basis.
+    """
+    ops = ["add", "sub", "mul", "div"]
+    results = {"with_hebbian": {}, "no_update": {}, "no_init": {}}
+
+    for op in ops:
+        # --- WITH Hebbian updates ---
+        correct_hebb = 0
+        total_hebb = 0
+        for ep in range(n_episodes):
+            problems = generate_few_shot_episode(
+                n_problems, n_demos=0, op_type=op
+            )
+            mach.reset_episode()
+            for step, problem in enumerate(problems):
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(device)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids)
+                    logits = output.logits if hasattr(output, 'logits') else output[0]
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == problem["answer"])
+                    reward = 1.0 if correct else -1.0
+                with torch.no_grad():
+                    mach.hebbian_step(reward, step, n_problems, device)
+                if step >= n_problems // 2:
+                    correct_hebb += int(correct)
+                    total_hebb += 1
+        results["with_hebbian"][op] = correct_hebb / max(total_hebb, 1)
+
+        # --- NO Hebbian updates (but WITH random init) ---
+        correct_no = 0
+        total_no = 0
+        for ep in range(n_episodes):
+            problems = generate_few_shot_episode(
+                n_problems, n_demos=0, op_type=op
+            )
+            mach.reset_episode()  # gets random init
+            for step, problem in enumerate(problems):
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(device)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids)
+                    logits = output.logits if hasattr(output, 'logits') else output[0]
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == problem["answer"])
+                # NO hebbian_step
+                if step >= n_problems // 2:
+                    correct_no += int(correct)
+                    total_no += 1
+        results["no_update"][op] = correct_no / max(total_no, 1)
+
+        # --- NO init, NO updates (zero patches) ---
+        correct_zero = 0
+        total_zero = 0
+        old_init_std = mach.init_std
+        mach.init_std = 0  # disable random init
+        for ep in range(n_episodes):
+            problems = generate_few_shot_episode(
+                n_problems, n_demos=0, op_type=op
+            )
+            mach.reset_episode()  # zero patches
+            for step, problem in enumerate(problems):
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(device)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids)
+                    logits = output.logits if hasattr(output, 'logits') else output[0]
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == problem["answer"])
+                if step >= n_problems // 2:
+                    correct_zero += int(correct)
+                    total_zero += 1
+        mach.init_std = old_init_std
+        results["no_init"][op] = correct_zero / max(total_zero, 1)
+
+    print("\n  === HEBBIAN ABLATION ===")
+    print(f"  {'op':4s} | {'with_hebb':>10s} | {'no_update':>10s} | {'no_init':>10s}")
+    print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+    for op in ops:
+        print(f"  {op:4s} | {results['with_hebbian'][op]:>9.0%} | {results['no_update'][op]:>9.0%} | {results['no_init'][op]:>9.0%}")
+
+    avg_hebb = sum(results['with_hebbian'].values()) / len(ops)
+    avg_no = sum(results['no_update'].values()) / len(ops)
+    avg_zero = sum(results['no_init'].values()) / len(ops)
+    print(f"  {'avg':4s} | {avg_hebb:>9.0%} | {avg_no:>9.0%} | {avg_zero:>9.0%}")
+    print()
+
+    if wandb is not None:
+        for op in ops:
+            wandb.log({
+                f"ablation/{op}_with_hebbian": results["with_hebbian"][op],
+                f"ablation/{op}_no_update": results["no_update"][op],
+                f"ablation/{op}_no_init": results["no_init"][op],
+            })
+
+    return results
 
 
 def _log_hebbian_diagnostics(mach, meta_params, episode_idx):

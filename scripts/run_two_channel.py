@@ -24,6 +24,7 @@ from models.universal_module import (
 )
 from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
+    ablate_hebbian,
     CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
     FEW_SHOT_BASIC_CURRICULUM,
 )
@@ -129,6 +130,8 @@ def main():
                         help="Minimal oracle: Linear(2) → patches, no GRU/transformer")
     parser.add_argument("--hebbian", action="store_true",
                         help="Three-factor Hebbian learning with critic")
+    parser.add_argument("--ablate", action="store_true",
+                        help="Run Hebbian ablation (requires --hebbian --checkpoint)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -202,13 +205,22 @@ def main():
                 },
             )
 
-        meta_train_hebbian(
-            base_model, mach, patched_model, tokenizer, config.DEVICE,
-            n_episodes=args.episodes, lr=args.lr,
-            checkpoint_path=args.checkpoint,
-            save_path=save_path,
-            curriculum=curriculum,
-        )
+        if args.ablate:
+            if args.checkpoint:
+                mach.load_state_dict(torch.load(args.checkpoint, map_location=config.DEVICE))
+                print(f"Loaded checkpoint: {args.checkpoint}")
+            mach.eval()
+            ablate_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+            )
+        else:
+            meta_train_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+                n_episodes=args.episodes, lr=args.lr,
+                checkpoint_path=args.checkpoint,
+                save_path=save_path,
+                curriculum=curriculum,
+            )
 
     elif args.demoread or args.oracle or args.oracle_minimal:
         # MACHDemoRead / oracle / oracle-minimal
