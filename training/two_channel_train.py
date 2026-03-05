@@ -624,27 +624,32 @@ def _log_diagnostics(mach, meta_params, episode_idx):
         wandb.log({f"diag/{k}": v for k, v in diag.items()})
 
 
-# ---- Iterative Error-Correction Training ----
+# ---- DemoRead Training ----
 
 
-def run_episode_iterative(base_model, mach, patched_model, tokenizer,
-                          problems, device):
+def _encode_demos(base_model, mach, tokenizer, demos, device):
+    """Tokenize and encode demos through DemoEncoder → write patches."""
+    demo_text = "\n".join(p["prompt"] for p in demos)
+    demo_ids = tokenizer(demo_text, return_tensors="pt").input_ids.to(device)
+    mach.process_demos(base_model, demo_ids, device)
+
+
+def run_episode_demoread(base_model, mach, patched_model, tokenizer,
+                         problems, device):
     """
-    Iterative episode: K inner steps on demos, then evaluate on tests.
+    DemoRead episode: encode demos → write patches → evaluate tests.
+    Gradient flows: test_loss → patches → basis → action_head → task_state → DemoEncoder.
     """
     mach.reset_episode()
 
     demos = [p for p in problems if p.get("is_demo", False)]
     tests = [p for p in problems if not p.get("is_demo", False)]
 
-    # Inner loop: iterate on demos (no test leakage)
-    step_accuracies = []
+    # Encode demos → write patches (NOT detached)
     if demos:
-        step_accuracies = mach.process_demos(
-            patched_model, tokenizer, demos, device
-        )
+        _encode_demos(base_model, mach, tokenizer, demos, device)
 
-    # Evaluate on test problems (gradient flows through patches)
+    # Evaluate on test problems (gradient flows through patches → encoder)
     rewards = []
     problem_losses = []
     qwen_loss = torch.tensor(0.0, device=device, requires_grad=True)
@@ -675,14 +680,14 @@ def run_episode_iterative(base_model, mach, patched_model, tokenizer,
         problem_losses.append(output.loss.item())
         qwen_loss = qwen_loss + output.loss
 
-    return qwen_loss, rewards, problem_losses, step_accuracies
+    return qwen_loss, rewards, problem_losses
 
 
-def meta_train_iterative(base_model, mach, patched_model, tokenizer,
-                         device, n_episodes=None, lr=None,
-                         curriculum=None, checkpoint_path=None,
-                         save_path=None):
-    """Iterative error-correction meta-training loop."""
+def meta_train_demoread(base_model, mach, patched_model, tokenizer,
+                        device, n_episodes=None, lr=None,
+                        curriculum=None, checkpoint_path=None,
+                        save_path=None):
+    """DemoRead meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
     if lr is None:
@@ -699,13 +704,9 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
     optimizer = torch.optim.Adam(meta_params, lr=lr)
 
     n_meta = sum(p.numel() for p in meta_params)
-    print(f"MACHIterative trainable parameters: {n_meta:,}")
-    print(f"Inner steps: {mach.n_inner_steps}")
+    print(f"MACHDemoRead trainable parameters: {n_meta:,}")
 
     def get_n_problems(episode_idx):
-        # Iterative needs both demos AND tests from the start.
-        # generate_linear_episode defaults n_demos=max(5, n//3),
-        # so n_problems must be > 5 to have any test problems.
         if episode_idx < 100:
             return 10
         elif episode_idx < 300:
@@ -723,11 +724,10 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
         optimizer.zero_grad()
 
         try:
-            ce_loss, rewards, problem_losses, step_accs = \
-                run_episode_iterative(
-                    base_model, mach, patched_model, tokenizer,
-                    problems, device,
-                )
+            ce_loss, rewards, problem_losses = run_episode_demoread(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
 
             ce_loss.backward()
             loss_scalar = ce_loss.item()
@@ -737,11 +737,10 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
             torch.cuda.empty_cache()
             optimizer.zero_grad()
             problems = problems[:max(5, len(problems) // 2)]
-            ce_loss, rewards, problem_losses, step_accs = \
-                run_episode_iterative(
-                    base_model, mach, patched_model, tokenizer,
-                    problems, device,
-                )
+            ce_loss, rewards, problem_losses = run_episode_demoread(
+                base_model, mach, patched_model, tokenizer,
+                problems, device,
+            )
             ce_loss.backward()
             loss_scalar = ce_loss.item()
 
@@ -757,53 +756,53 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
                 len(test_rewards), 1
             )
 
-            # Inner step accuracies
-            step_str = " → ".join(f"{a:.0%}" for a in step_accs) if step_accs else "n/a"
+            task_state = mach.get_task_state()
+            ts_info = ""
+            if task_state is not None:
+                ts = task_state.detach()
+                ts_info = f"ts_max={ts.abs().max():.2f}"
 
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
                 f"ce={loss_scalar:.4f} | "
                 f"test={test_acc:.0%} avg_r={avg_reward:.2f} | "
-                f"inner: {step_str}"
+                f"{ts_info}"
             )
 
             if wandb is not None:
-                log_dict = {
+                wandb.log({
                     "episode": episode_idx,
                     "ce_loss": loss_scalar,
                     "avg_reward": avg_reward,
                     "test_accuracy": test_acc,
-                }
-                for si, sa in enumerate(step_accs):
-                    log_dict[f"inner_step/{si}"] = sa
-                wandb.log(log_dict)
+                })
 
         # Diagnostics + validation + checkpoint
         if (episode_idx % 200 == 0 and episode_idx > 0) or \
                 episode_idx == n_episodes - 1:
-            _log_iterative_diagnostics(mach, meta_params, episode_idx)
+            _log_demoread_diagnostics(mach, meta_params, episode_idx)
 
             if mode in ("continuous_linear",):
                 print(f"  --- TRAIN combos ---")
                 for coeffs in LINEAR_TRAIN:
-                    _run_linear_validation_iterative(
+                    _run_linear_validation_demoread(
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                     )
                 print(f"  --- HELD-OUT combos ---")
                 for coeffs in LINEAR_HELDOUT:
-                    _run_linear_validation_iterative(
+                    _run_linear_validation_demoread(
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                     )
                 print(f"  --- NOVEL combos ---")
                 for coeffs in [(3, 1), (1, 4), (4, 3), (5, 0), (0, 5)]:
-                    _run_linear_validation_iterative(
+                    _run_linear_validation_demoread(
                         base_model, mach, patched_model, tokenizer,
                         device, coeffs, episode_idx,
                     )
             elif mode == "token_map":
-                _run_token_map_validation_iterative(
+                _run_token_map_validation_demoread(
                     base_model, mach, patched_model, tokenizer,
                     device, episode_idx,
                 )
@@ -815,8 +814,8 @@ def meta_train_iterative(base_model, mach, patched_model, tokenizer,
                 print(f"  Checkpoint saved to {save_path}")
 
 
-def _log_iterative_diagnostics(mach, meta_params, episode_idx):
-    """Log gradient norms and weight stats for iterative architecture."""
+def _log_demoread_diagnostics(mach, meta_params, episode_idx):
+    """Log gradient norms and weight stats."""
     diag = {}
 
     component_grad_norms = {}
@@ -832,12 +831,12 @@ def _log_iterative_diagnostics(mach, meta_params, episode_idx):
         avg_norm = sum(norms) / len(norms)
         diag[f"grad_norm/{component}"] = avg_norm
 
-    # Task state (GRU memory)
+    # Task state
     task_state = mach.get_task_state()
     if task_state is not None:
         ts = task_state.detach()
-        diag["gru_memory/l1_norm"] = ts.abs().mean().item()
-        diag["gru_memory/max_abs"] = ts.abs().max().item()
+        diag["task_state/l1_norm"] = ts.abs().mean().item()
+        diag["task_state/max_abs"] = ts.abs().max().item()
 
     # Patch delta stats
     for i, patch in enumerate(mach.patches):
@@ -860,10 +859,10 @@ def _log_iterative_diagnostics(mach, meta_params, episode_idx):
         wandb.log({f"diag/{k}": v for k, v in diag.items()})
 
 
-def _run_linear_validation_iterative(base_model, mach, patched_model,
-                                     tokenizer, device, coeffs, episode_idx,
-                                     n_episodes=10, n_problems=20, n_demos=5):
-    """Evaluate linear combination performance with iterative architecture."""
+def _run_linear_validation_demoread(base_model, mach, patched_model,
+                                    tokenizer, device, coeffs, episode_idx,
+                                    n_episodes=10, n_problems=20, n_demos=5):
+    """Evaluate linear combination performance with DemoRead architecture."""
     test_correct = 0
     test_total = 0
 
@@ -878,7 +877,7 @@ def _run_linear_validation_iterative(base_model, mach, patched_model,
 
         if demos:
             with torch.no_grad():
-                mach.process_demos(patched_model, tokenizer, demos, device)
+                _encode_demos(base_model, mach, tokenizer, demos, device)
 
         for problem in tests:
             full_text = problem["prompt"] + problem["answer"]
@@ -910,11 +909,11 @@ def _run_linear_validation_iterative(base_model, mach, patched_model,
         wandb.log({f"eval/linear_{c1}_{c2}": test_acc})
 
 
-def _run_token_map_validation_iterative(base_model, mach, patched_model,
-                                        tokenizer, device, episode_idx,
-                                        n_episodes=10, n_problems=20,
-                                        n_demos=5):
-    """Evaluate token mapping performance with iterative architecture."""
+def _run_token_map_validation_demoread(base_model, mach, patched_model,
+                                       tokenizer, device, episode_idx,
+                                       n_episodes=10, n_problems=20,
+                                       n_demos=5):
+    """Evaluate token mapping performance with DemoRead architecture."""
     test_correct = 0
     test_total = 0
 
@@ -929,7 +928,7 @@ def _run_token_map_validation_iterative(base_model, mach, patched_model,
 
         if demos:
             with torch.no_grad():
-                mach.process_demos(patched_model, tokenizer, demos, device)
+                _encode_demos(base_model, mach, tokenizer, demos, device)
 
         for problem in tests:
             full_text = problem["prompt"] + problem["answer"]

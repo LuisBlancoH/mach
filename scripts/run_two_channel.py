@@ -19,10 +19,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import config
 from models.universal_module import (
     MACHTwoChannel, TwoChannelPatchedModel,
-    MACHIterative, IterativePatchedModel,
+    MACHDemoRead, IterativePatchedModel,
 )
 from training.two_channel_train import (
-    meta_train_two_channel, meta_train_iterative,
+    meta_train_two_channel, meta_train_demoread,
     CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
 )
 
@@ -119,10 +119,8 @@ def main():
     parser.add_argument("--n-prims", type=int, default=None)
     parser.add_argument("--write-cost-scale", type=float, default=None)
     parser.add_argument("--energy-beta", type=float, default=None)
-    parser.add_argument("--iterative", action="store_true",
-                        help="Use MACHIterative (error-correction inner loop)")
-    parser.add_argument("--n-inner-steps", type=int, default=3,
-                        help="Number of inner loop steps for iterative mode")
+    parser.add_argument("--demoread", action="store_true",
+                        help="Use MACHDemoRead (DemoEncoder + skip connection)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -137,11 +135,11 @@ def main():
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
-    if args.iterative:
-        # MACHIterative: error-correction inner loop
-        arch_name = "iterative"
+    if args.demoread:
+        # MACHDemoRead: DemoEncoder + skip connection
+        arch_name = "demoread"
         run_name = (
-            f"iter-{args.task}-K{args.n_inner_steps}"
+            f"demoread-{args.task}"
             f"-L{n_patch_layers_actual}-B{n_basis_actual}"
         )
 
@@ -157,27 +155,25 @@ def main():
             patch_layers = [min(l, n_layers - 2) for l in patch_layers]
 
         print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
-        print(f"n_basis={n_basis_actual}, n_inner_steps={args.n_inner_steps}")
+        print(f"n_basis={n_basis_actual}, d_meta={config.D_META}")
 
-        mach = MACHIterative(
+        mach = MACHDemoRead(
             d_model=d_model,
             n_layers=n_layers,
             patch_layers=patch_layers,
             hidden_dim=config.PATCH_HIDDEN_DIM,
             d_meta=config.D_META,
             n_basis=n_basis_actual,
-            n_inner_steps=args.n_inner_steps,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
-        print(f"MACHIterative total parameters: {n_params:,}")
+        print(f"MACHDemoRead total parameters: {n_params:,}")
 
         patched_model = IterativePatchedModel(base_model, mach)
 
         save_path = (
-            f"checkpoints/iter_{args.task}"
-            f"_K{args.n_inner_steps}_L{n_patch_layers_actual}"
-            f"_B{n_basis_actual}.pt"
+            f"checkpoints/demoread_{args.task}"
+            f"_L{n_patch_layers_actual}_B{n_basis_actual}.pt"
         )
         os.makedirs("checkpoints", exist_ok=True)
 
@@ -189,17 +185,16 @@ def main():
                     "base_model": config.BASE_MODEL,
                     "n_basis": n_basis_actual,
                     "n_patch_layers": n_patch_layers_actual,
-                    "n_inner_steps": args.n_inner_steps,
                     "d_meta": config.D_META,
                     "lr": args.lr or config.PHASE5_LR,
                     "episodes": args.episodes or config.PHASE5_EPISODES,
-                    "architecture": "iterative",
+                    "architecture": "demoread",
                     "task": args.task,
                     "device": str(config.DEVICE),
                 },
             )
 
-        meta_train_iterative(
+        meta_train_demoread(
             base_model, mach, patched_model, tokenizer, config.DEVICE,
             n_episodes=args.episodes, lr=args.lr,
             checkpoint_path=args.checkpoint,

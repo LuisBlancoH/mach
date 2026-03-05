@@ -1827,41 +1827,48 @@ class TwoChannelPatchedModel(nn.Module):
         self._hooks.clear()
 
 
-class MACHIterative(nn.Module):
+class MACHDemoRead(nn.Module):
     """
-    Iterative error-correction meta-learner.
+    Demo-reading meta-learner with skip connection for gradient stability.
 
-    Instead of one-shot demo processing, iterates K times:
-      1. Run patched Qwen on demos → compute error features
-      2. GRU integrates error features
-      3. Transformer decides corrective writes
-      4. Patches accumulate writes (additive, not reset)
-    Then evaluate on test problems; gradient flows through all K steps.
+    Architecture:
+      Demo tokens → frozen embed_tokens → DemoEncoder (2-layer transformer)
+        → task_state (d_meta)
+        → action_head (SKIP connection, short gradient path)
+        → also: GRU → MetaLearnerTransformer → action_head (long path)
+        → basis vectors → patch writes
 
-    Error features are detached (computed with no_grad on demo eval).
-    Gradient flows: test_loss → patches → writes → transformer → GRU → error_proj.
+    Key difference from MACHTwoChannel: no modulation channel, no primitives,
+    no critic. Just encode demos → write patches. The skip connection
+    (task_state directly to action_head as gru_memory) ensures DemoEncoder
+    always gets gradient, preventing the gradient death seen in previous
+    DemoEncoder attempts.
+
+    Gradient path (short): test_loss → patches → basis → action_head → task_state → DemoEncoder
+    Gradient path (long):  test_loss → patches → basis → action_head → transformer → GRU → task_state → DemoEncoder
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_meta=128, n_basis=8, n_inner_steps=3):
+                 d_meta=128, n_basis=8):
         super().__init__()
         self.d_model = d_model
         self.d_meta = d_meta
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
-        self.n_inner_steps = n_inner_steps
 
-        # Error observation
-        self.error_proj = ErrorProjection(n_error_features=4, d_meta=d_meta)
-        self.error_norm = nn.LayerNorm(d_meta)
+        # Demo encoder: token embeddings → task_state
+        self.demo_encoder = DemoEncoder(
+            d_embed=d_model, d_enc=d_meta, d_task=d_meta,
+            n_layers=2, n_heads=4,
+        )
 
-        # Working memory
+        # Working memory (integrates task_state, provides context)
         self.gru = SimpleGRU(d_meta)
 
-        # Meta-learner: [gru_mem, error_obs, tf_mem, think_0, think_1]
+        # Meta-learner: [gru_mem, task_state, tf_mem, think_0, think_1]
         self.transformer = MetaLearnerTransformer(d_meta, n_tokens=5)
 
-        # Patch writing — obs_conditioned for skip connection from error_obs
+        # Patch writing — obs_conditioned for skip connection from task_state
         self.action_head = ActionHead(
             d_meta, len(patch_layers), n_basis, obs_conditioned=True
         )
@@ -1871,8 +1878,9 @@ class MACHIterative(nn.Module):
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
-        # Transformer memory state
+        # State
         self._tf_mem = None
+        self._task_state = None
 
     def reset_episode(self):
         """Call at the start of each episode."""
@@ -1880,118 +1888,43 @@ class MACHIterative(nn.Module):
         for patch in self.patches:
             patch.reset_deltas()
         self._tf_mem = self.transformer.tf_mem_init.clone()
+        self._task_state = None
 
-    def _compute_error_features(self, patched_model, tokenizer,
-                                demos, device, step_idx):
+    def process_demos(self, base_model, demo_input_ids, device):
         """
-        Run patched Qwen on demos, compare to known answers.
-        Returns detached error feature tensor (4,).
+        Encode demo tokens → task_state → write patches.
+
+        demo_input_ids: (1, seq_len) or (seq_len,) token IDs
+        No Qwen forward pass — just frozen embedding lookup + learned encoder.
         """
-        from data.arithmetic import extract_number
-
-        total_loss = 0.0
-        n_correct = 0
-        total_conf = 0.0
-        n = 0
-
-        for demo in demos:
-            # Parse demo prompt to separate input from answer
-            # Demo format: "a ? b = answer" (full prompt includes answer)
-            parts = demo["prompt"].rsplit("= ", 1)
-            if len(parts) != 2:
-                continue
-
-            prompt_part = parts[0] + "= "
-            answer_part = parts[1].strip()
-            full_text = prompt_part + answer_part
-
-            encoding = tokenizer(full_text, return_tensors="pt").to(device)
-            prompt_ids = tokenizer(prompt_part, return_tensors="pt").input_ids
-            prompt_len = prompt_ids.shape[1]
-            labels = encoding.input_ids.clone()
-            labels[0, :prompt_len] = -100
-
-            with torch.no_grad():
-                output = patched_model(
-                    input_ids=encoding.input_ids, labels=labels
-                )
-                total_loss += output.loss.item()
-
-                logits = output.logits
-                # Confidence: avg max prob over answer tokens
-                if logits.shape[1] > prompt_len:
-                    probs = torch.softmax(
-                        logits[0, prompt_len - 1:-1], dim=-1
-                    )
-                    total_conf += probs.max(dim=-1).values.mean().item()
-
-                # Accuracy check
-                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
-                pred_text = tokenizer.decode(
-                    pred_tokens, skip_special_tokens=True
-                ).strip()
-
-                if demo.get("difficulty") == "token_map":
-                    correct = (pred_text == answer_part)
-                else:
-                    predicted = extract_number(pred_text)
-                    correct = (predicted == demo.get("answer", ""))
-
-                n_correct += int(correct)
-
-            n += 1
-
-        n = max(n, 1)
-        features = torch.tensor([
-            total_loss / n,                        # avg CE loss
-            n_correct / n,                         # fraction correct
-            total_conf / n,                        # avg confidence
-            step_idx / max(self.n_inner_steps, 1), # progress
-        ], device=device)
-
-        return features
-
-    def inner_loop(self, patched_model, tokenizer, demos, device):
-        """
-        K-step inner loop: observe error → decide → write → repeat.
-        Patches accumulate across steps.
-        """
-        step_accuracies = []
-
-        for step in range(self.n_inner_steps):
-            # 1. Compute error on demos with current patches (detached)
-            error_features = self._compute_error_features(
-                patched_model, tokenizer, demos, device, step
+        # Frozen token embedding lookup
+        with torch.no_grad():
+            token_embeds = base_model.model.embed_tokens(
+                demo_input_ids.squeeze(0)
             )
-            step_accuracies.append(error_features[1].item())
 
-            # 2. Project error → LayerNorm → GRU
-            error_obs = self.error_norm(self.error_proj(error_features))
-            gru_mem = self.gru.integrate(error_obs)
+        # Learned encoder: token_embeds → task_state (NOT detached)
+        self._task_state = self.demo_encoder(token_embeds.float())
 
-            # 3. Meta-learner decides adjustment
-            tokens = torch.stack([
-                gru_mem,
-                error_obs,
-                self._tf_mem,
-                self.transformer.think_0_init,
-                self.transformer.think_1_init,
-            ])  # (5, d_meta)
-            hidden = self.transformer(tokens)  # (5, d_meta)
+        # GRU integration (provides memory context)
+        gru_mem = self.gru.integrate(self._task_state)
 
-            # 4. Write patch adjustments (accumulate on top of previous)
-            #    Skip connection: error_obs → action_head (short gradient path)
-            writes = self.action_head(hidden[3], gru_memory=error_obs)
-            self.apply_writes(writes)
+        # Meta-learner transformer
+        tokens = torch.stack([
+            gru_mem,
+            self._task_state,
+            self._tf_mem,
+            self.transformer.think_0_init,
+            self.transformer.think_1_init,
+        ])  # (5, d_meta)
+        hidden = self.transformer(tokens)  # (5, d_meta)
 
-            # 5. Update transformer memory
-            self._tf_mem = self.memory_head(hidden[4], self._tf_mem)
+        # Write patches — skip connection: task_state → action_head directly
+        writes = self.action_head(hidden[3], gru_memory=self._task_state)
+        self.apply_writes(writes)
 
-        return step_accuracies
-
-    def process_demos(self, patched_model, tokenizer, demos, device):
-        """Public API: run inner loop on demos."""
-        return self.inner_loop(patched_model, tokenizer, demos, device)
+        # Update transformer memory
+        self._tf_mem = self.memory_head(hidden[4], self._tf_mem)
 
     def apply_writes(self, writes):
         """Apply differentiable patch weight modifications via basis vectors."""
@@ -2002,8 +1935,7 @@ class MACHIterative(nn.Module):
             self.patches[patch_idx].accumulate_write(weight_name, delta_W)
 
     def get_task_state(self):
-        """Return GRU memory as the task state (for diagnostics)."""
-        return self.gru.get_memory()
+        return self._task_state
 
 
 class IterativePatchedModel(nn.Module):
