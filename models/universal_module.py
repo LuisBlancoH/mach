@@ -2095,7 +2095,7 @@ class MACHHebbian(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 n_basis=8):
+                 n_basis=8, exploration_noise=0.3, init_std=0.01):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2103,6 +2103,8 @@ class MACHHebbian(nn.Module):
         self.patch_layers = patch_layers
         self.n_basis = n_basis
         self.gate_scale = GATE_SCALE
+        self.exploration_noise = exploration_noise
+        self.init_std = init_std
 
         # Patches
         self.patches = nn.ModuleList([
@@ -2143,9 +2145,15 @@ class MACHHebbian(nn.Module):
         self._last_value = None
 
     def reset_episode(self):
-        """Call at the start of each episode."""
+        """Call at the start of each episode.
+        Initializes patches with small random weights for exploration diversity.
+        """
         for patch in self.patches:
             patch.reset_deltas()
+            # Non-zero init: give the model something to work with
+            if self.init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
         self._last_value = None
@@ -2186,6 +2194,11 @@ class MACHHebbian(nn.Module):
         # Correlation signal: element-wise product (Hebbian), normalized
         coefficients = pre_h * post_h  # (n_basis,)
         coefficients = coefficients / (coefficients.norm() + 1e-8)
+
+        # Stochastic exploration: add noise so reward can select good directions
+        if self.training and self.exploration_noise > 0:
+            noise = torch.randn_like(coefficients) * self.exploration_noise
+            coefficients = coefficients + noise
 
         # Gate = learning rate × TD error (dopamine modulation), clamped
         gate = eta * td_error * self.gate_scale
