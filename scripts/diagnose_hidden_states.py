@@ -233,11 +233,13 @@ def main():
             input_ids = tokenizer(full_text, return_tensors="pt").input_ids.to(device)
             with torch.no_grad():
                 out = model.generate(
-                    input_ids, max_new_tokens=30, do_sample=False,
+                    input_ids, max_new_tokens=150, do_sample=False,
                     temperature=1.0
                 )
             generated = tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
-            print(f"    {prompt_name}: {generated.strip()[:80]}")
+            # Show first 200 chars, replace newlines for compact display
+            text = generated.strip()[:200].replace('\n', ' | ')
+            print(f"    {prompt_name}: {text}")
 
     print("\nDone.")
 
