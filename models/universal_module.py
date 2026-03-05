@@ -1593,6 +1593,48 @@ class ModulationHead(nn.Module):
         return self.head(task_state)
 
 
+class DemoEncoder(nn.Module):
+    """
+    Learned encoder on frozen token embeddings.
+    Replaces Qwen forward pass for demo observation.
+
+    embed_tokens(demo_ids) → proj → positional encoding → transformer → pool → task_state
+
+    Why: Qwen's hidden states don't encode arithmetic relationships (verified
+    up to 14B-Instruct). This encoder learns end-to-end what to extract from
+    raw token embeddings via the meta-learning loss.
+    """
+
+    def __init__(self, d_embed, d_enc=128, d_task=32, n_layers=2, n_heads=4):
+        super().__init__()
+        self.input_proj = nn.Linear(d_embed, d_enc)
+        self.pos_enc = nn.Embedding(512, d_enc)
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_enc, nhead=n_heads, dim_feedforward=d_enc * 2,
+                batch_first=True, norm_first=True
+            ) for _ in range(n_layers)
+        ])
+        self.out_proj = nn.Sequential(
+            nn.Linear(d_enc, d_task),
+            nn.LayerNorm(d_task),
+        )
+
+    def forward(self, token_embeddings):
+        """
+        token_embeddings: (seq_len, d_embed) — from frozen embed_tokens
+        Returns: task_state (d_task,)
+        """
+        x = self.input_proj(token_embeddings)
+        pos = self.pos_enc(torch.arange(x.shape[0], device=x.device))
+        x = x + pos
+        x = x.unsqueeze(0)
+        for layer in self.layers:
+            x = layer(x)
+        x = x.squeeze(0).mean(dim=0)
+        return self.out_proj(x)
+
+
 class MACHTwoChannel(nn.Module):
     """
     Two-channel universal adapter: modulation (Channel 1) + writing (Channel 2).
@@ -1603,7 +1645,7 @@ class MACHTwoChannel(nn.Module):
     Channel 2 (slow, novel capabilities): Basis vector outer products →
     DifferentiablePatch weight deltas. Penalized by higher metabolic cost.
 
-    Both channels driven by same task_state from DemoProjection.
+    Both channels driven by task_state from DemoEncoder (learned on token embeddings).
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
@@ -1619,16 +1661,8 @@ class MACHTwoChannel(nn.Module):
         self.patch_layers = patch_layers
         self.write_cost_scale = write_cost_scale
 
-        # Sensory cortex: per-layer projection (same as Phase5Concat)
-        d_per_layer = d_obs // len(patch_layers)
-        self.d_per_layer = d_per_layer
-        self.layer_projs = nn.ModuleList([
-            nn.Linear(d_model, d_per_layer, bias=False)
-            for _ in patch_layers
-        ])
-
-        # DemoProjection: obs → task_state
-        self.demo_projection = DemoProjection(d_obs, d_task)
+        # Demo encoder: token embeddings → task_state
+        self.demo_encoder = DemoEncoder(d_model, d_enc=128, d_task=d_task)
 
         # Channel 1: Modulation (fast, generalizable)
         self.primitives = ActivationPrimitives(
@@ -1650,13 +1684,6 @@ class MACHTwoChannel(nn.Module):
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
-        # Cross-attention demo readout: refine task_state with full demo sequence
-        self.wm_proj = nn.Linear(d_model, d_obs, bias=False)
-        self.demo_cross_attn = WorkingMemoryCrossAttention(d_task, d_obs)
-        self.post_cross_attn_norm = nn.LayerNorm(d_task)
-        # Middle patch layer used for full-sequence capture
-        self._mid_layer_idx = patch_layers[len(patch_layers) // 2]
-
         # Basal ganglia: value estimator
         self.critic = TaskStateCritic(d_task)
 
@@ -1674,45 +1701,17 @@ class MACHTwoChannel(nn.Module):
 
     def process_demos(self, base_model, demo_input_ids):
         """
-        One-shot demo processing: single Qwen forward pass → project → both channels.
-        Cross-attention over full demo sequence refines the rough task_state.
+        Demo processing via learned encoder on token embeddings.
+        No Qwen forward pass — just embedding lookup + encoder.
         """
-        # Extract hidden states from all patch layers (frozen)
-        hidden_states = {}
-        full_seq = {}  # full sequence from middle layer for cross-attention
-        hooks = []
-
+        # Get token embeddings (frozen lookup, no transformer)
         with torch.no_grad():
-            for layer_idx in self.patch_layers:
-                def make_hook(idx):
-                    def hook(module, input, output):
-                        t = output[0] if isinstance(output, tuple) else output
-                        hidden_states[idx] = t[:, -1, :]  # last token
-                        if idx == self._mid_layer_idx:
-                            full_seq[idx] = t[0]  # (seq_len, d_model)
-                    return hook
-                h = base_model.model.layers[layer_idx].register_forward_hook(
-                    make_hook(layer_idx)
-                )
-                hooks.append(h)
-            base_model(input_ids=demo_input_ids)
-            for h in hooks:
-                h.remove()
+            token_embeds = base_model.model.embed_tokens(
+                demo_input_ids.squeeze(0)
+            )
 
-        # Project each layer and concatenate
-        layer_obs = []
-        for i, layer_idx in enumerate(self.patch_layers):
-            proj = self.layer_projs[i](hidden_states[layer_idx].float())
-            layer_obs.append(proj)
-        obs = torch.cat(layer_obs, dim=-1).squeeze(0)  # (d_obs,)
-
-        # Rough task state from DemoProjection
-        self._task_state = self.demo_projection(obs)
-
-        # Refine task state with cross-attention over full demo sequence
-        demo_memory = self.wm_proj(full_seq[self._mid_layer_idx].float())  # (seq_len, d_obs)
-        self._task_state = self.demo_cross_attn(self._task_state, demo_memory)
-        self._task_state = self.post_cross_attn_norm(self._task_state)
+        # Learned encoder extracts task state
+        self._task_state = self.demo_encoder(token_embeds.float())
 
         # Channel 1: Modulation
         prim_weights = self.modulation_head(self._task_state)
