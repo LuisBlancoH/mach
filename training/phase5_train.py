@@ -877,6 +877,10 @@ def _log_diagnostics(mach, meta_params, episode_idx):
             diag[f"patch_delta/patch{i}_up"] = (
                 patch.delta_up.norm().item()
             )
+        if patch.delta_gain is not None:
+            diag[f"patch_delta/patch{i}_gain"] = (
+                patch.delta_gain.norm().item()
+            )
 
     # Observation gates (self-discovering architecture)
     obs_gates = mach.get_obs_gates()

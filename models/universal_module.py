@@ -33,6 +33,7 @@ class DifferentiablePatch(nn.Module):
         # Accumulated deltas — set externally, part of computational graph
         self.delta_down = None
         self.delta_up = None
+        self.delta_gain = None  # multiplicative gain vector (d_model,)
 
     def reset_deltas(self):
         """Call at start of each episode."""
@@ -42,13 +43,22 @@ class DifferentiablePatch(nn.Module):
         self.delta_up = torch.zeros(
             self.d_model, self.hidden_dim, device=self.up_base.device
         )
+        self.delta_gain = torch.zeros(
+            self.d_model, device=self.down_base.device
+        )
 
     def accumulate_write(self, weight_name, delta_W):
         """Add a differentiable delta. delta_W must be in the computational graph."""
         if weight_name == "down":
             self.delta_down = self.delta_down + delta_W
+        elif weight_name == "gain":
+            self.delta_gain = self.delta_gain + delta_W
         else:
             self.delta_up = self.delta_up + delta_W
+
+    def get_gain(self):
+        """Return accumulated gain vector for multiplicative modulation."""
+        return self.delta_gain if self.delta_gain is not None else 0
 
     def forward(self, hidden_states):
         """Forward with base + accumulated deltas. Operates in float32."""
@@ -712,15 +722,19 @@ class DeliberationModule(nn.Module):
 class ActionCompiler(nn.Module):
     """
     Compiles task state into patch write coefficients.
-    Same output format as ActionHead but takes d_task input.
+    Outputs additive (down/up) and multiplicative (gain) writes.
     """
 
-    def __init__(self, d_task, n_patches=4, n_basis=8):
+    def __init__(self, d_task, n_patches=4, n_basis=8, n_gain_basis=4):
         super().__init__()
         self.n_patches = n_patches
         self.n_basis = n_basis
-        n_writes = n_patches * 2
-        n_outputs = n_writes * (n_basis + 1)
+        self.n_gain_basis = n_gain_basis
+        # Additive: 2 writes per patch (down + up), each n_basis + 1
+        # Gain: 1 write per patch, n_gain_basis + 1
+        n_additive = n_patches * 2 * (n_basis + 1)
+        n_gain = n_patches * (n_gain_basis + 1)
+        n_outputs = n_additive + n_gain
         # Scale hidden dim with output size, min 64
         hidden = max(64, n_outputs // 3)
 
@@ -737,11 +751,17 @@ class ActionCompiler(nn.Module):
         writes = []
         idx = 0
         for patch_i in range(self.n_patches):
+            # Additive writes: down + up
             for weight_name in ["down", "up"]:
                 coefficients = raw[idx:idx + self.n_basis]
                 gate = torch.sigmoid(raw[idx + self.n_basis]) * GATE_SCALE
                 idx += self.n_basis + 1
                 writes.append((patch_i, weight_name, coefficients, gate))
+            # Gain write: multiplicative modulation
+            coefficients = raw[idx:idx + self.n_gain_basis]
+            gate = torch.sigmoid(raw[idx + self.n_gain_basis]) * GATE_SCALE
+            idx += self.n_gain_basis + 1
+            writes.append((patch_i, "gain", coefficients, gate))
 
         return writes
 
@@ -875,10 +895,15 @@ class MACHPhase5(nn.Module):
             self.deliberation = DeliberationModule(d_task)
 
         # Premotor: compile task state into patch writes
-        self.action_compiler = ActionCompiler(d_task, len(patch_layers), n_basis)
+        n_gain_basis = 4  # fewer gain basis vectors than additive (cheaper)
+        self.action_compiler = ActionCompiler(
+            d_task, len(patch_layers), n_basis, n_gain_basis
+        )
 
         # Motor execution: basis vectors + patches
-        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+        self.basis = BasisVectors(
+            d_model, hidden_dim, len(patch_layers), n_basis, n_gain_basis
+        )
         self.patches = nn.ModuleList([
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
@@ -1108,6 +1133,8 @@ class MACHPhase5(nn.Module):
                 cost = cost + patch.delta_down.abs().mean()
             if patch.delta_up is not None:
                 cost = cost + patch.delta_up.abs().mean()
+            if patch.delta_gain is not None:
+                cost = cost + patch.delta_gain.abs().mean()
 
         # Memory maintenance cost: GRU hidden state
         if self.gru.memory is not None:
@@ -1145,14 +1172,20 @@ class MACHPatchedModel(nn.Module):
 
             def make_hook(patch_idx):
                 def hook(module, input, output):
+                    patch = self.mach.patches[patch_idx]
                     if isinstance(output, tuple):
                         h = output[0]
-                        # Patches operate in float32 for stable gradients
-                        patch_out = self.mach.patches[patch_idx](h.float())
-                        return (h + patch_out.to(h.dtype),) + output[1:]
+                        # Additive: down → GELU → up
+                        patch_out = patch(h.float())
+                        # Multiplicative: gain modulation
+                        gain = patch.get_gain()
+                        h_mod = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+                        return (h_mod,) + output[1:]
                     else:
-                        patch_out = self.mach.patches[patch_idx](output.float())
-                        return output + patch_out.to(output.dtype)
+                        patch_out = patch(output.float())
+                        gain = patch.get_gain()
+                        return output * (1 + gain).to(output.dtype) \
+                            + patch_out.to(output.dtype)
                 return hook
 
             handle = layer.register_forward_hook(make_hook(i))
