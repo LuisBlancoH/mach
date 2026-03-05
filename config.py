@@ -90,6 +90,11 @@ PHASE5_MULTI_LAYER_OBS = False  # observe all 4 patch layers (vs just middle)
 PHASE5_N_PATCH_LAYERS = 4      # how many evenly-spaced layers (4=default, 12=searchable)
 PHASE5_N_THINKING_STEPS = 0   # working memory cross-attention steps (0 = off)
 
+# Two-Channel
+TWO_CHANNEL_N_PRIMS = 8
+TWO_CHANNEL_WRITE_COST_SCALE = 10.0
+TWO_CHANNEL_ENERGY_BETA = 0.01
+
 # Future phases
 MAX_INTERVAL = 16
 MAX_PLANNING_ITERS = 3

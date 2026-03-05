@@ -1503,3 +1503,306 @@ class MACHPhase5Concat(nn.Module):
                 cost = cost + patch.delta_gain.abs().mean()
 
         return cost
+
+
+class ActivationPrimitives(nn.Module):
+    """
+    Learned activation-space primitives for fast modulation (Channel 1).
+
+    Each primitive is a pair of (bias, gain) vectors per patch layer.
+    The ModulationHead produces scalar weights; modulation is:
+        h += sum_k(w_k * bias[layer, k])        (additive steering)
+        h *= (1 + sum_k(w_k * gain[layer, k]))  (multiplicative gating)
+
+    Interpolation is natural: w=3.0 means "3x this primitive".
+    """
+
+    def __init__(self, n_layers, n_prims, d_model):
+        super().__init__()
+        self.n_layers = n_layers
+        self.n_prims = n_prims
+        self.d_model = d_model
+
+        # (n_layers, n_prims, d_model) — learned end-to-end across episodes
+        self.bias = nn.Parameter(torch.randn(n_layers, n_prims, d_model) * 0.01)
+        self.gain = nn.Parameter(torch.randn(n_layers, n_prims, d_model) * 0.01)
+
+        # Scalar weights set per-episode by ModulationHead
+        # Shape: (n_layers * n_prims,) — reshaped to (n_layers, n_prims) for use
+        self._weights = None
+
+    def set_weights(self, weights):
+        """Set primitive weights from ModulationHead output. weights: (n_layers * n_prims,)"""
+        self._weights = weights.view(self.n_layers, self.n_prims)
+
+    def reset(self):
+        """Clear weights at episode start."""
+        self._weights = None
+
+    def modulate(self, layer_idx, hidden_states):
+        """
+        Apply weighted primitives at a specific layer.
+
+        layer_idx: index into self's layer dimension (0..n_layers-1)
+        hidden_states: (batch, seq, d_model) in bfloat16
+        Returns: modulated hidden_states
+        """
+        if self._weights is None:
+            return hidden_states
+
+        w = self._weights[layer_idx]  # (n_prims,)
+        b = self.bias[layer_idx]      # (n_prims, d_model)
+        g = self.gain[layer_idx]      # (n_prims, d_model)
+
+        # Weighted sum of primitives
+        bias_mod = torch.einsum('k,kd->d', w, b)   # (d_model,)
+        gain_mod = torch.einsum('k,kd->d', w, g)    # (d_model,)
+
+        # Apply: gain first (multiplicative context), then bias (additive steering)
+        h = hidden_states * (1 + gain_mod).to(hidden_states.dtype)
+        h = h + bias_mod.to(hidden_states.dtype)
+        return h
+
+
+class ModulationHead(nn.Module):
+    """
+    Maps task_state to scalar weights for activation primitives.
+
+    Output is unconstrained (no sigmoid) — allows negative and large weights
+    for continuous interpolation. Initialized to zero output so modulation
+    starts inactive.
+    """
+
+    def __init__(self, d_task, n_layers, n_prims, hidden_dim=32):
+        super().__init__()
+        n_outputs = n_layers * n_prims
+        self.head = nn.Sequential(
+            nn.Linear(d_task, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, n_outputs),
+        )
+        # Initialize to zero output: modulation starts inactive
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, task_state):
+        """Returns (n_layers * n_prims,) unconstrained scalar weights."""
+        return self.head(task_state)
+
+
+class MACHTwoChannel(nn.Module):
+    """
+    Two-channel universal adapter: modulation (Channel 1) + writing (Channel 2).
+
+    Channel 1 (fast, generalizable): Learned activation primitives scaled by
+    continuous scalar weights. Natural interpolation.
+
+    Channel 2 (slow, novel capabilities): Basis vector outer products →
+    DifferentiablePatch weight deltas. Penalized by higher metabolic cost.
+
+    Both channels driven by same task_state from DemoProjection.
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 d_obs=96, d_task=32, n_basis=8, n_prims=8,
+                 write_cost_scale=10.0):
+        super().__init__()
+        self.d_model = d_model
+        self.d_obs = d_obs
+        self.d_task = d_task
+        self.n_basis = n_basis
+        self.n_prims = n_prims
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.write_cost_scale = write_cost_scale
+
+        # Sensory cortex: per-layer projection (same as Phase5Concat)
+        d_per_layer = d_obs // len(patch_layers)
+        self.d_per_layer = d_per_layer
+        self.layer_projs = nn.ModuleList([
+            nn.Linear(d_model, d_per_layer, bias=False)
+            for _ in patch_layers
+        ])
+
+        # DemoProjection: obs → task_state
+        self.demo_projection = DemoProjection(d_obs, d_task)
+
+        # Channel 1: Modulation (fast, generalizable)
+        self.primitives = ActivationPrimitives(
+            len(patch_layers), n_prims, d_model
+        )
+        self.modulation_head = ModulationHead(
+            d_task, len(patch_layers), n_prims
+        )
+
+        # Channel 2: Writing (slow, novel capabilities)
+        n_gain_basis = 4
+        self.action_compiler = ActionCompiler(
+            d_task, len(patch_layers), n_basis, n_gain_basis
+        )
+        self.basis = BasisVectors(
+            d_model, hidden_dim, len(patch_layers), n_basis, n_gain_basis
+        )
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Basal ganglia: value estimator
+        self.critic = TaskStateCritic(d_task)
+
+        # Persistent state
+        self._task_state = None
+
+    def reset_episode(self):
+        """Call at the start of each episode."""
+        for patch in self.patches:
+            patch.reset_deltas()
+        self.primitives.reset()
+        self._task_state = torch.zeros(
+            self.d_task, device=next(self.parameters()).device
+        )
+
+    def process_demos(self, base_model, demo_input_ids):
+        """
+        One-shot demo processing: single Qwen forward pass → project → both channels.
+        """
+        # Extract hidden states from all patch layers (frozen)
+        hidden_states = {}
+        hooks = []
+
+        with torch.no_grad():
+            for layer_idx in self.patch_layers:
+                def make_hook(idx):
+                    def hook(module, input, output):
+                        t = output[0] if isinstance(output, tuple) else output
+                        hidden_states[idx] = t[:, -1, :]  # last token
+                    return hook
+                h = base_model.model.layers[layer_idx].register_forward_hook(
+                    make_hook(layer_idx)
+                )
+                hooks.append(h)
+            base_model(input_ids=demo_input_ids)
+            for h in hooks:
+                h.remove()
+
+        # Project each layer and concatenate
+        layer_obs = []
+        for i, layer_idx in enumerate(self.patch_layers):
+            proj = self.layer_projs[i](hidden_states[layer_idx].float())
+            layer_obs.append(proj)
+        obs = torch.cat(layer_obs, dim=-1).squeeze(0)  # (d_obs,)
+
+        # Project to task state
+        self._task_state = self.demo_projection(obs)
+
+        # Channel 1: Modulation
+        prim_weights = self.modulation_head(self._task_state)
+        self.primitives.set_weights(prim_weights)
+
+        # Channel 2: Writing
+        writes = self.action_compiler(self._task_state)
+        self.apply_writes(writes)
+
+    def get_task_state(self):
+        return self._task_state
+
+    def get_value(self):
+        if self._task_state is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.critic(self._task_state)
+
+    def apply_writes(self, writes):
+        for (patch_idx, weight_name, coefficients, gate) in writes:
+            delta_W = self.basis.compute_delta_W(
+                patch_idx, weight_name, coefficients, gate
+            )
+            self.patches[patch_idx].accumulate_write(weight_name, delta_W)
+
+    def metabolic_cost(self):
+        """
+        Free energy with asymmetric channel costs.
+        Channel 2 (writing) costs write_cost_scale more than Channel 1 (modulation).
+        """
+        cost = torch.tensor(0.0, device=self._task_state.device)
+
+        # PFC firing cost
+        cost = cost + self._task_state.abs().mean()
+
+        # Channel 1 cost: primitive weight magnitude (cheap)
+        if self.primitives._weights is not None:
+            cost = cost + self.primitives._weights.abs().mean()
+
+        # Channel 2 cost: patch delta magnitude (expensive)
+        for patch in self.patches:
+            if patch.delta_down is not None:
+                cost = cost + self.write_cost_scale * patch.delta_down.abs().mean()
+            if patch.delta_up is not None:
+                cost = cost + self.write_cost_scale * patch.delta_up.abs().mean()
+            if patch.delta_gain is not None:
+                cost = cost + self.write_cost_scale * patch.delta_gain.abs().mean()
+
+        return cost
+
+
+class TwoChannelPatchedModel(nn.Module):
+    """
+    Wraps Qwen with both modulation (Channel 1) and patches (Channel 2).
+
+    Hook order at each patch layer:
+    1. Channel 1: h *= (1 + gain_mod), h += bias_mod  (modulation context)
+    2. Channel 2: h += patch(h), h *= (1 + patch_gain)  (patch computation)
+    """
+
+    def __init__(self, base_model, mach):
+        super().__init__()
+        self.base_model = base_model
+        self.mach = mach
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for i, layer_idx in enumerate(self.mach.patch_layers):
+            layer = self.base_model.model.layers[layer_idx]
+
+            def make_hook(patch_idx):
+                def hook(module, input, output):
+                    mach = self.mach
+                    patch = mach.patches[patch_idx]
+
+                    if isinstance(output, tuple):
+                        h = output[0]
+                        # Channel 1: Modulation
+                        h = mach.primitives.modulate(patch_idx, h)
+                        # Channel 2: Patch
+                        patch_out = patch(h.float())
+                        gain = patch.get_gain()
+                        h = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+                        return (h,) + output[1:]
+                    else:
+                        # Channel 1: Modulation
+                        h = mach.primitives.modulate(patch_idx, output)
+                        # Channel 2: Patch
+                        patch_out = patch(h.float())
+                        gain = patch.get_gain()
+                        return h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+                return hook
+
+            handle = layer.register_forward_hook(make_hook(i))
+            self._hooks.append(handle)
+
+    @property
+    def device(self):
+        return self.base_model.device
+
+    def forward(self, input_ids, labels=None, attention_mask=None):
+        return self.base_model(
+            input_ids=input_ids, labels=labels, attention_mask=attention_mask
+        )
+
+    def generate(self, *args, **kwargs):
+        return self.base_model.generate(*args, **kwargs)
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
