@@ -71,9 +71,11 @@ def generate_episode_problems(n_problems, mode):
 
 
 def run_episode_phase5(base_model, mach, patched_model, tokenizer,
-                       problems, device, n_self_eval_steps=0):
+                       problems, device, n_self_eval_steps=0,
+                       td_modulation=0.0, gamma=0.0):
     """
-    Phase 5 episode. No reward signals. Sparsity loss on task state.
+    Phase 5 episode. No reward signals to fire(). Sparsity loss on task state.
+    Optional TD-weighted CE loss: critic modulates gradient magnitude.
     Optional self-evaluation: after demos, observe own patched output
     on demo problems to detect and correct errors.
     """
@@ -83,7 +85,13 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
     problem_losses = []
     sparsity_losses = []
     qwen_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    critic_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    td_errors = []
     demo_problems = []
+    use_critic = td_modulation > 0
+
+    # Track value from previous test problem for TD targets
+    last_value = None
 
     for i, problem in enumerate(problems):
         input_ids = tokenizer(
@@ -99,6 +107,10 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
         # Sparsity loss on task state
         task_state = mach.get_task_state()
         sparsity_losses.append(task_state.abs().mean())
+
+        # Get critic value estimate (before applying writes)
+        if use_critic:
+            value = mach.get_value()
 
         # Apply writes
         mach.apply_writes(writes)
@@ -156,12 +168,34 @@ def run_episode_phase5(base_model, mach, patched_model, tokenizer,
 
         rewards.append(reward)
         problem_losses.append(output.loss.item())
-        qwen_loss = qwen_loss + output.loss
+
+        if use_critic:
+            # TD-weighted CE: surprising outcomes get amplified gradient
+            with torch.no_grad():
+                td_error = abs(reward - value.item())
+                td_errors.append(td_error)
+            ce_weight = 1.0 + td_modulation * td_error
+            qwen_loss = qwen_loss + output.loss * ce_weight
+
+            # Critic TD loss: train value estimator
+            with torch.no_grad():
+                # Next value for TD target (0 if last problem)
+                next_value = 0.0  # Will be updated if there's a next test
+                td_target = reward + gamma * next_value
+            critic_loss = critic_loss + (value - td_target) ** 2
+
+            # Update TD target for previous problem's next_value
+            last_value = value
+        else:
+            qwen_loss = qwen_loss + output.loss
 
     # Aggregate sparsity loss
     sparsity_loss = sum(sparsity_losses) / len(sparsity_losses)
 
-    return qwen_loss, sparsity_loss, rewards, problem_losses
+    avg_td_error = sum(td_errors) / len(td_errors) if td_errors else 0.0
+
+    return qwen_loss, sparsity_loss, rewards, problem_losses, \
+        critic_loss, avg_td_error
 
 
 def compute_decorrelation_loss(task_state_buffer, current_task_state):
@@ -194,7 +228,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                       device, n_episodes=None, lr=None, curriculum=None,
                       checkpoint_path=None, save_path=None,
                       sparsity_beta=None, decorr_beta=None,
-                      energy_beta=None, n_self_eval_steps=None):
+                      energy_beta=None, n_self_eval_steps=None,
+                      td_modulation=None, critic_beta=None):
     """Phase 5 meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -210,6 +245,10 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         energy_beta = config.PHASE5_ENERGY_BETA
     if n_self_eval_steps is None:
         n_self_eval_steps = config.PHASE5_N_SELF_EVAL_STEPS
+    if td_modulation is None:
+        td_modulation = config.PHASE5_TD_MODULATION
+    if critic_beta is None:
+        critic_beta = config.PHASE5_CRITIC_BETA
 
     if checkpoint_path is not None:
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -220,12 +259,16 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
     optimizer = torch.optim.Adam(meta_params, lr=lr)
 
     use_energy = energy_beta > 0
+    use_critic = td_modulation > 0
+    gamma = config.PHASE5_GAMMA
     n_meta = sum(p.numel() for p in meta_params)
     print(f"Phase 5 trainable parameters: {n_meta:,}")
     if use_energy:
         print(f"Using unified energy loss (beta={energy_beta})")
     else:
         print(f"Sparsity beta: {sparsity_beta}, decorr beta: {decorr_beta}")
+    if use_critic:
+        print(f"Critic: td_modulation={td_modulation}, critic_beta={critic_beta}, gamma={gamma}")
 
     # Rolling buffer of task states for decorrelation loss
     task_state_buffer = []
@@ -249,17 +292,21 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
         optimizer.zero_grad()
 
         try:
-            ce_loss, sparsity_loss, rewards, problem_losses = \
-                run_episode_phase5(
+            ce_loss, sparsity_loss, rewards, problem_losses, \
+                ep_critic_loss, avg_td_error = run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                     n_self_eval_steps=n_self_eval_steps,
+                    td_modulation=td_modulation,
+                    gamma=gamma,
                 )
 
             if use_energy:
                 # Unified free energy: prediction error + metabolic cost
                 metabolic = mach.metabolic_cost()
                 total_loss = ce_loss + energy_beta * metabolic
+                if use_critic:
+                    total_loss = total_loss + critic_beta * ep_critic_loss
                 energy_scalar = metabolic.item()
                 sparsity_scalar = sparsity_loss.item()
                 decorr_scalar = 0.0
@@ -285,6 +332,8 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                 total_loss = ce_loss + sparsity_beta * sparsity_loss \
                     + decorr_beta * decorr_loss \
                     + sparsity_beta * obs_gate_loss
+                if use_critic:
+                    total_loss = total_loss + critic_beta * ep_critic_loss
                 energy_scalar = 0.0
                 decorr_scalar = decorr_loss.item()
                 sparsity_scalar = sparsity_loss.item()
@@ -297,13 +346,17 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             torch.cuda.empty_cache()
             optimizer.zero_grad()
             problems = problems[:max(5, len(problems) // 2)]
-            ce_loss, sparsity_loss, rewards, problem_losses = \
-                run_episode_phase5(
+            ce_loss, sparsity_loss, rewards, problem_losses, \
+                ep_critic_loss, avg_td_error = run_episode_phase5(
                     base_model, mach, patched_model, tokenizer,
                     problems, device,
                     n_self_eval_steps=n_self_eval_steps,
+                    td_modulation=td_modulation,
+                    gamma=gamma,
                 )
             total_loss = ce_loss + sparsity_beta * sparsity_loss
+            if use_critic:
+                total_loss = total_loss + critic_beta * ep_critic_loss
             total_loss.backward()
             loss_scalar = ce_loss.item()
             sparsity_scalar = sparsity_loss.item()
@@ -361,9 +414,13 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             else:
                 cost_str = f"sp={sparsity_scalar:.3f} dc={decorr_scalar:.3f}"
 
+            critic_str = ""
+            if use_critic:
+                critic_str = f" | td={avg_td_error:.3f}"
+
             print(
                 f"Episode {episode_idx:4d} | {mode} n={len(problems):2d} | "
-                f"ce={loss_scalar:.4f} {cost_str} | "
+                f"ce={loss_scalar:.4f} {cost_str}{critic_str} | "
                 f"avg_r={avg_reward:.2f} "
                 f"early={early_acc:.0%} late={late_acc:.0%} | "
                 f"active={n_active:.0f}/{mach.d_task} max={ts_max:.2f}"
@@ -371,7 +428,7 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
             )
 
             if wandb is not None:
-                wandb.log({
+                log_dict = {
                     "episode": episode_idx,
                     "ce_loss": loss_scalar,
                     "sparsity_loss": sparsity_scalar,
@@ -382,7 +439,11 @@ def meta_train_phase5(base_model, mach, patched_model, tokenizer,
                     "late_accuracy": late_acc,
                     "task_state_active": n_active,
                     "task_state_max": ts_max,
-                })
+                }
+                if use_critic:
+                    log_dict["avg_td_error"] = avg_td_error
+                    log_dict["critic_loss"] = ep_critic_loss.item()
+                wandb.log(log_dict)
 
         # Diagnostics + validation + checkpoint
         if (episode_idx % 200 == 0 and episode_idx > 0) or \

@@ -746,6 +746,30 @@ class ActionCompiler(nn.Module):
         return writes
 
 
+class TaskStateCritic(nn.Module):
+    """
+    Basal ganglia: value estimator over task state.
+
+    Predicts how well the current task representation will perform.
+    Used for TD-weighted CE loss (plasticity modulation) and
+    inference-time satisfaction signal (self-eval loop).
+
+    Never input to fire() — only shapes gradient magnitude.
+    """
+
+    def __init__(self, d_task, hidden_dim=32):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_task, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, task_state):
+        """Returns scalar value estimate."""
+        return self.net(task_state).squeeze(-1)
+
+
 class MACHPhase5(nn.Module):
     """
     Phase 5: Brain-like meta-learner with structured task bottleneck.
@@ -822,6 +846,9 @@ class MACHPhase5(nn.Module):
         self.patches = nn.ModuleList([
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
+
+        # Basal ganglia: value estimator (shapes gradient, not input to fire)
+        self.critic = TaskStateCritic(d_task)
 
         # Persistent state (reset per episode)
         self._task_state = None
@@ -930,6 +957,12 @@ class MACHPhase5(nn.Module):
     def get_task_state(self):
         """Return current task state for sparsity loss."""
         return self._task_state
+
+    def get_value(self):
+        """Critic value estimate of current task state (basal ganglia)."""
+        if self._task_state is None:
+            return torch.tensor(0.0, device=next(self.parameters()).device)
+        return self.critic(self._task_state)
 
     def apply_writes(self, writes):
         """Apply differentiable patch weight modifications via basis vectors."""

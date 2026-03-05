@@ -164,6 +164,14 @@ def main():
         "--d-obs", type=int, default=None,
         help="Observation projection dimension (64=default, 96=searchable)"
     )
+    parser.add_argument(
+        "--td-modulation", type=float, default=None,
+        help="TD-weighted CE loss: critic modulates gradient (0=off, 0.5=moderate)"
+    )
+    parser.add_argument(
+        "--critic-beta", type=float, default=None,
+        help="Critic loss weight (default: 0.1)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -203,6 +211,8 @@ def main():
                 "task_noise": args.task_noise or config.PHASE5_TASK_NOISE,
                 "energy_beta": args.energy_beta or config.PHASE5_ENERGY_BETA,
                 "multi_layer_obs": args.multi_layer_obs,
+                "td_modulation": args.td_modulation or config.PHASE5_TD_MODULATION,
+                "critic_beta": args.critic_beta or config.PHASE5_CRITIC_BETA,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -237,6 +247,8 @@ def main():
         decorr_beta=args.decorr_beta,
         energy_beta=args.energy_beta,
         n_self_eval_steps=args.self_eval_steps,
+        td_modulation=args.td_modulation,
+        critic_beta=args.critic_beta,
     )
 
     torch.save(mach.state_dict(), save_path)
