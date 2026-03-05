@@ -1964,6 +1964,69 @@ class MACHDemoRead(nn.Module):
         return self._task_state
 
 
+class MACHOracleMinimal(nn.Module):
+    """
+    Minimal oracle: Linear(2) → patch write coefficients via basis vectors.
+    No GRU, no transformer, no memory. Tests whether the basis vector
+    write mechanism can express continuous arithmetic at all.
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 n_basis=8):
+        super().__init__()
+        self.d_model = d_model
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.oracle = True  # for compatibility with training loop
+
+        n_writes = self.n_patches * 2  # down + up per patch
+        n_outputs = n_writes * (n_basis + 1)  # coefficients + gate per write
+        self.n_basis = n_basis
+
+        # [c1, c2] → patch write coefficients directly
+        self.head = nn.Sequential(
+            nn.Linear(2, 128),
+            nn.GELU(),
+            nn.Linear(128, n_outputs),
+        )
+
+        self.basis = BasisVectors(d_model, hidden_dim, len(patch_layers), n_basis)
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        self._task_state = None
+
+    def reset_episode(self):
+        for patch in self.patches:
+            patch.reset_deltas()
+        self._task_state = None
+
+    def process_oracle(self, c1, c2, device):
+        from config import GATE_SCALE
+        coeffs = torch.tensor([float(c1), float(c2)], device=device)
+        self._task_state = coeffs  # just store for diagnostics
+        raw = self.head(coeffs)
+
+        # Parse into writes (same format as ActionHead)
+        idx = 0
+        for patch_i in range(self.n_patches):
+            for weight_name in ["down", "up"]:
+                coefficients = raw[idx:idx + self.n_basis]
+                gate = torch.sigmoid(raw[idx + self.n_basis]) * GATE_SCALE
+                idx += self.n_basis + 1
+                delta_W = self.basis.compute_delta_W(
+                    patch_i, weight_name, coefficients, gate
+                )
+                self.patches[patch_i].accumulate_write(weight_name, delta_W)
+
+    def predict_coeffs(self):
+        return None
+
+    def get_task_state(self):
+        return self._task_state
+
+
 class IterativePatchedModel(nn.Module):
     """
     Wraps Qwen with DifferentiablePatch hooks for MACHIterative.

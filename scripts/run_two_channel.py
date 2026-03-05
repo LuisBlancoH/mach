@@ -19,7 +19,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import config
 from models.universal_module import (
     MACHTwoChannel, TwoChannelPatchedModel,
-    MACHDemoRead, IterativePatchedModel,
+    MACHDemoRead, MACHOracleMinimal, IterativePatchedModel,
 )
 from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread,
@@ -123,6 +123,8 @@ def main():
                         help="Use MACHDemoRead (DemoEncoder + skip connection)")
     parser.add_argument("--oracle", action="store_true",
                         help="Oracle mode: feed true [c1,c2] instead of demos")
+    parser.add_argument("--oracle-minimal", action="store_true",
+                        help="Minimal oracle: Linear(2) → patches, no GRU/transformer")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -137,9 +139,14 @@ def main():
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
-    if args.demoread or args.oracle:
-        # MACHDemoRead: DemoEncoder + skip connection (or oracle mode)
-        arch_name = "oracle" if args.oracle else "demoread"
+    if args.demoread or args.oracle or args.oracle_minimal:
+        # MACHDemoRead / oracle / oracle-minimal
+        if args.oracle_minimal:
+            arch_name = "oracle_minimal"
+        elif args.oracle:
+            arch_name = "oracle"
+        else:
+            arch_name = "demoread"
         run_name = (
             f"{arch_name}-{args.task}"
             f"-L{n_patch_layers_actual}-B{n_basis_actual}"
@@ -159,18 +166,27 @@ def main():
         print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
         print(f"n_basis={n_basis_actual}, d_meta={config.D_META}")
 
-        mach = MACHDemoRead(
-            d_model=d_model,
-            n_layers=n_layers,
-            patch_layers=patch_layers,
-            hidden_dim=config.PATCH_HIDDEN_DIM,
-            d_meta=config.D_META,
-            n_basis=n_basis_actual,
-            oracle=args.oracle,
-        ).to(config.DEVICE)
+        if args.oracle_minimal:
+            mach = MACHOracleMinimal(
+                d_model=d_model,
+                n_layers=n_layers,
+                patch_layers=patch_layers,
+                hidden_dim=config.PATCH_HIDDEN_DIM,
+                n_basis=n_basis_actual,
+            ).to(config.DEVICE)
+        else:
+            mach = MACHDemoRead(
+                d_model=d_model,
+                n_layers=n_layers,
+                patch_layers=patch_layers,
+                hidden_dim=config.PATCH_HIDDEN_DIM,
+                d_meta=config.D_META,
+                n_basis=n_basis_actual,
+                oracle=args.oracle,
+            ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
-        print(f"MACHDemoRead total parameters: {n_params:,}")
+        print(f"{arch_name} total parameters: {n_params:,}")
 
         patched_model = IterativePatchedModel(base_model, mach)
 
