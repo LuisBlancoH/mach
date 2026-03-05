@@ -84,6 +84,8 @@ PHASE5_GAMMA = 0.0              # discount factor (0 = no discounting, each prob
 PHASE5_SATISFACTION_THRESHOLD = 0.5  # critic value above which self-eval stops early
 PHASE5_CONSOLIDATION = False         # cross-episode slow memory (off by default)
 PHASE5_EMA_DECAY = 0.95              # slow memory EMA decay rate
+PHASE5_N_PLANNING_STEPS = 0         # 0 = no planning, 3+ = critic-gated deliberation
+PHASE5_PLANNING_TEMPERATURE = 1.0   # softmax temperature for candidate selection
 PHASE5_MULTI_LAYER_OBS = False  # observe all 4 patch layers (vs just middle)
 PHASE5_N_PATCH_LAYERS = 4      # how many evenly-spaced layers (4=default, 12=searchable)
 

@@ -45,7 +45,8 @@ def load_base_model():
 def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
                        d_task=None, task_noise=0.0, multi_layer_obs=False,
                        n_patch_layers=None, n_basis=None, d_obs=None,
-                       consolidation=False, ema_decay=None):
+                       consolidation=False, ema_decay=None,
+                       n_planning_steps=None, planning_temperature=None):
     if d_task is None:
         d_task = config.PHASE5_D_TASK
     if n_patch_layers is None:
@@ -56,6 +57,10 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         d_obs = config.PHASE5_D_OBS
     if ema_decay is None:
         ema_decay = config.PHASE5_EMA_DECAY
+    if n_planning_steps is None:
+        n_planning_steps = config.PHASE5_N_PLANNING_STEPS
+    if planning_temperature is None:
+        planning_temperature = config.PHASE5_PLANNING_TEMPERATURE
 
     # Generate evenly-spaced patch layers
     if n_patch_layers == 4:
@@ -86,7 +91,7 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
     print(f"d_obs={d_obs}, d_gru={d_gru}, d_task={d_task}, n_basis={n_basis}, "
           f"deliberation_steps={n_deliberation_steps}, "
           f"task_noise={task_noise}, multi_layer_obs={multi_layer_obs}, "
-          f"consolidation={consolidation}")
+          f"consolidation={consolidation}, planning_steps={n_planning_steps}")
 
     mach = MACHPhase5(
         d_model=d_model,
@@ -102,6 +107,8 @@ def create_mach_phase5(d_model, n_layers, n_deliberation_steps=0,
         multi_layer_obs=multi_layer_obs,
         consolidation=consolidation,
         ema_decay=ema_decay,
+        n_planning_steps=n_planning_steps,
+        planning_temperature=planning_temperature,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in mach.parameters())
@@ -190,6 +197,14 @@ def main():
         "--ema-decay", type=float, default=None,
         help="Slow memory EMA decay rate (default: 0.95)"
     )
+    parser.add_argument(
+        "--planning-steps", type=int, default=None,
+        help="Critic-gated planning steps (0=blind deliberation, 3+=planning)"
+    )
+    parser.add_argument(
+        "--planning-temperature", type=float, default=None,
+        help="Softmax temperature for planning candidate selection (default: 1.0)"
+    )
     args = parser.parse_args()
 
     if args.task == "continuous_linear":
@@ -233,6 +248,8 @@ def main():
                 "critic_beta": args.critic_beta or config.PHASE5_CRITIC_BETA,
                 "consolidation": args.consolidation,
                 "ema_decay": args.ema_decay or config.PHASE5_EMA_DECAY,
+                "planning_steps": args.planning_steps or config.PHASE5_N_PLANNING_STEPS,
+                "planning_temperature": args.planning_temperature or config.PHASE5_PLANNING_TEMPERATURE,
                 "task": args.task,
                 "device": str(config.DEVICE),
             },
@@ -252,6 +269,8 @@ def main():
         n_patch_layers=args.n_patch_layers, n_basis=args.n_basis,
         d_obs=args.d_obs,
         consolidation=args.consolidation, ema_decay=args.ema_decay,
+        n_planning_steps=args.planning_steps,
+        planning_temperature=args.planning_temperature,
     )
     patched_model = MACHPatchedModel(base_model, mach)
 

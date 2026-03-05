@@ -827,7 +827,8 @@ class MACHPhase5(nn.Module):
                  d_obs=64, d_gru=64, d_task=32, n_basis=8,
                  n_deliberation_steps=0, task_noise=0.0,
                  multi_layer_obs=False, consolidation=False,
-                 ema_decay=0.95):
+                 ema_decay=0.95, n_planning_steps=0,
+                 planning_temperature=1.0):
         super().__init__()
         self.d_model = d_model
         self.d_obs = d_obs
@@ -837,6 +838,8 @@ class MACHPhase5(nn.Module):
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
         self.n_deliberation_steps = n_deliberation_steps
+        self.n_planning_steps = n_planning_steps
+        self.planning_temperature = planning_temperature
         self.task_noise = task_noise  # noise std on task state (forgetting)
         self.multi_layer_obs = multi_layer_obs
 
@@ -987,10 +990,35 @@ class MACHPhase5(nn.Module):
             self._task_state = self._task_state + \
                 self.task_noise * torch.randn_like(self._task_state)
 
-        # PFC deliberation: iterative refinement
+        # PFC deliberation + planning
         if self.n_deliberation_steps > 0:
-            for _ in range(self.n_deliberation_steps):
-                self._task_state = self.deliberation(self._task_state)
+            if self.n_planning_steps > 0:
+                # Critic-gated planning: generate candidates, soft-select best
+                candidates = [self._task_state]
+                for _ in range(self.n_planning_steps):
+                    candidate = self.deliberation(self._task_state)
+                    candidates.append(candidate)
+                    self._task_state = candidate
+
+                # Evaluate each candidate with critic (basal ganglia)
+                values = torch.stack([self.critic(c) for c in candidates])
+
+                if self.training:
+                    # Soft selection: differentiable weighted average
+                    weights = torch.softmax(
+                        values * self.planning_temperature, dim=0
+                    )
+                    self._task_state = sum(
+                        w * c for w, c in zip(weights, candidates)
+                    )
+                else:
+                    # Hard selection: pick the best at inference
+                    best_idx = values.argmax()
+                    self._task_state = candidates[best_idx]
+            else:
+                # Blind deliberation (backward compatible)
+                for _ in range(self.n_deliberation_steps):
+                    self._task_state = self.deliberation(self._task_state)
 
         # Premotor: compile task state into patch writes
         writes = self.action_compiler(self._task_state)
