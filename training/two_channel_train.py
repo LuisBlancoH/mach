@@ -52,6 +52,49 @@ def generate_episode_problems(n_problems, mode):
         return generate_few_shot_episode(n_problems)
 
 
+def _contrastive_loss(mach, base_model, tokenizer, problems, device):
+    """
+    Contrastive auxiliary loss: gives demo_encoder direct gradient.
+
+    Generate demos for a different coefficient pair, encode them,
+    and push the two task_states apart (cosine distance).
+    Same-task states should be similar; different-task states should differ.
+    """
+    # Get current task's coefficients
+    c1 = problems[0].get("c1")
+    c2 = problems[0].get("c2")
+    if c1 is None:
+        return torch.tensor(0.0, device=device)
+
+    # Generate negative: different coefficients
+    for _ in range(10):
+        neg_c1 = random.randint(0, 5)
+        neg_c2 = random.randint(0, 5)
+        if (neg_c1, neg_c2) != (c1, c2):
+            break
+
+    neg_problems = generate_linear_episode(5, coeffs=(neg_c1, neg_c2))
+    neg_demos = [p for p in neg_problems if p.get("is_demo", False)]
+    neg_text = "\n".join(p["prompt"] for p in neg_demos)
+    neg_ids = tokenizer(neg_text, return_tensors="pt").input_ids.to(device)
+
+    # Encode negative demos (encoder only, no channel writes)
+    with torch.no_grad():
+        neg_embeds = base_model.model.embed_tokens(neg_ids.squeeze(0))
+    neg_task_state = mach.demo_encoder(neg_embeds.float())
+
+    # Positive: current task_state (already computed)
+    pos_task_state = mach.get_task_state()
+
+    # Cosine similarity: push apart
+    cos_sim = torch.nn.functional.cosine_similarity(
+        pos_task_state.unsqueeze(0), neg_task_state.unsqueeze(0)
+    )
+    # Loss: want cos_sim to be low (different tasks → different states)
+    # margin=0: just push apart, don't require a specific margin
+    return torch.clamp(cos_sim + 0.5, min=0.0)  # hinge: sim < -0.5
+
+
 def run_episode_two_channel(base_model, mach, patched_model, tokenizer,
                             problems, device):
     """
@@ -62,7 +105,7 @@ def run_episode_two_channel(base_model, mach, patched_model, tokenizer,
     demos = [p for p in problems if p.get("is_demo", False)]
     tests = [p for p in problems if not p.get("is_demo", False)]
 
-    # Phase A: Demo processing (one Qwen forward pass → both channels)
+    # Phase A: Demo processing
     if demos:
         demo_text = "\n".join(p["prompt"] for p in demos)
         demo_ids = tokenizer(demo_text, return_tensors="pt").input_ids.to(device)
@@ -162,6 +205,13 @@ def meta_train_two_channel(base_model, mach, patched_model, tokenizer,
                 total_loss = ce_loss
                 energy_scalar = 0.0
 
+            # Contrastive loss: direct gradient to demo_encoder
+            contrastive = _contrastive_loss(
+                mach, base_model, tokenizer, problems, device
+            )
+            contrastive_beta = 1.0
+            total_loss = total_loss + contrastive_beta * contrastive
+
             total_loss.backward()
             loss_scalar = ce_loss.item()
 
@@ -177,6 +227,10 @@ def meta_train_two_channel(base_model, mach, patched_model, tokenizer,
             total_loss = ce_loss
             if use_energy:
                 total_loss = total_loss + energy_beta * mach.metabolic_cost()
+            contrastive = _contrastive_loss(
+                mach, base_model, tokenizer, problems, device
+            )
+            total_loss = total_loss + contrastive
             total_loss.backward()
             loss_scalar = ce_loss.item()
             energy_scalar = 0.0
