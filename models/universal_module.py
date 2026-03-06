@@ -75,14 +75,17 @@ class DifferentiablePatch(nn.Module):
                     self.delta_up.detach(), alpha=1.0 - decay
                 )
 
-    def accumulate_write(self, weight_name, delta_W):
-        """Add a differentiable delta. delta_W must be in the computational graph."""
+    def accumulate_write(self, weight_name, delta_W, decay=1.0):
+        """Add a differentiable delta with optional decay on existing values.
+        decay=1.0: pure accumulation (original behavior)
+        decay=0.9: exponential moving average (self-stabilizing)
+        """
         if weight_name == "down":
-            self.delta_down = self.delta_down + delta_W
+            self.delta_down = self.delta_down * decay + delta_W
         elif weight_name == "gain":
-            self.delta_gain = self.delta_gain + delta_W
+            self.delta_gain = self.delta_gain * decay + delta_W
         else:
-            self.delta_up = self.delta_up + delta_W
+            self.delta_up = self.delta_up * decay + delta_W
 
     def get_gain(self):
         """Return accumulated gain vector for multiplicative modulation."""
@@ -2122,7 +2125,8 @@ class MACHHebbian(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 n_basis=8, exploration_noise=0.3, init_std=0.001):
+                 n_basis=8, exploration_noise=0.3, init_std=0.001,
+                 delta_decay=1.0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2132,6 +2136,7 @@ class MACHHebbian(nn.Module):
         self.gate_scale = GATE_SCALE
         self.exploration_noise = exploration_noise
         self.init_std = init_std
+        self.delta_decay = delta_decay
 
         # Patches
         self.patches = nn.ModuleList([
@@ -2263,8 +2268,8 @@ class MACHHebbian(nn.Module):
                 delta_down, delta_up = self.compute_hebbian_update(
                     patch_idx, modulator, etas[patch_idx]
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down)
-                self.patches[patch_idx].accumulate_write("up", delta_up)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
         return value, modulator
 
@@ -2474,7 +2479,8 @@ class MACHActivationHebbian(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
-                 frozen_projections=False, consolidation=False, ema_decay=0.95):
+                 frozen_projections=False, consolidation=False, ema_decay=0.95,
+                 delta_decay=1.0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2486,6 +2492,7 @@ class MACHActivationHebbian(nn.Module):
         self.init_std = init_std
         self.consolidation = consolidation
         self.ema_decay = ema_decay
+        self.delta_decay = delta_decay
 
         # Patches
         self.patches = nn.ModuleList([
@@ -2586,8 +2593,8 @@ class MACHActivationHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down)
-                self.patches[patch_idx].accumulate_write("up", delta_up)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
         return value, modulator
 
@@ -2668,7 +2675,7 @@ class MACHDenseHebbian(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=64,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
-                 consolidation=False, ema_decay=0.95):
+                 consolidation=False, ema_decay=0.95, delta_decay=1.0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2680,6 +2687,7 @@ class MACHDenseHebbian(nn.Module):
         self.init_std = init_std
         self.consolidation = consolidation
         self.ema_decay = ema_decay
+        self.delta_decay = delta_decay
 
         # Dense patches — smaller hidden dim, more layers
         self.patches = nn.ModuleList([
@@ -2791,8 +2799,8 @@ class MACHDenseHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down)
-                self.patches[patch_idx].accumulate_write("up", delta_up)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
         return value, modulator
 
@@ -2916,7 +2924,7 @@ class MACHDualHebbian(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  attn_hidden_dim=64, n_rank=2, d_proj=32,
-                 exploration_noise=0.3, init_std=0.001):
+                 exploration_noise=0.3, init_std=0.001, delta_decay=1.0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2926,6 +2934,7 @@ class MACHDualHebbian(nn.Module):
         self.gate_scale = GATE_SCALE
         self.exploration_noise = exploration_noise
         self.init_std = init_std
+        self.delta_decay = delta_decay
 
         # Residual patches (existing)
         self.patches = nn.ModuleList([
@@ -3026,8 +3035,8 @@ class MACHDualHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down)
-                self.patches[patch_idx].accumulate_write("up", delta_up)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
             # Attention patch update
             if patch_idx in self._attn_pre:
@@ -3039,8 +3048,8 @@ class MACHDualHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.attn_patches[patch_idx].accumulate_write("down", delta_down_a)
-                self.attn_patches[patch_idx].accumulate_write("up", delta_up_a)
+                self.attn_patches[patch_idx].accumulate_write("down", delta_down_a, decay=self.delta_decay)
+                self.attn_patches[patch_idx].accumulate_write("up", delta_up_a, decay=self.delta_decay)
 
         return value, modulator
 
@@ -3147,7 +3156,7 @@ class MACHCoprocessor(nn.Module):
                  copro_hidden_dim=256, n_copro_layers=3,
                  read_layer=None, write_layer=None,
                  n_rank=2, d_proj=32,
-                 exploration_noise=0.3, init_std=0.001):
+                 exploration_noise=0.3, init_std=0.001, delta_decay=1.0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -3157,6 +3166,7 @@ class MACHCoprocessor(nn.Module):
         self.gate_scale = GATE_SCALE
         self.exploration_noise = exploration_noise
         self.init_std = init_std
+        self.delta_decay = delta_decay
         self.n_copro_layers = n_copro_layers
 
         # Read from early layer, write to later layer
@@ -3290,8 +3300,8 @@ class MACHCoprocessor(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down)
-                self.patches[patch_idx].accumulate_write("up", delta_up)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
         # Update coprocessor patches
         copro_eta = etas[self.n_patches]  # shared eta for coprocessor
@@ -3306,8 +3316,8 @@ class MACHCoprocessor(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.copro_patches[copro_idx].accumulate_write("down", delta_down)
-                self.copro_patches[copro_idx].accumulate_write("up", delta_up)
+                self.copro_patches[copro_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
+                self.copro_patches[copro_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
         return value, modulator
 

@@ -25,7 +25,7 @@ from models.universal_module import MACHActivationHebbian, ActivationHebbianPatc
 from data.arithmetic import generate_few_shot_episode, extract_number
 
 
-def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials=5):
+def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials=5, delta_decay=1.0):
     if ops is None:
         ops = ["add", "sub", "mul", "div", "gcd", "abs_diff", "mod", "max"]
     if problem_counts is None:
@@ -46,7 +46,7 @@ def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials
     mach = MACHActivationHebbian(
         d_model=d_model, n_layers=n_layers, patch_layers=patch_layers,
         hidden_dim=config.PATCH_HIDDEN_DIM, n_rank=config.HEBBIAN_N_RANK,
-        d_proj=config.HEBBIAN_D_PROJ,
+        d_proj=config.HEBBIAN_D_PROJ, delta_decay=delta_decay,
     ).to(config.DEVICE)
 
     if checkpoint_path:
@@ -108,5 +108,8 @@ def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--delta-decay", type=float, default=1.0,
+                        help="Decay on accumulated deltas (1.0=no decay, 0.9=EMA)")
     args = parser.parse_args()
-    run_bottleneck_test(args.checkpoint)
+    print(f"Delta decay: {args.delta_decay}")
+    run_bottleneck_test(args.checkpoint, delta_decay=args.delta_decay)

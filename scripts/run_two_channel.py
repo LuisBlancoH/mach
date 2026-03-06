@@ -148,6 +148,8 @@ def main():
                         help="Enable memory consolidation across episodes")
     parser.add_argument("--ema-decay", type=float, default=0.95,
                         help="EMA decay for consolidation (default: 0.95)")
+    parser.add_argument("--delta-decay", type=float, default=1.0,
+                        help="Decay on accumulated deltas (1.0=no decay, 0.9=EMA). Prevents Hebbian drift.")
     parser.add_argument("--cot", action="store_true",
                         help="Chain of thought: model generates thinking tokens before answering")
     parser.add_argument("--max-thinking", type=int, default=32,
@@ -208,6 +210,7 @@ def main():
             n_copro_layers=n_copro_layers,
             n_rank=n_rank,
             d_proj=d_proj,
+            delta_decay=args.delta_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -288,6 +291,7 @@ def main():
             d_proj=d_proj,
             consolidation=args.consolidation,
             ema_decay=args.ema_decay,
+            delta_decay=args.delta_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -371,6 +375,7 @@ def main():
             attn_hidden_dim=attn_hidden,
             n_rank=n_rank,
             d_proj=d_proj,
+            delta_decay=args.delta_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -457,6 +462,7 @@ def main():
             frozen_projections=frozen,
             consolidation=args.consolidation,
             ema_decay=args.ema_decay,
+            delta_decay=args.delta_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -534,6 +540,7 @@ def main():
             patch_layers=patch_layers,
             hidden_dim=config.PATCH_HIDDEN_DIM,
             n_basis=n_basis_actual,
+            delta_decay=args.delta_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
