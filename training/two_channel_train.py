@@ -1304,10 +1304,10 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
             second_half = sum(1 for r in rewards[mid:] if r > 0) / max(n_total - mid, 1)
 
             neuromod_str = ""
-            if hasattr(mach, 'eta_scale'):
-                eta_val = torch.sigmoid(mach.eta_scale * abs(mach._last_td_error) if hasattr(mach, '_last_td_error') else mach.eta_scale).item()
-                decay_val = torch.sigmoid(mach.decay_base).item()
-                neuromod_str = f" | η={eta_val:.3f} decay={decay_val:.3f}"
+            if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+                neuromod_str = (f" | η={mach._last_etas[0].item():.3f}"
+                               f" decay={mach._last_decays[0].item():.3f}"
+                               f" expl={mach._last_exploration:.3f}")
             print(
                 f"Episode {episode_idx:4d} | {mode} n={n_total:2d} | "
                 f"ce={loss_scalar:.4f} critic={critic_scalar:.4f} | "
@@ -1585,10 +1585,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             acc = sum(1 for r in recent if r > 0) / len(recent)
             avg_r = sum(recent) / len(recent)
             neuromod_str = ""
-            if hasattr(mach, 'eta_scale'):
-                eta_val = torch.sigmoid(mach.eta_scale * abs(mach._last_td_error) if hasattr(mach, '_last_td_error') else mach.eta_scale).item()
-                decay_val = torch.sigmoid(mach.decay_base).item()
-                neuromod_str = f" | η={eta_val:.3f} decay={decay_val:.3f}"
+            if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+                neuromod_str = (f" | η={mach._last_etas[0].item():.3f}"
+                               f" decay={mach._last_decays[0].item():.3f}"
+                               f" expl={mach._last_exploration:.3f}")
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
@@ -1940,15 +1940,8 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["neuromod/reward_ema"] = mach._reward_ema
     if hasattr(mach, '_last_td_error'):
         diag["neuromod/td_error"] = mach._last_td_error
-    if hasattr(mach, 'eta_scale'):
-        diag["neuromod/eta_scale"] = mach.eta_scale.item()
-        diag["neuromod/decay_base"] = mach.decay_base.item()
-    if hasattr(mach, 'noise_scale'):
-        diag["neuromod/noise_scale"] = mach.noise_scale.item()
     if hasattr(mach, '_last_exploration'):
         diag["neuromod/exploration"] = mach._last_exploration
-    if hasattr(mach, '_failure_ema'):
-        diag["neuromod/failure_ema"] = mach._failure_ema
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

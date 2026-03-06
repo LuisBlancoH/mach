@@ -2493,24 +2493,17 @@ class MACHActivationHebbian(nn.Module):
             for param in self.hebb_rule.parameters():
                 param.requires_grad = False
 
-        # Critic (basal ganglia): GRU with memory over steps
-        # Input: compressed activations only (reward trains it, not feeds it)
+        # Basal ganglia: GRU with memory over steps → value + neuromodulation
+        # One circuit, four outputs. All end-to-end differentiable.
         d_critic_in = len(patch_layers) * d_proj
         self.critic_proj = nn.Linear(d_critic_in, 64)
         self.critic_gru = nn.GRUCell(64, 64)  # activation(64) → hidden(64)
-        self.critic_head = nn.Linear(64, 1)
+        self.critic_head = nn.Linear(64, 4)   # [value, eta, decay, exploration]
         self.register_buffer('_critic_state', torch.zeros(1, 64))
-
-        # Neuromodulation: three learnable scalars (meta-trained via backprop)
-        # Like evolution hardwiring receptor sensitivity — not hand-tuned
-        self.eta_scale = nn.Parameter(torch.tensor(0.5))    # dopamine: |TD error| → learning rate
-        self.decay_base = nn.Parameter(torch.tensor(0.0))   # memory timescale
-        self.noise_scale = nn.Parameter(torch.tensor(1.0))  # norepinephrine: sustained failure → exploration
 
         # State
         self._pre_activations = {}
         self._post_activations = {}
-        self._failure_ema = 0.0  # tracks sustained failure
 
     def reset_episode(self):
         """Call at the start of each episode."""
@@ -2521,9 +2514,8 @@ class MACHActivationHebbian(nn.Module):
                 patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
-        # Reset critic memory and failure tracking
+        # Reset critic memory
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
-        self._failure_ema = 0.0
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2565,39 +2557,34 @@ class MACHActivationHebbian(nn.Module):
         return torch.cat(summaries)
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
-        """Compute activation-derived Hebbian updates with scalar neuromodulation.
+        """Compute activation-derived Hebbian updates with learned neuromodulation.
 
-        Critic predicts value, TD error = dopamine signal.
-        Two learnable scalars (eta_scale, decay_base) control plasticity —
-        meta-trained via backprop through the Hebbian chain.
+        Basal ganglia GRU outputs four signals from one circuit:
+        - value: reward prediction (trained by MSE)
+        - eta: learning rate (trained through Hebbian chain)
+        - decay: memory retention (trained through Hebbian chain)
+        - exploration: noise level (trained through Hebbian chain)
         """
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
-        # Critic GRU: integrate activations over time (state → value)
+        # Basal ganglia: one circuit, four outputs
         critic_input = self.critic_proj(act_summary).unsqueeze(0)  # (1, 64)
         self._critic_state = self.critic_gru(critic_input, self._critic_state)
-        value = self.critic_head(self._critic_state).squeeze(-1).squeeze(-1)
+        outputs = self.critic_head(self._critic_state).squeeze(0)  # (4,)
+
+        value = outputs[0]
+        eta = torch.sigmoid(outputs[1])             # [0, 1] learning rate
+        decay = torch.sigmoid(outputs[2])            # [0, 1] memory retention
+        exploration = torch.sigmoid(outputs[3]) * 0.5 + self.exploration_noise  # base + learned
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
         # TD error = surprise = dopamine
         td_error = (reward_t - value).detach()
 
-        # Update reward EMA (continuous, no episode boundary)
+        # Update reward EMA (for logging only)
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
-
-        # Neuromodulation: scalar params → eta, decay, exploration
-        # Dopamine: more surprise → more plasticity. Zero at td_error=0.
-        eta = (self.eta_scale * td_error.abs()).clamp(0.0, 1.0)
-        # Memory timescale (bounded <1 by sigmoid)
-        decay = torch.sigmoid(self.decay_base)
-        # Norepinephrine: sustained failure → floor on eta + exploration noise
-        # When failing repeatedly, arousal increases: keep writing (eta floor) and try new things (noise)
-        self._failure_ema = 0.9 * self._failure_ema + 0.1 * max(0.0, -reward)
-        ne_boost = (self.noise_scale * self._failure_ema).clamp(0.0, 1.0)
-        eta = eta + ne_boost * (1.0 - eta)  # push eta toward 1 when failing
-        exploration = self.exploration_noise + ne_boost
 
         # Store for diagnostics
         self._last_etas = eta.detach().expand(self.n_patches)
