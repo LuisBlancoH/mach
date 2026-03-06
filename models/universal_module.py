@@ -2493,13 +2493,18 @@ class MACHActivationHebbian(nn.Module):
             for param in self.hebb_rule.parameters():
                 param.requires_grad = False
 
-        # Basal ganglia: GRU with memory over steps → value + neuromodulation
-        # One circuit, four outputs. All end-to-end differentiable.
+        # Basal ganglia: GRU integrates temporal context
         d_critic_in = len(patch_layers) * d_proj
         self.critic_proj = nn.Linear(d_critic_in, 64)
-        self.critic_gru = nn.GRUCell(64, 64)  # activation(64) → hidden(64)
-        self.critic_head = nn.Linear(64, 4)   # [value, eta, decay, exploration]
+        self.critic_gru = nn.GRUCell(64, 64)
         self.register_buffer('_critic_state', torch.zeros(1, 64))
+
+        # Separate nuclei: each reads GRU state, processes independently
+        # Like VTA/LC/basal forebrain — shared cortical input, separate circuits
+        self.value_head = nn.Linear(64, 1)                          # VTA: reward prediction
+        self.eta_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1))   # dopamine: plasticity
+        self.decay_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1)) # ACh: retention
+        self.expl_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1))  # LC: exploration
 
         # State
         self._pre_activations = {}
@@ -2559,24 +2564,25 @@ class MACHActivationHebbian(nn.Module):
     def hebbian_step(self, reward, step_idx, n_steps, device):
         """Compute activation-derived Hebbian updates with learned neuromodulation.
 
-        Basal ganglia GRU outputs four signals from one circuit:
-        - value: reward prediction (trained by MSE)
-        - eta: learning rate (trained through Hebbian chain)
-        - decay: memory retention (trained through Hebbian chain)
-        - exploration: noise level (trained through Hebbian chain)
+        Separate nuclei read shared GRU state, each producing one signal:
+        - value_head (VTA): reward prediction → TD error (dopamine)
+        - eta_head (dopamine circuit): plasticity rate
+        - decay_head (ACh circuit): memory retention
+        - expl_head (locus coeruleus): exploration noise
         """
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
-        # Basal ganglia: one circuit, four outputs
+        # Shared temporal integration (brainstem/cortex → all nuclei)
         critic_input = self.critic_proj(act_summary).unsqueeze(0)  # (1, 64)
         self._critic_state = self.critic_gru(critic_input, self._critic_state)
-        outputs = self.critic_head(self._critic_state).squeeze(0)  # (4,)
+        h = self._critic_state.squeeze(0)  # (64,)
 
-        value = outputs[0]
-        eta = torch.sigmoid(outputs[1])             # [0, 1] learning rate
-        decay = torch.sigmoid(outputs[2])            # [0, 1] memory retention
-        exploration = torch.sigmoid(outputs[3]) * 0.5 + self.exploration_noise  # base + learned
+        # Separate nuclei — each processes GRU state independently
+        value = self.value_head(h).squeeze(-1)          # scalar
+        eta = torch.sigmoid(self.eta_head(h).squeeze(-1))        # [0, 1]
+        decay = torch.sigmoid(self.decay_head(h).squeeze(-1))    # [0, 1]
+        exploration = torch.sigmoid(self.expl_head(h).squeeze(-1)) * 0.5 + self.exploration_noise
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
