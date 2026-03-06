@@ -50,7 +50,7 @@ def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials
     ).to(config.DEVICE)
 
     if checkpoint_path:
-        mach.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE))
+        mach.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE), strict=False)
         print(f"Loaded: {checkpoint_path}")
 
     patched_model = ActivationHebbianPatchedModel(model, mach)
