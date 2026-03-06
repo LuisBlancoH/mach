@@ -2612,7 +2612,7 @@ class MACHActivationHebbian(nn.Module):
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
-                gate = (etas[patch_idx] * reward_t * self.gate_scale).clamp(-1.0, 1.0)
+                gate = (etas[patch_idx] * td_error * self.gate_scale).clamp(-1.0, 1.0)
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx],
