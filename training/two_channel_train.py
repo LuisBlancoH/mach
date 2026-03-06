@@ -895,10 +895,11 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
         if patch.delta_gain is not None:
             diag[f"patch_delta/patch{i}_gain"] = patch.delta_gain.norm().item()
 
-    # Basis vector norms
-    for i in range(mach.basis.n_patches):
-        diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
-        diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
+    # Basis vector norms (only for MACHHebbian with basis vectors)
+    if hasattr(mach, 'basis'):
+        for i in range(mach.basis.n_patches):
+            diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
+            diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
@@ -1414,10 +1415,11 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
             diag[f"patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
             diag[f"patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
 
-    # Basis vector norms
-    for i in range(mach.basis.n_patches):
-        diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
-        diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
+    # Basis vector norms (only for MACHHebbian with basis vectors)
+    if hasattr(mach, 'basis'):
+        for i in range(mach.basis.n_patches):
+            diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
+            diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
