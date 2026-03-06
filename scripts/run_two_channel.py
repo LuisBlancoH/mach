@@ -168,6 +168,8 @@ def main():
                         help="Total steps for continuous training (default: 40000)")
     parser.add_argument("--context-size", type=int, default=0,
                         help="Number of past solved problems as context (0=off, 5-10=typical)")
+    parser.add_argument("--thinking-tokens", type=int, default=0,
+                        help="Max thinking tokens before answering (0=off, 16-32=typical)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -525,6 +527,7 @@ def main():
                 save_path=save_path,
                 curriculum=curriculum,
                 context_size=args.context_size,
+                thinking_tokens=args.thinking_tokens,
             )
         else:
             meta_train_hebbian(

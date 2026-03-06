@@ -1384,7 +1384,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           device, n_steps=40000, lr=None,
                           truncation_window=20, checkpoint_path=None,
                           save_path=None, curriculum=None,
-                          context_size=0):
+                          context_size=0, thinking_tokens=0):
     """
     Continuous Hebbian training: no episodes, no resets.
 
@@ -1395,6 +1395,9 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     If context_size > 0, the last N solved problems are prepended as context
     (fast explicit memory, like hippocampus). The LLM uses in-context
     learning for fast adaptation while patches handle slow adaptation.
+
+    If thinking_tokens > 0, the model generates N tokens before answering
+    (inner speech). Patches steer thinking; gradient flows through the answer.
 
     This matches deployment: the model must manage its own plasticity.
     """
@@ -1450,26 +1453,58 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         else:
             full_prompt = problem["prompt"]
 
-        # Forward pass
-        full_text = full_prompt + problem["answer"]
-        encoding = tokenizer(full_text, return_tensors="pt").to(device)
-        prompt_len = len(tokenizer(full_prompt).input_ids)
-        labels = encoding.input_ids.clone()
-        labels[0, :prompt_len] = -100
+        # Forward pass (with optional thinking tokens)
+        prompt_ids = tokenizer(full_prompt, return_tensors="pt").input_ids.to(device)
+        prompt_len = prompt_ids.shape[1]
 
-        output = patched_model(input_ids=encoding.input_ids, labels=labels)
-        window_ce = window_ce + output.loss
+        if thinking_tokens > 0:
+            # Phase 1: Generate thinking tokens (steered by patches, no grad)
+            with torch.no_grad():
+                generated = prompt_ids
+                for _ in range(thinking_tokens):
+                    out = patched_model(input_ids=generated)
+                    next_token = out.logits[0, -1:].argmax(dim=-1, keepdim=True)
+                    generated = torch.cat([generated, next_token], dim=1)
+                    tok_text = tokenizer.decode(next_token[0], skip_special_tokens=False)
+                    if "=" in tok_text or "\n" in tok_text:
+                        break
 
-        # Compute reward
-        with torch.no_grad():
-            logits = output.logits
-            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
-            pred_text = tokenizer.decode(
-                pred_tokens, skip_special_tokens=True
-            ).strip()
-            predicted = extract_number(pred_text)
-            correct = (predicted == problem["answer"])
-            reward = 1.0 if correct else -1.0
+            # Phase 2: Append correct answer, compute CE loss on answer only
+            answer_ids = tokenizer(problem["answer"], return_tensors="pt",
+                                   add_special_tokens=False).input_ids.to(device)
+            full_ids = torch.cat([generated, answer_ids], dim=1)
+            labels = full_ids.clone()
+            labels[0, :generated.shape[1]] = -100  # loss only on answer
+
+            output = patched_model(input_ids=full_ids, labels=labels)
+            window_ce = window_ce + output.loss
+
+            # Check prediction (what model said after thinking)
+            with torch.no_grad():
+                pred_tokens = output.logits[0, generated.shape[1] - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = 1.0 if correct else -1.0
+        else:
+            # Direct: no thinking
+            full_text = full_prompt + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            labels = encoding.input_ids.clone()
+            labels[0, :prompt_len] = -100
+
+            output = patched_model(input_ids=encoding.input_ids, labels=labels)
+            window_ce = window_ce + output.loss
+
+            with torch.no_grad():
+                logits = output.logits
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(
+                    pred_tokens, skip_special_tokens=True
+                ).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = 1.0 if correct else -1.0
         all_rewards.append(reward)
 
         # Update context buffer: show the correct answer (feedback)
