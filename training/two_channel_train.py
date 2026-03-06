@@ -1574,6 +1574,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     patch.delta_gain = patch.delta_gain.detach()
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
+            # Detach nuclei GRU states at truncation boundary
+            for attr in ('_eta_state', '_decay_state', '_expl_state'):
+                if hasattr(mach, attr):
+                    setattr(mach, attr, getattr(mach, attr).detach())
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
@@ -1628,6 +1632,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             ]
             saved_reward_ema = mach._reward_ema
             saved_critic_state = mach._critic_state.detach().clone() if hasattr(mach, '_critic_state') else None
+            saved_nuclei = {
+                attr: getattr(mach, attr).detach().clone()
+                for attr in ('_eta_state', '_decay_state', '_expl_state')
+                if hasattr(mach, attr)
+            }
             mach_training = mach.training
             mach.eval()
             for op in eval_ops:
@@ -1643,6 +1652,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             mach._reward_ema = saved_reward_ema
             if saved_critic_state is not None:
                 mach._critic_state = saved_critic_state
+            for attr, val in saved_nuclei.items():
+                setattr(mach, attr, val)
             if mach_training:
                 mach.train()
 
