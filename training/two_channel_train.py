@@ -1586,9 +1586,17 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             avg_r = sum(recent) / len(recent)
             neuromod_str = ""
             if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+                td_str = f"td={mach._last_td_error:+.3f}" if hasattr(mach, '_last_td_error') else ""
+                # Patch delta norms
+                dnorm = sum(
+                    (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                    (p.delta_up.norm().item() if p.delta_up is not None else 0)
+                    for p in mach.patches
+                )
                 neuromod_str = (f" | η={mach._last_etas[0].item():.3f}"
                                f" decay={mach._last_decays[0].item():.3f}"
-                               f" expl={mach._last_exploration:.3f}")
+                               f" expl={mach._last_exploration:.3f}"
+                               f" {td_str} Δ={dnorm:.2f}")
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
