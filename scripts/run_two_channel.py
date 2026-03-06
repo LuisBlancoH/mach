@@ -150,6 +150,8 @@ def main():
                         help="EMA decay for consolidation (default: 0.95)")
     parser.add_argument("--delta-decay", type=float, default=1.0,
                         help="Decay on accumulated deltas (1.0=no decay, 0.9=EMA). Prevents Hebbian drift.")
+    parser.add_argument("--consolidation-interval", type=int, default=0,
+                        help="Consolidate every N Hebbian steps (0=episode-based only). Enables continuous learning.")
     parser.add_argument("--cot", action="store_true",
                         help="Chain of thought: model generates thinking tokens before answering")
     parser.add_argument("--max-thinking", type=int, default=32,
@@ -292,6 +294,7 @@ def main():
             consolidation=args.consolidation,
             ema_decay=args.ema_decay,
             delta_decay=args.delta_decay,
+            consolidation_interval=args.consolidation_interval,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -463,6 +466,7 @@ def main():
             consolidation=args.consolidation,
             ema_decay=args.ema_decay,
             delta_decay=args.delta_decay,
+            consolidation_interval=args.consolidation_interval,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())

@@ -2480,7 +2480,7 @@ class MACHActivationHebbian(nn.Module):
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
                  frozen_projections=False, consolidation=False, ema_decay=0.95,
-                 delta_decay=1.0):
+                 delta_decay=1.0, consolidation_interval=0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2493,6 +2493,9 @@ class MACHActivationHebbian(nn.Module):
         self.consolidation = consolidation
         self.ema_decay = ema_decay
         self.delta_decay = delta_decay
+        self.consolidation_interval = consolidation_interval
+        self._step_count = 0
+        self._reward_ema = 0.0
 
         # Patches
         self.patches = nn.ModuleList([
@@ -2541,8 +2544,9 @@ class MACHActivationHebbian(nn.Module):
         self._post_activations.clear()
 
     def consolidate(self, avg_reward=None, threshold=0.0):
-        """Consolidate episode deltas into slow memory.
-        Only consolidates if avg_reward > threshold (reward-gated).
+        """Consolidate deltas into slow memory.
+        Called explicitly (episode-based) or automatically (step-based).
+        Only consolidates if reward signal is positive.
         """
         if not self.consolidation:
             return
@@ -2550,6 +2554,16 @@ class MACHActivationHebbian(nn.Module):
             return
         for patch in self.patches:
             patch.consolidate(decay=self.ema_decay)
+
+    def _maybe_consolidate_step(self, reward):
+        """Step-based consolidation: consolidate every N steps if reward EMA is positive."""
+        if self.consolidation_interval <= 0:
+            return
+        self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
+        self._step_count += 1
+        if self._step_count % self.consolidation_interval == 0 and self._reward_ema > 0:
+            for patch in self.patches:
+                patch.consolidate(decay=self.ema_decay)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input."""
@@ -2596,6 +2610,7 @@ class MACHActivationHebbian(nn.Module):
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
+        self._maybe_consolidate_step(reward)
         return value, modulator
 
 
@@ -2675,7 +2690,8 @@ class MACHDenseHebbian(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=64,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
-                 consolidation=False, ema_decay=0.95, delta_decay=1.0):
+                 consolidation=False, ema_decay=0.95, delta_decay=1.0,
+                 consolidation_interval=0):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2688,6 +2704,9 @@ class MACHDenseHebbian(nn.Module):
         self.consolidation = consolidation
         self.ema_decay = ema_decay
         self.delta_decay = delta_decay
+        self.consolidation_interval = consolidation_interval
+        self._step_count = 0
+        self._reward_ema = 0.0
 
         # Dense patches — smaller hidden dim, more layers
         self.patches = nn.ModuleList([
@@ -2741,13 +2760,23 @@ class MACHDenseHebbian(nn.Module):
         self._gains = None
 
     def consolidate(self, avg_reward=None, threshold=0.0):
-        """Consolidate episode deltas into slow memory."""
+        """Consolidate deltas into slow memory."""
         if not self.consolidation:
             return
         if avg_reward is not None and avg_reward <= threshold:
             return
         for patch in self.patches:
             patch.consolidate(decay=self.ema_decay)
+
+    def _maybe_consolidate_step(self, reward):
+        """Step-based consolidation: consolidate every N steps if reward EMA is positive."""
+        if self.consolidation_interval <= 0:
+            return
+        self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
+        self._step_count += 1
+        if self._step_count % self.consolidation_interval == 0 and self._reward_ema > 0:
+            for patch in self.patches:
+                patch.consolidate(decay=self.ema_decay)
 
     def get_activation_summary(self):
         summaries = []
@@ -2802,6 +2831,7 @@ class MACHDenseHebbian(nn.Module):
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
 
+        self._maybe_consolidate_step(reward)
         return value, modulator
 
 
