@@ -2521,12 +2521,14 @@ class MACHActivationHebbian(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Adaptive learning rate
-        self.eta_head = nn.Sequential(
-            nn.Linear(3, 32),
+        # Plasticity controller: metalearns when/how much to learn, forget, consolidate
+        # Input: activation summary + reward + reward_ema + per-patch delta norms
+        n_patches = len(patch_layers)
+        plasticity_in = d_critic_in + 2 + n_patches
+        self.plasticity_head = nn.Sequential(
+            nn.Linear(plasticity_in, 64),
             nn.GELU(),
-            nn.Linear(32, len(patch_layers)),
-            nn.Softplus(),
+            nn.Linear(64, n_patches * 3),  # eta, decay, consolidation_gate per patch
         )
 
         # State
@@ -2583,18 +2585,37 @@ class MACHActivationHebbian(nn.Module):
         return torch.cat(summaries)
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
-        """Compute activation-derived Hebbian updates modulated by reward."""
+        """Compute activation-derived Hebbian updates with metalearned plasticity."""
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
         value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
 
         modulator = torch.tensor(reward, device=device, dtype=torch.float32)
 
-        step_frac = step_idx / max(n_steps, 1)
-        eta_input = torch.tensor(
-            [reward, reward, step_frac], device=device,
+        # Update reward EMA (continuous, no episode boundary)
+        self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
+
+        # Compute per-patch delta norms (how much has each patch been modified)
+        delta_norms = torch.tensor(
+            [p.delta_down.norm().item() + p.delta_up.norm().item()
+             for p in self.patches],
+            device=device,
         )
-        etas = self.eta_head(eta_input).clamp(max=1.0)
+
+        # Plasticity controller input: what the agent can observe continuously
+        plasticity_input = torch.cat([
+            act_summary,                                                    # what patches are doing
+            torch.tensor([reward, self._reward_ema], device=device),        # immediate + running reward
+            delta_norms,                                                    # how modified patches are
+        ])
+
+        # Output: eta, decay, consolidation_gate per patch
+        plasticity_out = self.plasticity_head(plasticity_input)
+        plasticity_out = plasticity_out.view(self.n_patches, 3)
+
+        etas = torch.sigmoid(plasticity_out[:, 0])           # [0, 1] learning rate
+        decays = torch.sigmoid(plasticity_out[:, 1])         # [0, 1] how much to retain
+        consol_gates = torch.sigmoid(plasticity_out[:, 2])   # [0, 1] how much to consolidate
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
@@ -2607,10 +2628,22 @@ class MACHActivationHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down, decay=self.delta_decay)
-                self.patches[patch_idx].accumulate_write("up", delta_up, decay=self.delta_decay)
+                # Metalearned decay per patch
+                decay = decays[patch_idx] * self.delta_decay  # combine learned + prior
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
 
-        self._maybe_consolidate_step(reward)
+                # Metalearned consolidation per patch
+                if self.consolidation and consol_gates[patch_idx] > 0.01:
+                    with torch.no_grad():
+                        gate_val = consol_gates[patch_idx].item()
+                        self.patches[patch_idx].slow_down.mul_(1 - gate_val).add_(
+                            self.patches[patch_idx].delta_down.detach(), alpha=gate_val
+                        )
+                        self.patches[patch_idx].slow_up.mul_(1 - gate_val).add_(
+                            self.patches[patch_idx].delta_up.detach(), alpha=gate_val
+                        )
+
         return value, modulator
 
 
