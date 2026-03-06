@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Investigate why patches drift: is it the critic, eta, or decay?
+Investigate within-episode adaptation and neuromodulation dynamics.
 
 For each operation, runs N problems and tracks:
-- Critic predictions vs actual rewards (is critic accurate?)
-- TD error magnitude over time (does it shrink when doing well?)
-- Eta values (does learning rate decrease when consistent?)
-- Patch delta norms (are patches stabilizing or wandering?)
-- Per-step accuracy (when does drift start?)
+- Critic predictions vs actual rewards
+- TD error magnitude over time
+- Per-patch eta/decay/exploration values
+- Patch delta norms
+- Per-step and rolling accuracy (first10 vs last10 = adaptation signal)
 
 Usage:
     python scripts/investigate_critic.py --checkpoint checkpoints/act_hebbian_diverse_ops_L4_R16_P32.pt --n-rank 16
+    python scripts/investigate_critic.py --checkpoint checkpoints/act_hebbian_diverse_ops_L4_R16_P32.pt --n-rank 16 --ops mod max min
 """
 
 import argparse
@@ -55,22 +56,16 @@ def investigate(checkpoint_path, n_rank=None, ops=None, n_problems=60):
         mach.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE), strict=False)
         print(f"Loaded: {checkpoint_path}")
 
-    print(f"\neta_scale={mach.eta_scale.item():.4f}, decay_base={mach.decay_base.item():.4f}")
-    print(f"decay = sigmoid(decay_base) = {torch.sigmoid(mach.decay_base).item():.4f}")
-    print(f"eta at td_error=0: clamp(0) = 0.000")
-    print(f"eta at td_error=1: clamp({mach.eta_scale.item():.3f}) = {min(mach.eta_scale.item() * 1.0, 1.0):.4f}")
-    print(f"eta at td_error=2: clamp({2*mach.eta_scale.item():.3f}) = {min(mach.eta_scale.item() * 2.0, 1.0):.4f}")
-
     patched_model = ActivationHebbianPatchedModel(model, mach)
     mach.eval()
 
     for op in ops:
-        print(f"\n{'='*80}")
+        print(f"\n{'='*90}")
         print(f"Operation: {op} ({n_problems} problems)")
-        print(f"{'='*80}")
-        print(f"{'step':>4} {'correct':>7} {'reward':>6} {'critic':>6} {'td_err':>6} "
-              f"{'eta':>6} {'gate':>8} {'Δnorm':>8} {'acc_10':>6}")
-        print("-" * 75)
+        print(f"{'='*90}")
+        print(f"{'step':>4} {'ok':>3} {'reward':>6} {'td_err':>7} "
+              f"{'eta':>20} {'decay':>20} {'Δnorm':>6} {'acc10':>5}")
+        print("-" * 90)
 
         mach.reset_episode()
         problems = generate_few_shot_episode(n_problems, n_demos=0, op_type=op)
@@ -96,21 +91,17 @@ def investigate(checkpoint_path, n_rank=None, ops=None, n_problems=60):
 
             rewards_history.append(reward)
 
-            # Get critic prediction BEFORE hebbian step
-            act_summary = mach.get_activation_summary()
-            act_summary = act_summary / (act_summary.norm() + 1e-8)
-            critic_val = mach.critic(mach.critic_proj(act_summary)).squeeze(-1).item()
-
             # Hebbian step
             value, _ = mach.hebbian_step(reward, step, n_problems, config.DEVICE)
 
             td_error = mach._last_td_error
-            eta = mach._last_etas[0].item()
-            gate = eta * td_error * mach.gate_scale
+            etas = mach._last_etas
+            decays = mach._last_decays
 
             # Patch delta norms
             total_norm = sum(
-                p.delta_down.norm().item() + p.delta_up.norm().item()
+                (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                (p.delta_up.norm().item() if p.delta_up is not None else 0)
                 for p in mach.patches
             )
             delta_norms_history.append(total_norm)
@@ -119,16 +110,23 @@ def investigate(checkpoint_path, n_rank=None, ops=None, n_problems=60):
             recent = rewards_history[-10:]
             acc_10 = sum(1 for r in recent if r > 0) / len(recent)
 
-            print(f"{step:4d} {'✓' if correct else '✗':>7} {reward:>6.1f} {critic_val:>6.3f} "
-                  f"{td_error:>6.3f} {eta:>6.4f} {gate:>8.5f} {total_norm:>8.3f} {acc_10:>5.0%}")
+            eta_str = "/".join(f"{e:.2f}" for e in etas)
+            decay_str = "/".join(f"{d:.2f}" for d in decays)
+
+            print(f"{step:4d} {'Y' if correct else 'N':>3} {reward:>6.1f} {td_error:>+7.3f} "
+                  f"  [{eta_str}] [{decay_str}] {total_norm:>6.2f} {acc_10:>4.0%}")
 
         # Summary
         total_correct = sum(1 for r in rewards_history if r > 0)
         first_10 = sum(1 for r in rewards_history[:10] if r > 0)
         last_10 = sum(1 for r in rewards_history[-10:] if r > 0)
-        print(f"\nSummary: {total_correct}/{n_problems} correct "
-              f"(first10={first_10}/10, last10={last_10}/10)")
-        print(f"Delta norm: start={delta_norms_history[0]:.3f} → end={delta_norms_history[-1]:.3f} "
+        first_half = sum(1 for r in rewards_history[:n_problems//2] if r > 0)
+        last_half = sum(1 for r in rewards_history[n_problems//2:] if r > 0)
+        half = n_problems // 2
+        print(f"\nSummary: {total_correct}/{n_problems} correct ({total_correct/n_problems:.0%})")
+        print(f"  first10={first_10}/10  last10={last_10}/10  (adaptation: {last_10-first_10:+d})")
+        print(f"  first_half={first_half}/{half}  last_half={last_half}/{half}  (adaptation: {last_half-first_half:+d})")
+        print(f"  Delta norm: start={delta_norms_history[0]:.3f} → end={delta_norms_history[-1]:.3f} "
               f"(Δ={delta_norms_history[-1]-delta_norms_history[0]:+.3f})")
 
 
