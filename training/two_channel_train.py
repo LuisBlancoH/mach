@@ -930,8 +930,12 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
     if hasattr(mach, 'coprocessor'):
         copro = mach.coprocessor
         diag["copro/output_scale"] = copro.output_scale.item()
-        diag["copro/input_proj_norm"] = copro.input_proj.weight.norm().item()
-        diag["copro/output_proj_norm"] = copro.output_proj.weight.norm().item()
+        for i, p in enumerate(copro.proc_patches):
+            if p.delta_down is not None:
+                diag[f"copro/proc{i}_down"] = p.delta_down.norm().item()
+        for i, p in enumerate(copro.out_patches):
+            if p.delta_down is not None:
+                diag[f"copro/out{i}_down"] = p.delta_down.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
@@ -1482,8 +1486,12 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
     if hasattr(mach, 'coprocessor'):
         copro = mach.coprocessor
         diag["copro/output_scale"] = copro.output_scale.item()
-        diag["copro/input_proj_norm"] = copro.input_proj.weight.norm().item()
-        diag["copro/output_proj_norm"] = copro.output_proj.weight.norm().item()
+        for i, p in enumerate(copro.proc_patches):
+            if p.delta_down is not None:
+                diag[f"copro/proc{i}_down"] = p.delta_down.norm().item()
+        for i, p in enumerate(copro.out_patches):
+            if p.delta_down is not None:
+                diag[f"copro/out{i}_down"] = p.delta_down.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
