@@ -1383,13 +1383,18 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
 def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           device, n_steps=40000, lr=None,
                           truncation_window=20, checkpoint_path=None,
-                          save_path=None, curriculum=None):
+                          save_path=None, curriculum=None,
+                          context_size=0):
     """
     Continuous Hebbian training: no episodes, no resets.
 
     Problems arrive in an endless stream. Truncated backprop every
     `truncation_window` steps (computational necessity, not a semantic
     boundary). Patches and slow memory persist across everything.
+
+    If context_size > 0, the last N solved problems are prepended as context
+    (fast explicit memory, like hippocampus). The LLM uses in-context
+    learning for fast adaptation while patches handle slow adaptation.
 
     This matches deployment: the model must manage its own plasticity.
     """
@@ -1421,6 +1426,9 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     op_step_count = 0
     op_switch_interval = random.randint(10, 60)  # random task duration
 
+    # Context buffer: rolling history of solved problems (hippocampal memory)
+    context_buffer = []  # list of "a ? b = answer\n" strings
+
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
         op_step_count += 1
@@ -1428,15 +1436,24 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
             op_switch_interval = random.randint(10, 60)
+            if context_size > 0:
+                context_buffer.clear()  # new task = clear episodic memory
 
         # Generate one problem
         problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
         problem = problems[0]
 
+        # Build context: last N solved problems prepended as demos
+        if context_size > 0 and context_buffer:
+            context_str = "".join(context_buffer[-context_size:])
+            full_prompt = context_str + problem["prompt"]
+        else:
+            full_prompt = problem["prompt"]
+
         # Forward pass
-        full_text = problem["prompt"] + problem["answer"]
+        full_text = full_prompt + problem["answer"]
         encoding = tokenizer(full_text, return_tensors="pt").to(device)
-        prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+        prompt_len = len(tokenizer(full_prompt).input_ids)
         labels = encoding.input_ids.clone()
         labels[0, :prompt_len] = -100
 
@@ -1454,6 +1471,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             correct = (predicted == problem["answer"])
             reward = 1.0 if correct else -1.0
         all_rewards.append(reward)
+
+        # Update context buffer: show the correct answer (feedback)
+        if context_size > 0:
+            context_buffer.append(f"{problem['prompt']}{problem['answer']}\n")
 
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)

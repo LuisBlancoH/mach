@@ -166,6 +166,8 @@ def main():
                         help="Truncated backprop window for continuous training (default: 20)")
     parser.add_argument("--n-steps", type=int, default=40000,
                         help="Total steps for continuous training (default: 40000)")
+    parser.add_argument("--context-size", type=int, default=0,
+                        help="Number of past solved problems as context (0=off, 5-10=typical)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -522,6 +524,7 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                context_size=args.context_size,
             )
         else:
             meta_train_hebbian(
