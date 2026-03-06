@@ -2913,8 +2913,8 @@ class HebbianCoprocessor(nn.Module):
         # All copro patches in one list for easy iteration
         # proc_patches[0..n_layers-1], out_patches[0..n_virtual_tokens-1]
 
-        # Scale factor (meta-trained, starts small)
-        self.output_scale = nn.Parameter(torch.tensor(0.01))
+        # Scale factor: fixed, not learnable. Start loud like brain's spontaneous activity.
+        self.register_buffer('output_scale', torch.tensor(0.1))
 
         # State: pre/post activations for Hebbian updates
         self._copro_pre = {}
