@@ -2422,11 +2422,16 @@ class ActivationHebbianRule(nn.Module):
             # delta_down: learned row, activation-derived col
             u_down = self.row_heads_down[patch_idx][r](pre_c)      # (hidden_dim,)
             v_down = self.col_diags_down[patch_idx][r] * pre_norm   # (d_model,)
+            # Normalize both vectors to bound outer product norm
+            u_down = u_down / (u_down.norm() + 1e-8)
+            v_down = v_down / (v_down.norm() + 1e-8)
             delta_down = delta_down + coeff * torch.outer(u_down, v_down)
 
             # delta_up: activation-derived row, learned col
             u_up = self.row_diags_up[patch_idx][r] * post_norm      # (d_model,)
             v_up = self.col_heads_up[patch_idx][r](post_c)          # (hidden_dim,)
+            u_up = u_up / (u_up.norm() + 1e-8)
+            v_up = v_up / (v_up.norm() + 1e-8)
             delta_up = delta_up + coeff * torch.outer(u_up, v_up)
 
         return gate * delta_down, gate * delta_up
