@@ -140,7 +140,7 @@ def main():
     parser.add_argument("--dual-hebbian", action="store_true",
                         help="Dual Hebbian: residual patches + attention output patches")
     parser.add_argument("--coprocessor", action="store_true",
-                        help="Coprocessor: virtual tokens + residual patches")
+                        help="Coprocessor: direct injection + residual patches")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -162,16 +162,15 @@ def main():
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
     if args.coprocessor:
-        # MACHCoprocessor: virtual tokens + residual patches
+        # MACHCoprocessor: direct injection (read early layer → process → inject at later layer)
         arch_name = "coprocessor"
         n_rank = config.HEBBIAN_N_RANK
         d_proj = config.HEBBIAN_D_PROJ
         d_copro = config.COPRO_D_MODEL
         n_copro_layers = config.COPRO_N_LAYERS
-        n_virt = config.COPRO_N_VIRTUAL_TOKENS
         run_name = (
             f"copro-{args.task}"
-            f"-L{n_patch_layers_actual}-C{d_copro}x{n_copro_layers}-V{n_virt}"
+            f"-L{n_patch_layers_actual}-C{d_copro}x{n_copro_layers}"
         )
 
         # Generate patch layers
@@ -186,7 +185,8 @@ def main():
             patch_layers = [min(l, n_layers - 2) for l in patch_layers]
 
         print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
-        print(f"Coprocessor: d={d_copro}, layers={n_copro_layers}, virtual_tokens={n_virt}")
+        print(f"Coprocessor: d={d_copro}, layers={n_copro_layers}")
+        print(f"  read_layer={n_layers // 4}, write_layer={3 * n_layers // 4}")
 
         mach = MACHCoprocessor(
             d_model=d_model,
@@ -195,7 +195,6 @@ def main():
             hidden_dim=config.PATCH_HIDDEN_DIM,
             copro_hidden_dim=d_copro,
             n_copro_layers=n_copro_layers,
-            n_virtual_tokens=n_virt,
             n_rank=n_rank,
             d_proj=d_proj,
         ).to(config.DEVICE)
@@ -207,7 +206,7 @@ def main():
 
         save_path = (
             f"checkpoints/copro_{args.task}"
-            f"_L{n_patch_layers_actual}_C{d_copro}x{n_copro_layers}_V{n_virt}.pt"
+            f"_L{n_patch_layers_actual}_C{d_copro}x{n_copro_layers}.pt"
         )
         os.makedirs("checkpoints", exist_ok=True)
 
@@ -219,7 +218,6 @@ def main():
                     "base_model": config.BASE_MODEL,
                     "d_copro": d_copro,
                     "n_copro_layers": n_copro_layers,
-                    "n_virtual_tokens": n_virt,
                     "n_rank": n_rank,
                     "d_proj": d_proj,
                     "n_patch_layers": n_patch_layers_actual,

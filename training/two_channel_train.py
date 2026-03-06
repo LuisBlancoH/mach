@@ -927,15 +927,11 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
                 diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
 
     # Coprocessor stats (only for MACHCoprocessor)
-    if hasattr(mach, 'coprocessor'):
-        copro = mach.coprocessor
-        diag["copro/output_scale"] = copro.output_scale.item()
-        for i, p in enumerate(copro.proc_patches):
+    if hasattr(mach, 'copro_patches'):
+        for i, p in enumerate(mach.copro_patches):
             if p.delta_down is not None:
-                diag[f"copro/proc{i}_down"] = p.delta_down.norm().item()
-        for i, p in enumerate(copro.out_patches):
-            if p.delta_down is not None:
-                diag[f"copro/out{i}_down"] = p.delta_down.norm().item()
+                diag[f"copro/patch{i}_down"] = p.delta_down.norm().item()
+                diag[f"copro/patch{i}_up"] = p.delta_up.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
@@ -1483,15 +1479,11 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
                 diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
 
     # Coprocessor stats (only for MACHCoprocessor)
-    if hasattr(mach, 'coprocessor'):
-        copro = mach.coprocessor
-        diag["copro/output_scale"] = copro.output_scale.item()
-        for i, p in enumerate(copro.proc_patches):
+    if hasattr(mach, 'copro_patches'):
+        for i, p in enumerate(mach.copro_patches):
             if p.delta_down is not None:
-                diag[f"copro/proc{i}_down"] = p.delta_down.norm().item()
-        for i, p in enumerate(copro.out_patches):
-            if p.delta_down is not None:
-                diag[f"copro/out{i}_down"] = p.delta_down.norm().item()
+                diag[f"copro/patch{i}_down"] = p.delta_down.norm().item()
+                diag[f"copro/patch{i}_up"] = p.delta_up.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
