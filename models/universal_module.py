@@ -2493,9 +2493,9 @@ class MACHActivationHebbian(nn.Module):
             for param in self.hebb_rule.parameters():
                 param.requires_grad = False
 
-        # Basal ganglia: GRU integrates temporal context
+        # Basal ganglia: GRU integrates temporal context + PFC task context
         d_critic_in = len(patch_layers) * d_proj
-        self.critic_proj = nn.Linear(d_critic_in, 64)
+        self.critic_proj = nn.Linear(d_critic_in + 32, 64)  # +32 for PFC state
         self.critic_gru = nn.GRUCell(64, 64)
         self.register_buffer('_critic_state', torch.zeros(1, 64))
 
@@ -2521,7 +2521,7 @@ class MACHActivationHebbian(nn.Module):
         # Maintains stable task set through own GRU dynamics
         # Separate from critic GRU: critic predicts reward, PFC represents task context
         d_pfc_in = len(patch_layers) * d_proj  # same as critic input (128)
-        self.pfc_proj = nn.Linear(d_pfc_in, 32)   # sensory compression
+        self.pfc_proj = nn.Linear(d_pfc_in + 64, 32)  # +64 for critic state
         self.pfc_gru = nn.GRUCell(32, 32)          # recurrent task representation
         self.register_buffer('_pfc_state', torch.zeros(1, 32))
         # Per-patch gate from PFC state
@@ -2593,8 +2593,9 @@ class MACHActivationHebbian(nn.Module):
         # Reuse activation summary (all 4 layers compressed to 128-dim)
         act_summary = self.get_activation_summary().detach()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
-        # PFC GRU: integrate sensory input, maintain task set
-        pfc_input = self.pfc_proj(act_summary).unsqueeze(0)  # (1, 32)
+        # PFC GRU: sensory input + critic context → task representation
+        critic_context = self._critic_state.squeeze(0).detach()  # (64,)
+        pfc_input = self.pfc_proj(torch.cat([act_summary, critic_context])).unsqueeze(0)  # (1, 32)
         self._pfc_state = self.pfc_gru(pfc_input, self._pfc_state)
         h = self._pfc_state.squeeze(0)  # (32,)
         # Per-patch gates from PFC task representation
@@ -2630,8 +2631,13 @@ class MACHActivationHebbian(nn.Module):
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
-        # Shared temporal integration (brainstem/cortex → all nuclei)
-        critic_input = self.critic_proj(act_summary).unsqueeze(0)  # (1, 64)
+        # Reciprocal PFC ↔ basal ganglia communication (detached — signal, not gradient)
+        # Critic sees PFC task context, PFC sees critic reward context
+        pfc_to_critic = self._pfc_state.squeeze(0).detach()    # (32,)
+        critic_to_pfc = self._critic_state.squeeze(0).detach() # (64,)
+
+        # Basal ganglia: activations + PFC context → reward prediction
+        critic_input = self.critic_proj(torch.cat([act_summary, pfc_to_critic])).unsqueeze(0)  # (1, 64)
         self._critic_state = self.critic_gru(critic_input, self._critic_state)
         h = self._critic_state.squeeze(0)  # (64,)
 
