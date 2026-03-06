@@ -2506,6 +2506,14 @@ class MACHActivationHebbian(nn.Module):
         self.decay_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1)) # ACh: retention
         self.expl_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1))  # LC: exploration
 
+        # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
+        # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
+        # eta: sigmoid(-0.5) ≈ 0.38 — moderate learning rate
+        # expl: sigmoid(0.0) = 0.5 — default exploration (no bias needed)
+        with torch.no_grad():
+            self.decay_head[-1].bias.fill_(2.0)
+            self.eta_head[-1].bias.fill_(-0.5)
+
         # State
         self._pre_activations = {}
         self._post_activations = {}
