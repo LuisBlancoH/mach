@@ -1781,17 +1781,7 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["plasticity/eta_std"] = mach._last_etas.std().item()
         diag["plasticity/decay_mean"] = mach._last_decays.mean().item()
         diag["plasticity/decay_std"] = mach._last_decays.std().item()
-        diag["plasticity/consol_gate_mean"] = mach._last_consol_gates.mean().item()
-        diag["plasticity/consol_gate_std"] = mach._last_consol_gates.std().item()
         diag["plasticity/reward_ema"] = mach._reward_ema
-
-    # Consolidation stats
-    if hasattr(mach, 'consolidation') and mach.consolidation:
-        slow_norms = []
-        for p in mach.patches:
-            slow_norms.append(p.slow_down.norm().item())
-        diag["consolidation/slow_mean_norm"] = sum(slow_norms) / len(slow_norms)
-        diag["consolidation/slow_max_norm"] = max(slow_norms)
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

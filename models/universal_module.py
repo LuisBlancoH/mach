@@ -16,12 +16,11 @@ from models.error_observation import ErrorProjection
 class DifferentiablePatch(nn.Module):
     """
     Cortical patch with differentiable accumulated writes.
-    Base weights are fixed at zero (buffers, not parameters).
-    Meta-learner writes accumulate as delta tensors that remain in the
-    computational graph, enabling gradient flow back to the meta-learner.
 
-    Supports consolidation: slow_delta buffers accumulate successful
-    patterns across episodes (like synaptic consolidation during sleep).
+    All computation comes from delta tensors that remain in the
+    computational graph. Metalearned decay controls memory timescale:
+    high decay (0.99) = slow memory, low decay (0.8) = fast adaptation.
+    No separate slow/fast buffers — just one set of deltas with learned decay.
     """
 
     def __init__(self, d_model, hidden_dim=256):
@@ -30,52 +29,37 @@ class DifferentiablePatch(nn.Module):
         self.hidden_dim = hidden_dim
         self.act = nn.GELU()
 
-        # Base weights fixed at zero — not parameters
-        self.register_buffer('down_base', torch.zeros(hidden_dim, d_model))
-        self.register_buffer('up_base', torch.zeros(d_model, hidden_dim))
-
-        # Slow memory for consolidation (persists across episodes)
-        self.register_buffer('slow_down', torch.zeros(hidden_dim, d_model))
-        self.register_buffer('slow_up', torch.zeros(d_model, hidden_dim))
-
         # Accumulated deltas — set externally, part of computational graph
         self.delta_down = None
         self.delta_up = None
         self.delta_gain = None  # multiplicative gain vector (d_model,)
 
     def reset_deltas(self, use_slow=False):
-        """Zero fast deltas. Slow memory remains active in forward().
-        use_slow is ignored (kept for API compatibility) — slow memory
-        is always used as the base weights now.
-        """
+        """Zero all deltas."""
+        device = next(self.parameters(), torch.tensor(0)).device
+        # Find device from existing deltas or default
+        if self.delta_down is not None:
+            device = self.delta_down.device
         self.delta_down = torch.zeros(
-            self.hidden_dim, self.d_model, device=self.slow_down.device
+            self.hidden_dim, self.d_model, device=device
         )
         self.delta_up = torch.zeros(
-            self.d_model, self.hidden_dim, device=self.slow_up.device
+            self.d_model, self.hidden_dim, device=device
         )
         self.delta_gain = torch.zeros(
-            self.d_model, device=self.slow_down.device
+            self.d_model, device=device
         )
 
     def consolidate(self, decay=0.95):
-        """Blend current episode deltas into slow memory.
-        Like synaptic consolidation: frequently reinforced patterns persist.
+        """No-op. Kept for API compatibility.
+        Memory timescale is now controlled by metalearned decay in accumulate_write.
         """
-        with torch.no_grad():
-            if self.delta_down is not None:
-                self.slow_down.mul_(decay).add_(
-                    self.delta_down.detach(), alpha=1.0 - decay
-                )
-            if self.delta_up is not None:
-                self.slow_up.mul_(decay).add_(
-                    self.delta_up.detach(), alpha=1.0 - decay
-                )
+        pass
 
     def accumulate_write(self, weight_name, delta_W, decay=1.0):
-        """Add a differentiable delta with optional decay on existing values.
-        decay=1.0: pure accumulation (original behavior)
-        decay=0.9: exponential moving average (self-stabilizing)
+        """Add a differentiable delta with learned decay.
+        decay controls memory timescale: 0.99 = slow, 0.8 = fast.
+        Fully differentiable — gradient flows through decay to plasticity controller.
         """
         if weight_name == "down":
             self.delta_down = self.delta_down * decay + delta_W
@@ -89,12 +73,9 @@ class DifferentiablePatch(nn.Module):
         return self.delta_gain if self.delta_gain is not None else 0
 
     def forward(self, hidden_states):
-        """Forward with slow memory + fast deltas. Operates in float32.
-        slow_down/slow_up: consolidated long-term memory (always active)
-        delta_down/delta_up: fast adaptation (decays, comes and goes)
-        """
-        W_down = self.slow_down + (self.delta_down if self.delta_down is not None else 0)
-        W_up = self.slow_up + (self.delta_up if self.delta_up is not None else 0)
+        """Forward with accumulated deltas. Operates in float32."""
+        W_down = self.delta_down if self.delta_down is not None else 0
+        W_up = self.delta_up if self.delta_up is not None else 0
 
         h = torch.nn.functional.linear(hidden_states, W_down)
         h = self.act(h)
@@ -2521,14 +2502,14 @@ class MACHActivationHebbian(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Plasticity controller: metalearns when/how much to learn, forget, consolidate
+        # Plasticity controller: metalearns when/how much to learn and forget
         # Input: activation summary + reward + reward_ema + per-patch delta norms
         n_patches = len(patch_layers)
         plasticity_in = d_critic_in + 2 + n_patches
         self.plasticity_head = nn.Sequential(
             nn.Linear(plasticity_in, 64),
             nn.GELU(),
-            nn.Linear(64, n_patches * 3),  # eta, decay, consolidation_gate per patch
+            nn.Linear(64, n_patches * 2),  # 2 outputs per patch: eta, decay
         )
 
         # State
@@ -2609,18 +2590,16 @@ class MACHActivationHebbian(nn.Module):
             delta_norms,                                                    # how modified patches are
         ])
 
-        # Output: eta, decay, consolidation_gate per patch
+        # Output: eta (learning rate), decay (memory timescale) per patch
         plasticity_out = self.plasticity_head(plasticity_input)
-        plasticity_out = plasticity_out.view(self.n_patches, 3)
+        plasticity_out = plasticity_out.view(self.n_patches, 2)
 
         etas = torch.sigmoid(plasticity_out[:, 0])           # [0, 1] learning rate
-        decays = torch.sigmoid(plasticity_out[:, 1])         # [0, 1] how much to retain
-        consol_gates = torch.sigmoid(plasticity_out[:, 2])   # [0, 1] how much to consolidate
+        decays = torch.sigmoid(plasticity_out[:, 1])         # [0, 1] memory retention
 
         # Store for diagnostics
         self._last_etas = etas.detach()
         self._last_decays = decays.detach()
-        self._last_consol_gates = consol_gates.detach()
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
@@ -2633,21 +2612,11 @@ class MACHActivationHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                # Metalearned decay per patch
-                decay = decays[patch_idx] * self.delta_decay  # combine learned + prior
+                # Metalearned decay: controls memory timescale per patch
+                # High decay (0.99) = slow memory, low decay (0.8) = fast adaptation
+                decay = decays[patch_idx]
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
-
-                # Metalearned consolidation per patch
-                if self.consolidation and consol_gates[patch_idx] > 0.01:
-                    with torch.no_grad():
-                        gate_val = consol_gates[patch_idx].item()
-                        self.patches[patch_idx].slow_down.mul_(1 - gate_val).add_(
-                            self.patches[patch_idx].delta_down.detach(), alpha=gate_val
-                        )
-                        self.patches[patch_idx].slow_up.mul_(1 - gate_val).add_(
-                            self.patches[patch_idx].delta_up.detach(), alpha=gate_val
-                        )
 
         return value, modulator
 
