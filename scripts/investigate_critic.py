@@ -59,6 +59,30 @@ def investigate(checkpoint_path, n_rank=None, ops=None, n_problems=60):
     patched_model = ActivationHebbianPatchedModel(model, mach)
     mach.eval()
 
+    # Baseline: frozen Qwen without patches
+    print(f"\n{'='*90}")
+    print("BASELINE (frozen Qwen, no patches)")
+    print(f"{'='*90}")
+    patched_model.remove_hooks()
+    for op in ops:
+        problems = generate_few_shot_episode(n_problems, n_demos=0, op_type=op)
+        correct_count = 0
+        for problem in problems:
+            full_text = problem["prompt"] + problem["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(config.DEVICE)
+            prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+            with torch.no_grad():
+                output = model(input_ids=encoding.input_ids)
+                logits = output.logits
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                if predicted == problem["answer"]:
+                    correct_count += 1
+        print(f"  {op:<12} {correct_count}/{n_problems} ({correct_count/n_problems:.0%})")
+    # Re-register hooks
+    patched_model._register_hooks()
+
     for op in ops:
         print(f"\n{'='*90}")
         print(f"Operation: {op} ({n_problems} problems)")
