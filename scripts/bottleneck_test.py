@@ -25,7 +25,7 @@ from models.universal_module import MACHActivationHebbian, ActivationHebbianPatc
 from data.arithmetic import generate_few_shot_episode, extract_number
 
 
-def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials=5, delta_decay=1.0, n_rank=None):
+def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials=5, delta_decay=1.0, n_rank=None, context_size=0):
     if ops is None:
         ops = ["add", "sub", "mul", "div", "gcd", "abs_diff", "mod", "max"]
     if problem_counts is None:
@@ -73,11 +73,19 @@ def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials
                     n_problems, n_demos=0, op_type=op
                 )
                 mach.reset_episode()
+                context_buffer = []
 
                 for step, problem in enumerate(problems):
-                    full_text = problem["prompt"] + problem["answer"]
+                    # Build context from past solved problems
+                    if context_size > 0 and context_buffer:
+                        context_str = "".join(context_buffer[-context_size:])
+                        full_prompt = context_str + problem["prompt"]
+                    else:
+                        full_prompt = problem["prompt"]
+
+                    full_text = full_prompt + problem["answer"]
                     encoding = tokenizer(full_text, return_tensors="pt").to(config.DEVICE)
-                    prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                    prompt_len = len(tokenizer(full_prompt).input_ids)
 
                     with torch.no_grad():
                         output = patched_model(input_ids=encoding.input_ids)
@@ -89,6 +97,10 @@ def run_bottleneck_test(checkpoint_path, ops=None, problem_counts=None, n_trials
                         predicted = extract_number(pred_text)
                         correct = (predicted == problem["answer"])
                         reward = 1.0 if correct else -1.0
+
+                    # Add solved problem to context
+                    if context_size > 0:
+                        context_buffer.append(f"{problem['prompt']}{problem['answer']}\n")
 
                     mach.hebbian_step(reward, step, n_problems, config.DEVICE)
 
@@ -112,7 +124,9 @@ if __name__ == "__main__":
                         help="Decay on accumulated deltas (1.0=no decay, 0.9=EMA)")
     parser.add_argument("--n-rank", type=int, default=None,
                         help="Hebbian rank (default: from config)")
+    parser.add_argument("--context-size", type=int, default=0,
+                        help="Number of past solved problems as context (0=off)")
     args = parser.parse_args()
     print(f"Delta decay: {args.delta_decay}")
     run_bottleneck_test(args.checkpoint, delta_decay=args.delta_decay,
-                        n_rank=args.n_rank)
+                        n_rank=args.n_rank, context_size=args.context_size)
