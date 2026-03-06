@@ -46,10 +46,10 @@ FEW_SHOT_BASIC_CURRICULUM = [
 DIVERSE_TRAIN_OPS = [
     "add", "sub", "mul", "div",
     "gcd", "abs_diff", "avg", "first", "second",
-    "digit_sum_add", "bitwise_and", "bitwise_xor",
+    "digit_sum_add", "bitwise_and",
 ]
 DIVERSE_HELDOUT_OPS = ["mod", "max", "min"]
-DIVERSE_IMPOSSIBLE_OPS = ["digit_sum_add", "bitwise_and", "bitwise_xor"]
+DIVERSE_IMPOSSIBLE_OPS = ["bitwise_xor"]
 
 DIVERSE_OPS_CURRICULUM = [
     (0, 5000, "few_shot_diverse"),
