@@ -2446,7 +2446,8 @@ class MACHActivationHebbian(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001):
+                 n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
+                 frozen_projections=False):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2466,6 +2467,11 @@ class MACHActivationHebbian(nn.Module):
         self.hebb_rule = ActivationHebbianRule(
             d_model, hidden_dim, len(patch_layers), n_rank, d_proj
         )
+
+        # Freeze projections for reservoir-style learning
+        if frozen_projections:
+            for param in self.hebb_rule.parameters():
+                param.requires_grad = False
 
         # Critic (basal ganglia): patch activation summary -> value
         d_critic_in = len(patch_layers) * d_proj

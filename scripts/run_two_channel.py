@@ -133,6 +133,8 @@ def main():
                         help="Three-factor Hebbian learning with critic")
     parser.add_argument("--act-hebbian", action="store_true",
                         help="Activation-derived Hebbian (no basis vectors)")
+    parser.add_argument("--frozen-proj", action="store_true",
+                        help="Freeze hebb_rule projections (reservoir-style)")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -157,10 +159,12 @@ def main():
         # MACHActivationHebbian: activation-derived Hebbian (no basis vectors)
         arch_name = "act_hebbian"
         n_rank = config.HEBBIAN_N_RANK
-        d_proj = config.HEBBIAN_D_PROJ
+        d_proj = 128 if args.frozen_proj else config.HEBBIAN_D_PROJ
+        frozen = args.frozen_proj
+        suffix = "-frozen" if frozen else ""
         run_name = (
             f"act-hebbian-{args.task}"
-            f"-L{n_patch_layers_actual}-R{n_rank}-P{d_proj}"
+            f"-L{n_patch_layers_actual}-R{n_rank}-P{d_proj}{suffix}"
         )
 
         # Generate patch layers
@@ -175,7 +179,7 @@ def main():
             patch_layers = [min(l, n_layers - 2) for l in patch_layers]
 
         print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
-        print(f"n_rank={n_rank}, d_proj={d_proj}")
+        print(f"n_rank={n_rank}, d_proj={d_proj}, frozen_proj={frozen}")
 
         mach = MACHActivationHebbian(
             d_model=d_model,
@@ -184,6 +188,7 @@ def main():
             hidden_dim=config.PATCH_HIDDEN_DIM,
             n_rank=n_rank,
             d_proj=d_proj,
+            frozen_projections=frozen,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -193,7 +198,7 @@ def main():
 
         save_path = (
             f"checkpoints/act_hebbian_{args.task}"
-            f"_L{n_patch_layers_actual}_R{n_rank}_P{d_proj}.pt"
+            f"_L{n_patch_layers_actual}_R{n_rank}_P{d_proj}{suffix}.pt"
         )
         os.makedirs("checkpoints", exist_ok=True)
 
