@@ -21,8 +21,9 @@ import config
 
 
 def graded_reward(predicted, actual):
-    """Graded reward: +1 for correct, scaled by proximity for incorrect.
-    Like warmer/colder feedback — near-misses reinforce, way-off punishes."""
+    """Graded reward: +1 for correct, graded negative for incorrect.
+    Wrong answers are always negative — close miss = gentle correction,
+    way off = strong correction. Never reinforces wrong answers."""
     if predicted == actual:
         return 1.0
     try:
@@ -33,9 +34,9 @@ def graded_reward(predicted, actual):
     # Relative error: how far off as fraction of answer magnitude
     scale = max(abs(a), 1)
     rel_error = abs(p - a) / scale
-    # reward: 0.5 for very close, -1.0 for way off
-    # Smooth: reward = 1 - 2 * clamp(rel_error, 0, 1)
-    return max(-1.0, 1.0 - 2.0 * min(rel_error, 1.0))
+    # Wrong answers: -0.2 (very close) to -1.0 (way off)
+    # close miss doesn't cancel learning as hard, but still corrective
+    return -0.2 - 0.8 * min(rel_error, 1.0)
 
 
 CONTINUOUS_LINEAR_CURRICULUM = [
