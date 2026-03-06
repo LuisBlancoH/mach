@@ -2870,116 +2870,124 @@ class DualHebbianPatchedModel(nn.Module):
 
 
 # ============================================================
-# Coprocessor: independent compute module for novel operations
+# Coprocessor: fully Hebbian compute module for novel operations
 # ============================================================
 
-class CoprocessorBlock(nn.Module):
-    """Single transformer block for the coprocessor."""
-
-    def __init__(self, d_model, n_heads=4, mlp_dim=None):
-        super().__init__()
-        mlp_dim = mlp_dim or d_model * 4
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, mlp_dim),
-            nn.GELU(),
-            nn.Linear(mlp_dim, d_model),
-        )
-
-    def forward(self, x):
-        h = self.norm1(x)
-        h = self.attn(h, h, h, need_weights=False)[0]
-        x = x + h
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class Coprocessor(nn.Module):
+class HebbianCoprocessor(nn.Module):
     """
-    Independent compute module that produces virtual tokens for Qwen.
+    Fully Hebbian coprocessor — ALL computation weights are buffers written
+    by Hebbian learning. No backprop-trained weights in the compute path.
 
-    Takes tokenized input, embeds it, processes through a small transformer,
-    and outputs K virtual token embeddings in Qwen's d_model space.
+    Architecture:
+    1. Qwen embeddings (d_model) + positional embeddings
+    2. N DifferentiablePatch layers (position-wise MLPs with residual)
+    3. Mean pool over sequence
+    4. K output DifferentiablePatch layers (one per virtual token)
+    5. Scale by output_scale
 
-    Weights are buffers (not parameters) — written to by Hebbian learning,
-    same as DifferentiablePatch.
+    The only meta-trained parameters are positional embeddings and output_scale.
+    Everything else is buffer-based, written by ActivationHebbianRule.
     """
 
-    def __init__(self, d_copro=256, d_qwen=2560, n_layers=2,
-                 n_heads=4, n_virtual_tokens=4, max_seq_len=64):
+    def __init__(self, d_model=2560, hidden_dim=256, n_layers=2,
+                 n_virtual_tokens=4, max_seq_len=64):
         super().__init__()
-        self.d_copro = d_copro
-        self.d_qwen = d_qwen
+        self.d_model = d_model
+        self.n_layers = n_layers
         self.n_virtual_tokens = n_virtual_tokens
+        self.n_copro_patches = n_layers + n_virtual_tokens
 
-        # Project from Qwen's embedding space down to coprocessor dim
-        self.input_proj = nn.Linear(d_qwen, d_copro, bias=False)
-        nn.init.normal_(self.input_proj.weight, std=0.02)
+        # Positional embedding (meta-trained — like brain's tonotopic maps)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, d_model) * 0.01)
 
-        # Positional embedding
-        self.pos_embed = nn.Parameter(torch.randn(1, max_seq_len, d_copro) * 0.02)
-
-        # Transformer blocks with buffer-based weights
-        self.blocks = nn.ModuleList([
-            CoprocessorBlock(d_copro, n_heads, d_copro * 4)
-            for _ in range(n_layers)
+        # Processing layers: buffer-based MLPs with residual connections
+        self.proc_patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in range(n_layers)
         ])
 
-        # Learnable query tokens that get refined by attending to input
-        self.queries = nn.Parameter(torch.randn(1, n_virtual_tokens, d_copro) * 0.02)
+        # Output patches: each produces one virtual token from pooled input
+        self.out_patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in range(n_virtual_tokens)
+        ])
 
-        # Cross-attention: queries attend to processed input
-        self.cross_attn_norm = nn.LayerNorm(d_copro)
-        self.cross_attn = nn.MultiheadAttention(d_copro, n_heads, batch_first=True)
+        # All copro patches in one list for easy iteration
+        # proc_patches[0..n_layers-1], out_patches[0..n_virtual_tokens-1]
 
-        # Project to Qwen's embedding space
-        self.output_proj = nn.Linear(d_copro, d_qwen)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-
-        # Scale factor for output (start small, like GATE_SCALE)
+        # Scale factor (meta-trained, starts small)
         self.output_scale = nn.Parameter(torch.tensor(0.1))
+
+        # State: pre/post activations for Hebbian updates
+        self._copro_pre = {}
+        self._copro_post = {}
+
+    def reset_deltas(self, init_std=0.0):
+        """Reset all coprocessor patch deltas."""
+        for patch in self.proc_patches:
+            patch.reset_deltas()
+            if init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * init_std
+        for patch in self.out_patches:
+            patch.reset_deltas()
+            if init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * init_std
+        self._copro_pre.clear()
+        self._copro_post.clear()
+
+    def get_patch(self, copro_idx):
+        """Get patch by unified index (proc layers first, then output)."""
+        if copro_idx < self.n_layers:
+            return self.proc_patches[copro_idx]
+        else:
+            return self.out_patches[copro_idx - self.n_layers]
 
     def forward(self, embeddings):
         """
-        embeddings: (batch, seq_len, d_qwen) — Qwen's frozen token embeddings
-        Returns: (batch, n_virtual_tokens, d_qwen)
+        embeddings: (batch, seq_len, d_model) — Qwen's frozen token embeddings
+        Returns: (batch, n_virtual_tokens, d_model)
         """
         bsz, seq_len, _ = embeddings.shape
 
-        # Project down from Qwen space to coprocessor space
-        x = self.input_proj(embeddings.float())  # (batch, seq, d_copro)
-        x = x + self.pos_embed[:, :seq_len, :]
+        # Add positional embedding
+        x = embeddings.float() + self.pos_embed[:, :seq_len, :]
 
-        # Self-attention processing
-        for block in self.blocks:
-            x = block(x)
+        # Process through buffer-based MLP layers with residual
+        for i, patch in enumerate(self.proc_patches):
+            self._copro_pre[i] = x.detach()
+            x = x + patch(x)  # residual connection
+            self._copro_post[i] = x.detach()
 
-        # Cross-attention: queries extract from processed input
-        queries = self.queries.expand(bsz, -1, -1)  # (batch, K, d_copro)
-        q_norm = self.cross_attn_norm(queries)
-        virtual = self.cross_attn(q_norm, x, x, need_weights=False)[0]
-        virtual = queries + virtual  # residual
+        # Mean pool over sequence positions
+        pooled = x.mean(dim=1)  # (batch, d_model)
 
-        # Project to Qwen space
-        virtual_tokens = self.output_proj(virtual) * self.output_scale
+        # Generate virtual tokens via output patches
+        virtuals = []
+        for i, out_patch in enumerate(self.out_patches):
+            idx = self.n_layers + i  # unified index
+            self._copro_pre[idx] = pooled.detach()
+            v = pooled + out_patch(pooled)  # residual
+            self._copro_post[idx] = v.detach()
+            virtuals.append(v)
 
-        return virtual_tokens  # (batch, K, d_qwen)
+        virtual_tokens = torch.stack(virtuals, dim=1)  # (batch, K, d_model)
+        return virtual_tokens * self.output_scale
 
 
 class MACHCoprocessor(nn.Module):
     """
-    Combines coprocessor (new computation) with residual patches (steering).
+    Fully Hebbian coprocessor + residual patches.
 
-    The coprocessor produces virtual tokens prepended to Qwen's input.
-    Residual patches still steer Qwen's existing computation.
-    Both are updated by independent Hebbian rules.
+    Both the coprocessor (new computation) and residual patches (steering)
+    are buffer-based and written by independent ActivationHebbianRules.
+    Meta-training learns the Hebbian rules, not the weights.
+
+    At inference time: reward → Hebbian update → weights change.
+    No backprop needed. Fully brain-like.
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
-                 d_copro=256, n_copro_layers=2,
+                 copro_hidden_dim=256, n_copro_layers=2,
                  n_virtual_tokens=4, n_rank=2, d_proj=32,
                  exploration_noise=0.3, init_std=0.001):
         super().__init__()
@@ -2993,15 +3001,21 @@ class MACHCoprocessor(nn.Module):
         self.init_std = init_std
         self.n_virtual_tokens = n_virtual_tokens
 
-        # Coprocessor: produces virtual tokens
-        self.coprocessor = Coprocessor(
-            d_copro=d_copro,
-            d_qwen=d_model,
+        # Coprocessor: buffer-based, Hebbian-writable
+        self.coprocessor = HebbianCoprocessor(
+            d_model=d_model,
+            hidden_dim=copro_hidden_dim,
             n_layers=n_copro_layers,
             n_virtual_tokens=n_virtual_tokens,
         )
 
-        # Residual patches (same as before)
+        # Hebbian rule for coprocessor patches
+        n_copro_patches = n_copro_layers + n_virtual_tokens
+        self.copro_hebb_rule = ActivationHebbianRule(
+            d_model, copro_hidden_dim, n_copro_patches, n_rank, d_proj
+        )
+
+        # Residual patches (steering existing Qwen computation)
         self.patches = nn.ModuleList([
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
@@ -3011,8 +3025,9 @@ class MACHCoprocessor(nn.Module):
             d_model, hidden_dim, len(patch_layers), n_rank, d_proj
         )
 
-        # Critic
-        d_critic_in = len(patch_layers) * d_proj
+        # Critic: uses both residual and coprocessor activation summaries
+        n_total_patches = len(patch_layers) + n_copro_patches
+        d_critic_in = n_total_patches * d_proj
         self.critic_proj = nn.Linear(d_critic_in, 64)
         self.critic = nn.Sequential(
             nn.Linear(64, 64),
@@ -3020,19 +3035,21 @@ class MACHCoprocessor(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Adaptive learning rate
+        # Adaptive learning rate (one per residual patch + one shared for copro)
+        n_eta = len(patch_layers) + 1  # +1 for coprocessor
         self.eta_head = nn.Sequential(
             nn.Linear(3, 32),
             nn.GELU(),
-            nn.Linear(32, len(patch_layers)),
+            nn.Linear(32, n_eta),
             nn.Softplus(),
         )
 
-        # State
+        # State for residual patches
         self._pre_activations = {}
         self._post_activations = {}
 
     def reset_episode(self):
+        # Reset residual patches
         for patch in self.patches:
             patch.reset_deltas()
             if self.init_std > 0:
@@ -3041,8 +3058,14 @@ class MACHCoprocessor(nn.Module):
         self._pre_activations.clear()
         self._post_activations.clear()
 
+        # Reset coprocessor patches
+        self.coprocessor.reset_deltas(init_std=self.init_std)
+
     def get_activation_summary(self):
+        """Summarize activations from both residual patches and coprocessor."""
         summaries = []
+
+        # Residual patch summaries
         for i in range(self.n_patches):
             pre = self._pre_activations.get(i)
             if pre is not None:
@@ -3055,6 +3078,22 @@ class MACHCoprocessor(nn.Module):
                     self.hebb_rule.d_proj,
                     device=self.patches[0].down_base.device,
                 ))
+
+        # Coprocessor patch summaries
+        n_copro = self.coprocessor.n_copro_patches
+        for i in range(n_copro):
+            pre = self.coprocessor._copro_pre.get(i)
+            if pre is not None:
+                compressed = self.copro_hebb_rule.compress[i](pre.float())
+                while compressed.dim() > 1:
+                    compressed = compressed.mean(dim=0)
+                summaries.append(compressed)
+            else:
+                summaries.append(torch.zeros(
+                    self.copro_hebb_rule.d_proj,
+                    device=self.patches[0].down_base.device,
+                ))
+
         return torch.cat(summaries)
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
@@ -3070,6 +3109,7 @@ class MACHCoprocessor(nn.Module):
         )
         etas = self.eta_head(eta_input).clamp(max=1.0)
 
+        # Update residual patches
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
                 gate = (etas[patch_idx] * modulator * self.gate_scale).clamp(-1.0, 1.0)
@@ -3084,19 +3124,38 @@ class MACHCoprocessor(nn.Module):
                 self.patches[patch_idx].accumulate_write("down", delta_down)
                 self.patches[patch_idx].accumulate_write("up", delta_up)
 
+        # Update coprocessor patches
+        copro_gate_idx = self.n_patches  # index into etas for coprocessor
+        copro_eta = etas[copro_gate_idx]
+        n_copro = self.coprocessor.n_copro_patches
+        for copro_idx in range(n_copro):
+            if copro_idx in self.coprocessor._copro_pre:
+                gate = (copro_eta * modulator * self.gate_scale).clamp(-1.0, 1.0)
+                delta_down, delta_up = self.copro_hebb_rule.compute_update(
+                    copro_idx,
+                    self.coprocessor._copro_pre[copro_idx],
+                    self.coprocessor._copro_post[copro_idx],
+                    gate,
+                    exploration_noise=self.exploration_noise,
+                    training=self.training,
+                )
+                patch = self.coprocessor.get_patch(copro_idx)
+                patch.accumulate_write("down", delta_down)
+                patch.accumulate_write("up", delta_up)
+
         return value, modulator
 
 
 class CoprocessorPatchedModel(nn.Module):
     """
-    Wraps Qwen with coprocessor (virtual tokens) + residual patches.
+    Wraps Qwen with fully Hebbian coprocessor + residual patches.
 
     On each forward pass:
-    1. Coprocessor produces virtual tokens from input_ids
-    2. Virtual token embeddings are prepended to Qwen's embedding output
-    3. Qwen processes the extended sequence (attention mask adjusted)
+    1. Coprocessor produces virtual tokens from Qwen embeddings
+    2. Virtual tokens prepended to Qwen's input
+    3. Qwen processes extended sequence
     4. Residual patches steer computation at selected layers
-    5. Loss is computed only on the original (non-virtual) token positions
+    5. Loss computed on original (non-virtual) positions only
     """
 
     def __init__(self, base_model, mach):
@@ -3139,27 +3198,18 @@ class CoprocessorPatchedModel(nn.Module):
         return self.base_model.device
 
     def forward(self, input_ids, labels=None, attention_mask=None):
-        """
-        Forward with virtual token prepending.
-
-        1. Get Qwen embeddings for input_ids
-        2. Get virtual tokens from coprocessor
-        3. Prepend virtual tokens to embeddings
-        4. Run Qwen's transformer layers on extended embeddings
-        5. Slice output to remove virtual positions, compute loss on original positions
-        """
         n_virt = self.mach.n_virtual_tokens
         bsz, seq_len = input_ids.shape
 
         # Get Qwen embeddings (frozen)
-        embeds = self.base_model.model.embed_tokens(input_ids)  # (bsz, seq, d_model)
+        embeds = self.base_model.model.embed_tokens(input_ids)
 
-        # Get virtual tokens from coprocessor (uses Qwen embeddings as input)
-        virtual_tokens = self.mach.coprocessor(embeds)  # (bsz, K, d_model)
+        # Coprocessor: Hebbian-written patches produce virtual tokens
+        virtual_tokens = self.mach.coprocessor(embeds)
         virtual_tokens = virtual_tokens.to(embeds.dtype)
 
         # Prepend virtual tokens
-        extended_embeds = torch.cat([virtual_tokens, embeds], dim=1)  # (bsz, K+seq, d_model)
+        extended_embeds = torch.cat([virtual_tokens, embeds], dim=1)
 
         # Extend attention mask
         if attention_mask is None:
@@ -3167,16 +3217,16 @@ class CoprocessorPatchedModel(nn.Module):
         virt_mask = torch.ones(bsz, n_virt, device=input_ids.device)
         extended_mask = torch.cat([virt_mask, attention_mask], dim=1)
 
-        # Run Qwen with embeddings (bypass embed_tokens)
+        # Run Qwen with extended embeddings
         output = self.base_model(
             inputs_embeds=extended_embeds,
             attention_mask=extended_mask,
         )
 
         # Slice logits to remove virtual token positions
-        logits = output.logits[:, n_virt:, :]  # back to (bsz, seq, vocab)
+        logits = output.logits[:, n_virt:, :]
 
-        # Compute loss manually if labels provided
+        # Compute loss on original positions only
         loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
@@ -3187,7 +3237,6 @@ class CoprocessorPatchedModel(nn.Module):
                 ignore_index=-100,
             )
 
-        # Return in a format compatible with HF output
         class Output:
             pass
         out = Output()

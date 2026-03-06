@@ -193,7 +193,7 @@ def main():
             n_layers=n_layers,
             patch_layers=patch_layers,
             hidden_dim=config.PATCH_HIDDEN_DIM,
-            d_copro=d_copro,
+            copro_hidden_dim=d_copro,
             n_copro_layers=n_copro_layers,
             n_virtual_tokens=n_virt,
             n_rank=n_rank,
