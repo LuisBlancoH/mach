@@ -1504,9 +1504,16 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         if step % 2000 == 0 and step > 0:
             _log_hebbian_diagnostics(mach, meta_params, step)
 
-            # Quick validation
+            # Quick validation — save/restore continuous state
             print(f"  --- Operation validation (step {step}) ---")
             eval_ops = DIVERSE_TRAIN_OPS[:6]
+            saved_deltas = [
+                (p.delta_down.detach().clone() if p.delta_down is not None else None,
+                 p.delta_up.detach().clone() if p.delta_up is not None else None,
+                 p.delta_gain.detach().clone() if p.delta_gain is not None else None)
+                for p in mach.patches
+            ]
+            saved_reward_ema = mach._reward_ema
             mach_training = mach.training
             mach.eval()
             for op in eval_ops:
@@ -1514,6 +1521,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     base_model, mach, patched_model,
                     tokenizer, device, op, step,
                 )
+            # Restore continuous state
+            for p, (dd, du, dg) in zip(mach.patches, saved_deltas):
+                p.delta_down = dd
+                p.delta_up = du
+                p.delta_gain = dg
+            mach._reward_ema = saved_reward_ema
             if mach_training:
                 mach.train()
 
