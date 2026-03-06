@@ -2623,7 +2623,8 @@ class MACHActivationHebbian(nn.Module):
         self._last_etas = etas.detach()
         self._last_decays = decays.detach()
         self._last_td_error = td_error.item()
-        self._last_exploration = expls.detach().mean().item()
+        self._last_expls = expls.detach()
+        self._last_exploration = expls.detach().mean().item()  # backward compat
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:

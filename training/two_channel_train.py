@@ -1597,13 +1597,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     (p.delta_up.norm().item() if p.delta_up is not None else 0)
                     for p in mach.patches
                 )
-                eta_vals = mach._last_etas
-                decay_vals = mach._last_decays
-                eta_str = "/".join(f"{e:.2f}" for e in eta_vals)
-                decay_str = "/".join(f"{d:.2f}" for d in decay_vals)
+                eta_str = "/".join(f"{e:.2f}" for e in mach._last_etas)
+                decay_str = "/".join(f"{d:.2f}" for d in mach._last_decays)
+                expl_str = "/".join(f"{x:.2f}" for x in mach._last_expls) if hasattr(mach, '_last_expls') else f"{mach._last_exploration:.3f}"
                 neuromod_str = (f" | η=[{eta_str}]"
                                f" dec=[{decay_str}]"
-                               f" expl={mach._last_exploration:.3f}"
+                               f" expl=[{expl_str}]"
                                f" {td_str} Δ={dnorm:.2f}")
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
