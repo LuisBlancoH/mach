@@ -24,6 +24,7 @@ from models.universal_module import (
     MACHActivationHebbian, ActivationHebbianPatchedModel,
     MACHDualHebbian, DualHebbianPatchedModel,
     MACHCoprocessor, CoprocessorPatchedModel,
+    MACHDenseHebbian, DenseHebbianPatchedModel,
 )
 from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
@@ -141,6 +142,8 @@ def main():
                         help="Dual Hebbian: residual patches + attention output patches")
     parser.add_argument("--coprocessor", action="store_true",
                         help="Coprocessor: direct injection + residual patches")
+    parser.add_argument("--dense-hebbian", action="store_true",
+                        help="Dense Hebbian: 12 layers + top-down gain modulation")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -224,6 +227,81 @@ def main():
                     "lr": args.lr or config.PHASE5_LR,
                     "episodes": args.episodes or config.PHASE5_EPISODES,
                     "architecture": "coprocessor",
+                    "task": args.task,
+                    "device": str(config.DEVICE),
+                },
+            )
+
+        if args.ablate:
+            if args.checkpoint:
+                mach.load_state_dict(torch.load(args.checkpoint, map_location=config.DEVICE))
+                print(f"Loaded checkpoint: {args.checkpoint}")
+            mach.eval()
+            ablate_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+            )
+        else:
+            meta_train_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+                n_episodes=args.episodes, lr=args.lr,
+                checkpoint_path=args.checkpoint,
+                save_path=save_path,
+                curriculum=curriculum,
+            )
+
+    elif args.dense_hebbian:
+        # MACHDenseHebbian: 12+ layers + top-down gain modulation
+        arch_name = "dense_hebbian"
+        n_rank = config.HEBBIAN_N_RANK
+        d_proj = config.HEBBIAN_D_PROJ
+        dense_hidden = 64  # smaller patches, more layers
+        n_dense_layers = n_patch_layers_actual if n_patch_layers_actual >= 8 else 12
+        run_name = (
+            f"dense-hebbian-{args.task}"
+            f"-L{n_dense_layers}-R{n_rank}-P{d_proj}-H{dense_hidden}"
+        )
+
+        # Generate dense patch layers (every 3rd layer for 12 layers)
+        step = n_layers // n_dense_layers
+        patch_layers = [i * step for i in range(n_dense_layers)]
+        patch_layers = [min(l, n_layers - 2) for l in patch_layers]
+
+        print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
+        print(f"n_rank={n_rank}, d_proj={d_proj}, hidden_dim={dense_hidden}")
+
+        mach = MACHDenseHebbian(
+            d_model=d_model,
+            n_layers=n_layers,
+            patch_layers=patch_layers,
+            hidden_dim=dense_hidden,
+            n_rank=n_rank,
+            d_proj=d_proj,
+        ).to(config.DEVICE)
+
+        n_params = sum(p.numel() for p in mach.parameters())
+        print(f"MACHDenseHebbian total parameters: {n_params:,}")
+
+        patched_model = DenseHebbianPatchedModel(base_model, mach)
+
+        save_path = (
+            f"checkpoints/dense_hebbian_{args.task}"
+            f"_L{n_dense_layers}_R{n_rank}_P{d_proj}_H{dense_hidden}.pt"
+        )
+        os.makedirs("checkpoints", exist_ok=True)
+
+        if wandb is not None:
+            wandb.init(
+                project="mach",
+                name=run_name,
+                config={
+                    "base_model": config.BASE_MODEL,
+                    "n_rank": n_rank,
+                    "d_proj": d_proj,
+                    "hidden_dim": dense_hidden,
+                    "n_patch_layers": n_dense_layers,
+                    "lr": args.lr or config.PHASE5_LR,
+                    "episodes": args.episodes or config.PHASE5_EPISODES,
+                    "architecture": "dense_hebbian",
                     "task": args.task,
                     "device": str(config.DEVICE),
                 },

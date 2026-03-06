@@ -934,6 +934,14 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
                 diag[f"copro/patch{i}_down"] = p.delta_down.norm().item()
                 diag[f"copro/patch{i}_up"] = p.delta_up.norm().item()
 
+    # Top-down gain stats (only for MACHDenseHebbian)
+    if hasattr(mach, 'gain_net') and mach._gains is not None:
+        gains = mach._gains.detach()
+        diag["gain/mean"] = gains.mean().item()
+        diag["gain/std"] = gains.std().item()
+        diag["gain/min"] = gains.min().item()
+        diag["gain/max"] = gains.max().item()
+
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
         print(f"    {k}: {v:.6f}")
@@ -1485,6 +1493,14 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
             if p.delta_down is not None:
                 diag[f"copro/patch{i}_down"] = p.delta_down.norm().item()
                 diag[f"copro/patch{i}_up"] = p.delta_up.norm().item()
+
+    # Top-down gain stats (only for MACHDenseHebbian)
+    if hasattr(mach, 'gain_net') and mach._gains is not None:
+        gains = mach._gains.detach()
+        diag["gain/mean"] = gains.mean().item()
+        diag["gain/std"] = gains.std().item()
+        diag["gain/min"] = gains.min().item()
+        diag["gain/max"] = gains.max().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

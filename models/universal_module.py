@@ -2606,6 +2606,208 @@ class ActivationHebbianPatchedModel(nn.Module):
         self._hooks.clear()
 
 
+# ============================================================
+# Dense Hebbian: many layers + top-down gain modulation
+# ============================================================
+
+class MACHDenseHebbian(nn.Module):
+    """
+    Dense Hebbian steering: patches at 12+ layers with top-down gain modulation.
+
+    Brain analogy:
+    - Many small synaptic changes across the whole pathway (dense patches)
+    - Neuromodulatory gain control (PFC/thalamus biases which patches activate)
+    - Cascading small changes create new computational paths through existing circuits
+
+    Key differences from MACHActivationHebbian:
+    - 12 layers instead of 4 (every 3rd Qwen layer)
+    - Smaller patches (64 hidden dim) to keep total params reasonable
+    - Top-down gain modulator: activation summary -> per-layer gain scalar
+    - Gain multiplies patch output BEFORE adding to residual stream
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=64,
+                 n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001):
+        super().__init__()
+        from config import GATE_SCALE
+        self.d_model = d_model
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.n_rank = n_rank
+        self.gate_scale = GATE_SCALE
+        self.exploration_noise = exploration_noise
+        self.init_std = init_std
+
+        # Dense patches — smaller hidden dim, more layers
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Hebbian rule for all patches
+        self.hebb_rule = ActivationHebbianRule(
+            d_model, hidden_dim, len(patch_layers), n_rank, d_proj
+        )
+
+        # Top-down gain modulator: activation summary -> per-layer gain
+        # Like PFC/thalamus sending gain signals to cortical areas
+        d_critic_in = len(patch_layers) * d_proj
+        self.gain_net = nn.Sequential(
+            nn.Linear(d_critic_in, 64),
+            nn.GELU(),
+            nn.Linear(64, len(patch_layers)),
+            nn.Sigmoid(),  # gain between 0 and 1
+        )
+
+        # Critic
+        self.critic_proj = nn.Linear(d_critic_in, 64)
+        self.critic = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        # Adaptive learning rate
+        self.eta_head = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, len(patch_layers)),
+            nn.Softplus(),
+        )
+
+        # State
+        self._pre_activations = {}
+        self._post_activations = {}
+        self._gains = None  # computed per forward pass
+
+    def reset_episode(self):
+        for patch in self.patches:
+            patch.reset_deltas()
+            if self.init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
+        self._pre_activations.clear()
+        self._post_activations.clear()
+        self._gains = None
+
+    def get_activation_summary(self):
+        summaries = []
+        for i in range(self.n_patches):
+            pre = self._pre_activations.get(i)
+            if pre is not None:
+                compressed = self.hebb_rule.compress[i](pre.float())
+                while compressed.dim() > 1:
+                    compressed = compressed.mean(dim=0)
+                summaries.append(compressed)
+            else:
+                summaries.append(torch.zeros(
+                    self.hebb_rule.d_proj,
+                    device=self.patches[0].down_base.device,
+                ))
+        return torch.cat(summaries)
+
+    def compute_gains(self):
+        """Compute top-down gain modulation from activation summary."""
+        act_summary = self.get_activation_summary()
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
+        self._gains = self.gain_net(act_summary)  # (n_patches,)
+        return self._gains
+
+    def get_gain_for_patch(self, patch_idx):
+        """Get top-down gain for a specific patch. Returns 1.0 if not computed yet."""
+        if self._gains is not None:
+            return self._gains[patch_idx]
+        return torch.tensor(1.0, device=self.patches[0].down_base.device)
+
+    def hebbian_step(self, reward, step_idx, n_steps, device):
+        act_summary = self.get_activation_summary()
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
+        value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
+
+        modulator = torch.tensor(reward, device=device, dtype=torch.float32)
+        step_frac = step_idx / max(n_steps, 1)
+        eta_input = torch.tensor([reward, reward, step_frac], device=device)
+        etas = self.eta_head(eta_input).clamp(max=1.0)
+
+        for patch_idx in range(self.n_patches):
+            if patch_idx in self._pre_activations:
+                gate = (etas[patch_idx] * modulator * self.gate_scale).clamp(-1.0, 1.0)
+                delta_down, delta_up = self.hebb_rule.compute_update(
+                    patch_idx,
+                    self._pre_activations[patch_idx],
+                    self._post_activations[patch_idx],
+                    gate,
+                    exploration_noise=self.exploration_noise,
+                    training=self.training,
+                )
+                self.patches[patch_idx].accumulate_write("down", delta_down)
+                self.patches[patch_idx].accumulate_write("up", delta_up)
+
+        return value, modulator
+
+
+class DenseHebbianPatchedModel(nn.Module):
+    """Wraps Qwen with dense patches + top-down gain modulation."""
+
+    def __init__(self, base_model, mach):
+        super().__init__()
+        self.base_model = base_model
+        self.mach = mach
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for i, layer_idx in enumerate(self.mach.patch_layers):
+            layer = self.base_model.model.layers[layer_idx]
+
+            def make_hook(patch_idx):
+                def hook(module, input, output):
+                    patch = self.mach.patches[patch_idx]
+
+                    if isinstance(output, tuple):
+                        h = output[0]
+                    else:
+                        h = output
+
+                    self.mach._pre_activations[patch_idx] = h.detach()
+
+                    patch_out = patch(h.float())
+
+                    # Top-down gain modulation
+                    top_down_gain = self.mach.get_gain_for_patch(patch_idx)
+                    patch_out = patch_out * top_down_gain
+
+                    gain = patch.get_gain()
+                    h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+
+                    self.mach._post_activations[patch_idx] = h_new.detach()
+
+                    if isinstance(output, tuple):
+                        return (h_new,) + output[1:]
+                    return h_new
+                return hook
+
+            handle = layer.register_forward_hook(make_hook(i))
+            self._hooks.append(handle)
+
+    @property
+    def device(self):
+        return self.base_model.device
+
+    def forward(self, input_ids, labels=None, attention_mask=None):
+        # Compute top-down gains from previous forward pass activations
+        # (first forward pass uses default gain=1.0)
+        if self.mach._pre_activations:
+            self.mach.compute_gains()
+        return self.base_model(
+            input_ids=input_ids, labels=labels, attention_mask=attention_mask
+        )
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+
 class AttentionPatch(nn.Module):
     """
     Small MLP that produces attention output corrections.
