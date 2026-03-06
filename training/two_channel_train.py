@@ -1638,11 +1638,59 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
 
-            # Hippocampus: decay and save
-            if hippocampus is not None:
+            # Hippocampus: decay, consolidate (sleep), save
+            if hippocampus is not None and len(hippocampus) > 0:
                 hippocampus.decay_all()
+                n_replayed = _consolidation_replay(
+                    mach, patched_model, tokenizer, device, hippocampus,
+                )
                 hippocampus.save()
-                print(f"  Hippocampus: {len(hippocampus)} memories")
+                print(f"  Hippocampus: {len(hippocampus)} memories, replayed {n_replayed}")
+
+
+def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,
+                          batch_size=10):
+    """Sleep-like consolidation: replay hippocampal memories through Hebbian loop.
+
+    Patches absorb patterns from stored experiences. The explicit memory
+    can then fade (via decay) while the implicit knowledge persists in weights.
+    """
+    batch = hippocampus.get_replay_batch(batch_size=batch_size)
+    if not batch:
+        return 0
+
+    was_training = mach.training
+    mach.eval()
+
+    for text, stored_td_error in batch:
+        # Parse experience text back into prompt + answer
+        # Format: "a ? b = answer\n"
+        parts = text.strip().split("= ")
+        if len(parts) != 2:
+            continue
+        prompt = parts[0] + "= "
+        answer = parts[1]
+
+        full_text = prompt + answer
+        encoding = tokenizer(full_text, return_tensors="pt").to(device)
+        prompt_len = len(tokenizer(prompt).input_ids)
+
+        with torch.no_grad():
+            output = patched_model(input_ids=encoding.input_ids)
+            logits = output.logits
+            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+            pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+            predicted = extract_number(pred_text)
+            correct = (predicted == answer)
+            reward = 1.0 if correct else -1.0
+
+        # Hebbian update from replay (same as live experience)
+        mach.hebbian_step(reward, 0, 1, device)
+
+    if was_training:
+        mach.train()
+
+    return len(batch)
 
 
 def _run_op_validation_hebbian(base_model, mach, patched_model,
