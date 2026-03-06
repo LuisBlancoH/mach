@@ -20,6 +20,24 @@ from data.arithmetic import (
 import config
 
 
+def graded_reward(predicted, actual):
+    """Graded reward: +1 for correct, scaled by proximity for incorrect.
+    Like warmer/colder feedback — near-misses reinforce, way-off punishes."""
+    if predicted == actual:
+        return 1.0
+    try:
+        p = int(predicted) if predicted is not None else 0
+        a = int(actual)
+    except (ValueError, TypeError):
+        return -1.0
+    # Relative error: how far off as fraction of answer magnitude
+    scale = max(abs(a), 1)
+    rel_error = abs(p - a) / scale
+    # reward: 0.5 for very close, -1.0 for way off
+    # Smooth: reward = 1 - 2 * clamp(rel_error, 0, 1)
+    return max(-1.0, 1.0 - 2.0 * min(rel_error, 1.0))
+
+
 CONTINUOUS_LINEAR_CURRICULUM = [
     (0, 5000, "continuous_linear"),
 ]
@@ -1510,7 +1528,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
                 predicted = extract_number(pred_text)
                 correct = (predicted == problem["answer"])
-                reward = 1.0 if correct else -1.0
+                reward = graded_reward(predicted, problem["answer"])
         else:
             # Direct: no thinking
             full_text = full_prompt + problem["answer"]
@@ -1529,7 +1547,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 ).strip()
                 predicted = extract_number(pred_text)
                 correct = (predicted == problem["answer"])
-                reward = 1.0 if correct else -1.0
+                reward = graded_reward(predicted, problem["answer"])
         all_rewards.append(reward)
 
         # Update context buffer: show the correct answer (feedback)
@@ -1586,7 +1604,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Logging
         if step % 100 == 0 and step > 0:
             recent = all_rewards[-100:]
-            acc = sum(1 for r in recent if r > 0) / len(recent)
+            acc = sum(1 for r in recent if r == 1.0) / len(recent)  # exact match only
             avg_r = sum(recent) / len(recent)
             neuromod_str = ""
             if hasattr(mach, '_last_etas') and mach._last_etas is not None:
