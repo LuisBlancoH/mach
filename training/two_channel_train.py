@@ -1303,11 +1303,16 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
             first_half = sum(1 for r in rewards[:mid] if r > 0) / max(mid, 1)
             second_half = sum(1 for r in rewards[mid:] if r > 0) / max(n_total - mid, 1)
 
+            neuromod_str = ""
+            if hasattr(mach, 'eta_scale'):
+                eta_val = torch.sigmoid(mach.eta_scale * abs(mach._last_td_error) if hasattr(mach, '_last_td_error') else mach.eta_scale).item()
+                decay_val = torch.sigmoid(mach.decay_base).item()
+                neuromod_str = f" | η={eta_val:.3f} decay={decay_val:.3f}"
             print(
                 f"Episode {episode_idx:4d} | {mode} n={n_total:2d} | "
                 f"ce={loss_scalar:.4f} critic={critic_scalar:.4f} | "
                 f"acc={test_acc:.0%} 1st={first_half:.0%} 2nd={second_half:.0%} | "
-                f"avg_r={avg_reward:.2f}"
+                f"avg_r={avg_reward:.2f}{neuromod_str}"
             )
 
             if wandb is not None:
@@ -1489,9 +1494,14 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             recent = all_rewards[-100:]
             acc = sum(1 for r in recent if r > 0) / len(recent)
             avg_r = sum(recent) / len(recent)
+            neuromod_str = ""
+            if hasattr(mach, 'eta_scale'):
+                eta_val = torch.sigmoid(mach.eta_scale * abs(mach._last_td_error) if hasattr(mach, '_last_td_error') else mach.eta_scale).item()
+                decay_val = torch.sigmoid(mach.decay_base).item()
+                neuromod_str = f" | η={eta_val:.3f} decay={decay_val:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
-                f"acc(100)={acc:.0%} avg_r={avg_r:.2f}"
+                f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
             )
             if wandb is not None:
                 wandb.log({
