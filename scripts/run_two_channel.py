@@ -158,6 +158,12 @@ def main():
                         help="Max thinking tokens for CoT (default: 32)")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
+    parser.add_argument("--continuous", action="store_true",
+                        help="Continuous training: no episodes, no resets, truncated backprop")
+    parser.add_argument("--truncation-window", type=int, default=20,
+                        help="Truncated backprop window for continuous training (default: 20)")
+    parser.add_argument("--n-steps", type=int, default=40000,
+                        help="Total steps for continuous training (default: 40000)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -504,6 +510,16 @@ def main():
             mach.eval()
             ablate_hebbian(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,
+            )
+        elif args.continuous:
+            from training.two_channel_train import meta_train_continuous
+            meta_train_continuous(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+                n_steps=args.n_steps, lr=args.lr,
+                truncation_window=args.truncation_window,
+                checkpoint_path=args.checkpoint,
+                save_path=save_path,
+                curriculum=curriculum,
             )
         else:
             meta_train_hebbian(

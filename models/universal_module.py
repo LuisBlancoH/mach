@@ -44,21 +44,18 @@ class DifferentiablePatch(nn.Module):
         self.delta_gain = None  # multiplicative gain vector (d_model,)
 
     def reset_deltas(self, use_slow=False):
-        """Call at start of each episode.
-        If use_slow=True, initialize from consolidated slow memory.
+        """Zero fast deltas. Slow memory remains active in forward().
+        use_slow is ignored (kept for API compatibility) — slow memory
+        is always used as the base weights now.
         """
-        if use_slow:
-            self.delta_down = self.slow_down.clone()
-            self.delta_up = self.slow_up.clone()
-        else:
-            self.delta_down = torch.zeros(
-                self.hidden_dim, self.d_model, device=self.down_base.device
-            )
-            self.delta_up = torch.zeros(
-                self.d_model, self.hidden_dim, device=self.up_base.device
-            )
+        self.delta_down = torch.zeros(
+            self.hidden_dim, self.d_model, device=self.slow_down.device
+        )
+        self.delta_up = torch.zeros(
+            self.d_model, self.hidden_dim, device=self.slow_up.device
+        )
         self.delta_gain = torch.zeros(
-            self.d_model, device=self.down_base.device
+            self.d_model, device=self.slow_down.device
         )
 
     def consolidate(self, decay=0.95):
@@ -92,9 +89,12 @@ class DifferentiablePatch(nn.Module):
         return self.delta_gain if self.delta_gain is not None else 0
 
     def forward(self, hidden_states):
-        """Forward with base + accumulated deltas. Operates in float32."""
-        W_down = self.down_base + (self.delta_down if self.delta_down is not None else 0)
-        W_up = self.up_base + (self.delta_up if self.delta_up is not None else 0)
+        """Forward with slow memory + fast deltas. Operates in float32.
+        slow_down/slow_up: consolidated long-term memory (always active)
+        delta_down/delta_up: fast adaptation (decays, comes and goes)
+        """
+        W_down = self.slow_down + (self.delta_down if self.delta_down is not None else 0)
+        W_up = self.slow_up + (self.delta_up if self.delta_up is not None else 0)
 
         h = torch.nn.functional.linear(hidden_states, W_down)
         h = self.act(h)

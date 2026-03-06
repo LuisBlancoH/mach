@@ -1375,6 +1375,153 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                 print(f"  Checkpoint saved to {save_path}")
 
 
+def meta_train_continuous(base_model, mach, patched_model, tokenizer,
+                          device, n_steps=40000, lr=None,
+                          truncation_window=20, checkpoint_path=None,
+                          save_path=None, curriculum=None):
+    """
+    Continuous Hebbian training: no episodes, no resets.
+
+    Problems arrive in an endless stream. Truncated backprop every
+    `truncation_window` steps (computational necessity, not a semantic
+    boundary). Patches and slow memory persist across everything.
+
+    This matches deployment: the model must manage its own plasticity.
+    """
+    if lr is None:
+        lr = config.PHASE5_LR
+    if curriculum is None:
+        curriculum = CONTINUOUS_LINEAR_CURRICULUM
+
+    if checkpoint_path is not None:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        mach.load_state_dict(state_dict, strict=False)
+
+    meta_params = list(mach.parameters())
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
+
+    n_meta = sum(p.numel() for p in meta_params)
+    print(f"Continuous training: {n_meta:,} params, {n_steps} steps, "
+          f"truncation every {truncation_window}")
+
+    # Initialize patches once — never reset
+    mach.reset_episode()
+
+    # Running stats
+    window_ce = torch.tensor(0.0, device=device, requires_grad=True)
+    window_critic_losses = []
+    all_rewards = []
+    current_op = random.choice(DIVERSE_TRAIN_OPS)
+    op_step_count = 0
+    op_switch_interval = random.randint(10, 60)  # random task duration
+
+    for step in range(n_steps):
+        # Switch operation randomly (like encountering different tasks)
+        op_step_count += 1
+        if op_step_count >= op_switch_interval:
+            current_op = random.choice(DIVERSE_TRAIN_OPS)
+            op_step_count = 0
+            op_switch_interval = random.randint(10, 60)
+
+        # Generate one problem
+        problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
+        problem = problems[0]
+
+        # Forward pass
+        full_text = problem["prompt"] + problem["answer"]
+        encoding = tokenizer(full_text, return_tensors="pt").to(device)
+        prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+        labels = encoding.input_ids.clone()
+        labels[0, :prompt_len] = -100
+
+        output = patched_model(input_ids=encoding.input_ids, labels=labels)
+        window_ce = window_ce + output.loss
+
+        # Compute reward
+        with torch.no_grad():
+            logits = output.logits
+            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+            pred_text = tokenizer.decode(
+                pred_tokens, skip_special_tokens=True
+            ).strip()
+            predicted = extract_number(pred_text)
+            correct = (predicted == problem["answer"])
+            reward = 1.0 if correct else -1.0
+        all_rewards.append(reward)
+
+        # Hebbian step (no episode info — step_idx and n_steps are meaningless)
+        value, _ = mach.hebbian_step(reward, 0, 1, device)
+
+        # Critic loss
+        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
+        critic_loss = (value - critic_target) ** 2
+        window_critic_losses.append(critic_loss)
+
+        # Truncated backprop every N steps
+        if (step + 1) % truncation_window == 0:
+            avg_critic = torch.stack(window_critic_losses).mean()
+            total_loss = window_ce + 0.1 * avg_critic
+            total_loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                meta_params, max_norm=config.PHASE5_GRAD_CLIP
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # Detach patch deltas (break computation graph, keep values)
+            for patch in mach.patches:
+                if patch.delta_down is not None:
+                    patch.delta_down = patch.delta_down.detach()
+                if patch.delta_up is not None:
+                    patch.delta_up = patch.delta_up.detach()
+                if patch.delta_gain is not None:
+                    patch.delta_gain = patch.delta_gain.detach()
+
+            # Reset window accumulators
+            window_ce = torch.tensor(0.0, device=device, requires_grad=True)
+            window_critic_losses = []
+
+        # Logging
+        if step % 100 == 0 and step > 0:
+            recent = all_rewards[-100:]
+            acc = sum(1 for r in recent if r > 0) / len(recent)
+            avg_r = sum(recent) / len(recent)
+            print(
+                f"Step {step:5d} | op={current_op:<10} | "
+                f"acc(100)={acc:.0%} avg_r={avg_r:.2f}"
+            )
+            if wandb is not None:
+                wandb.log({
+                    "step": step,
+                    "accuracy_100": acc,
+                    "avg_reward_100": avg_r,
+                    "current_op": current_op,
+                })
+
+        # Diagnostics + checkpoint
+        if step % 2000 == 0 and step > 0:
+            _log_hebbian_diagnostics(mach, meta_params, step)
+
+            # Quick validation
+            print(f"  --- Operation validation (step {step}) ---")
+            eval_ops = DIVERSE_TRAIN_OPS[:6]
+            mach_training = mach.training
+            mach.eval()
+            for op in eval_ops:
+                _run_op_validation_hebbian(
+                    base_model, mach, patched_model,
+                    tokenizer, device, op, step,
+                )
+            if mach_training:
+                mach.train()
+
+            if save_path:
+                torch.save(mach.state_dict(), save_path)
+                print(f"  Checkpoint saved to {save_path}")
+
+
 def _run_op_validation_hebbian(base_model, mach, patched_model,
                                tokenizer, device, op_type, episode_idx,
                                n_episodes=10, n_problems=20):
