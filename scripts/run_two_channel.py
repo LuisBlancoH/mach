@@ -23,6 +23,7 @@ from models.universal_module import (
     MACHHebbian, HebbianPatchedModel,
     MACHActivationHebbian, ActivationHebbianPatchedModel,
     MACHDualHebbian, DualHebbianPatchedModel,
+    MACHCoprocessor, CoprocessorPatchedModel,
 )
 from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
@@ -138,6 +139,8 @@ def main():
                         help="Freeze hebb_rule projections (reservoir-style)")
     parser.add_argument("--dual-hebbian", action="store_true",
                         help="Dual Hebbian: residual patches + attention output patches")
+    parser.add_argument("--coprocessor", action="store_true",
+                        help="Coprocessor: virtual tokens + residual patches")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -158,7 +161,94 @@ def main():
 
     base_model, tokenizer, d_model, n_layers = load_base_model()
 
-    if args.dual_hebbian:
+    if args.coprocessor:
+        # MACHCoprocessor: virtual tokens + residual patches
+        arch_name = "coprocessor"
+        n_rank = config.HEBBIAN_N_RANK
+        d_proj = config.HEBBIAN_D_PROJ
+        d_copro = config.COPRO_D_MODEL
+        n_copro_layers = config.COPRO_N_LAYERS
+        n_virt = config.COPRO_N_VIRTUAL_TOKENS
+        run_name = (
+            f"copro-{args.task}"
+            f"-L{n_patch_layers_actual}-C{d_copro}x{n_copro_layers}-V{n_virt}"
+        )
+
+        # Generate patch layers
+        if n_patch_layers_actual == 4:
+            patch_layers = [
+                n_layers // 4, n_layers // 2,
+                3 * n_layers // 4, n_layers - 2,
+            ]
+        else:
+            step = n_layers // n_patch_layers_actual
+            patch_layers = [i * step for i in range(n_patch_layers_actual)]
+            patch_layers = [min(l, n_layers - 2) for l in patch_layers]
+
+        print(f"Patch layers ({len(patch_layers)}): {patch_layers}")
+        print(f"Coprocessor: d={d_copro}, layers={n_copro_layers}, virtual_tokens={n_virt}")
+
+        mach = MACHCoprocessor(
+            d_model=d_model,
+            n_layers=n_layers,
+            patch_layers=patch_layers,
+            hidden_dim=config.PATCH_HIDDEN_DIM,
+            d_copro=d_copro,
+            n_copro_layers=n_copro_layers,
+            n_virtual_tokens=n_virt,
+            n_rank=n_rank,
+            d_proj=d_proj,
+        ).to(config.DEVICE)
+
+        n_params = sum(p.numel() for p in mach.parameters())
+        print(f"MACHCoprocessor total parameters: {n_params:,}")
+
+        patched_model = CoprocessorPatchedModel(base_model, mach)
+
+        save_path = (
+            f"checkpoints/copro_{args.task}"
+            f"_L{n_patch_layers_actual}_C{d_copro}x{n_copro_layers}_V{n_virt}.pt"
+        )
+        os.makedirs("checkpoints", exist_ok=True)
+
+        if wandb is not None:
+            wandb.init(
+                project="mach",
+                name=run_name,
+                config={
+                    "base_model": config.BASE_MODEL,
+                    "d_copro": d_copro,
+                    "n_copro_layers": n_copro_layers,
+                    "n_virtual_tokens": n_virt,
+                    "n_rank": n_rank,
+                    "d_proj": d_proj,
+                    "n_patch_layers": n_patch_layers_actual,
+                    "lr": args.lr or config.PHASE5_LR,
+                    "episodes": args.episodes or config.PHASE5_EPISODES,
+                    "architecture": "coprocessor",
+                    "task": args.task,
+                    "device": str(config.DEVICE),
+                },
+            )
+
+        if args.ablate:
+            if args.checkpoint:
+                mach.load_state_dict(torch.load(args.checkpoint, map_location=config.DEVICE))
+                print(f"Loaded checkpoint: {args.checkpoint}")
+            mach.eval()
+            ablate_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+            )
+        else:
+            meta_train_hebbian(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+                n_episodes=args.episodes, lr=args.lr,
+                checkpoint_path=args.checkpoint,
+                save_path=save_path,
+                curriculum=curriculum,
+            )
+
+    elif args.dual_hebbian:
         # MACHDualHebbian: residual patches + attention output patches
         arch_name = "dual_hebbian"
         n_rank = config.HEBBIAN_N_RANK

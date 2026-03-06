@@ -926,6 +926,13 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
                 diag[f"attn_patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
                 diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
 
+    # Coprocessor stats (only for MACHCoprocessor)
+    if hasattr(mach, 'coprocessor'):
+        copro = mach.coprocessor
+        diag["copro/output_scale"] = copro.output_scale.item()
+        diag["copro/input_proj_norm"] = copro.input_proj.weight.norm().item()
+        diag["copro/output_proj_norm"] = copro.output_proj.weight.norm().item()
+
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
         print(f"    {k}: {v:.6f}")
@@ -1470,6 +1477,13 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
             if patch.delta_down is not None:
                 diag[f"attn_patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
                 diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
+
+    # Coprocessor stats (only for MACHCoprocessor)
+    if hasattr(mach, 'coprocessor'):
+        copro = mach.coprocessor
+        diag["copro/output_scale"] = copro.output_scale.item()
+        diag["copro/input_proj_norm"] = copro.input_proj.weight.norm().item()
+        diag["copro/output_proj_norm"] = copro.output_proj.weight.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
