@@ -917,6 +917,13 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
             diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
             diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
 
+    # Attention patch stats (only for MACHDualHebbian)
+    if hasattr(mach, 'attn_patches'):
+        for i, patch in enumerate(mach.attn_patches):
+            if patch.delta_down is not None:
+                diag[f"attn_patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
+                diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
+
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
         print(f"    {k}: {v:.6f}")
@@ -1443,6 +1450,13 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         for i in range(mach.basis.n_patches):
             diag[f"basis_norm/patch{i}_down_U"] = mach.basis.down_U[i].norm().item()
             diag[f"basis_norm/patch{i}_down_V"] = mach.basis.down_V[i].norm().item()
+
+    # Attention patch stats (only for MACHDualHebbian)
+    if hasattr(mach, 'attn_patches'):
+        for i, patch in enumerate(mach.attn_patches):
+            if patch.delta_down is not None:
+                diag[f"attn_patch_delta/patch{i}_down"] = patch.delta_down.norm().item()
+                diag[f"attn_patch_delta/patch{i}_up"] = patch.delta_up.norm().item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

@@ -2604,3 +2604,266 @@ class ActivationHebbianPatchedModel(nn.Module):
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
+
+
+class AttentionPatch(nn.Module):
+    """
+    Small MLP that produces attention output corrections.
+    Same structure as DifferentiablePatch but smaller hidden dim (64 vs 256).
+    Base weights are zero buffers; accumulated deltas via Hebbian updates.
+    """
+
+    def __init__(self, d_model, hidden_dim=64):
+        super().__init__()
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.act = nn.GELU()
+
+        # Base weights fixed at zero
+        self.register_buffer('down_base', torch.zeros(hidden_dim, d_model))
+        self.register_buffer('up_base', torch.zeros(d_model, hidden_dim))
+
+        # Accumulated deltas
+        self.delta_down = None
+        self.delta_up = None
+
+    def reset_deltas(self):
+        self.delta_down = torch.zeros(
+            self.hidden_dim, self.d_model, device=self.down_base.device
+        )
+        self.delta_up = torch.zeros(
+            self.d_model, self.hidden_dim, device=self.up_base.device
+        )
+
+    def accumulate_write(self, weight_name, delta_W):
+        if weight_name == "down":
+            self.delta_down = self.delta_down + delta_W
+        else:
+            self.delta_up = self.delta_up + delta_W
+
+    def forward(self, hidden_states):
+        W_down = self.down_base + (self.delta_down if self.delta_down is not None else 0)
+        W_up = self.up_base + (self.delta_up if self.delta_up is not None else 0)
+
+        h = torch.nn.functional.linear(hidden_states, W_down)
+        h = self.act(h)
+        h = torch.nn.functional.linear(h, W_up)
+        return h
+
+
+class MACHDualHebbian(nn.Module):
+    """
+    Dual Hebbian: residual patches + attention output patches.
+
+    Extends MACHActivationHebbian with AttentionPatch per layer that modifies
+    attention output before the residual connection. Both patch types use
+    independent ActivationHebbianRule instances.
+    """
+
+    def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
+                 attn_hidden_dim=64, n_rank=2, d_proj=32,
+                 exploration_noise=0.3, init_std=0.001):
+        super().__init__()
+        from config import GATE_SCALE
+        self.d_model = d_model
+        self.n_patches = len(patch_layers)
+        self.patch_layers = patch_layers
+        self.n_rank = n_rank
+        self.gate_scale = GATE_SCALE
+        self.exploration_noise = exploration_noise
+        self.init_std = init_std
+
+        # Residual patches (existing)
+        self.patches = nn.ModuleList([
+            DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
+        ])
+
+        # Attention patches (NEW)
+        self.attn_patches = nn.ModuleList([
+            AttentionPatch(d_model, attn_hidden_dim) for _ in patch_layers
+        ])
+
+        # Hebbian rules: one for residual, one for attention
+        self.hebb_rule = ActivationHebbianRule(
+            d_model, hidden_dim, len(patch_layers), n_rank, d_proj
+        )
+        self.attn_hebb_rule = ActivationHebbianRule(
+            d_model, attn_hidden_dim, len(patch_layers), n_rank, d_proj
+        )
+
+        # Critic (basal ganglia)
+        d_critic_in = len(patch_layers) * d_proj
+        self.critic_proj = nn.Linear(d_critic_in, 64)
+        self.critic = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),
+        )
+
+        # Adaptive learning rate
+        self.eta_head = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.GELU(),
+            nn.Linear(32, len(patch_layers)),
+            nn.Softplus(),
+        )
+
+        # State: separate pre/post for residual and attention hooks
+        self._pre_activations = {}
+        self._post_activations = {}
+        self._attn_pre = {}
+        self._attn_post = {}
+
+    def reset_episode(self):
+        for patch in self.patches:
+            patch.reset_deltas()
+            if self.init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
+        for patch in self.attn_patches:
+            patch.reset_deltas()
+            if self.init_std > 0:
+                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
+        self._pre_activations.clear()
+        self._post_activations.clear()
+        self._attn_pre.clear()
+        self._attn_post.clear()
+
+    def get_activation_summary(self):
+        summaries = []
+        for i in range(self.n_patches):
+            pre = self._pre_activations.get(i)
+            if pre is not None:
+                compressed = self.hebb_rule.compress[i](pre.float())
+                while compressed.dim() > 1:
+                    compressed = compressed.mean(dim=0)
+                summaries.append(compressed)
+            else:
+                summaries.append(torch.zeros(
+                    self.hebb_rule.d_proj,
+                    device=self.patches[0].down_base.device,
+                ))
+        return torch.cat(summaries)
+
+    def hebbian_step(self, reward, step_idx, n_steps, device):
+        act_summary = self.get_activation_summary()
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
+        value = self.critic(self.critic_proj(act_summary)).squeeze(-1)
+
+        modulator = torch.tensor(reward, device=device, dtype=torch.float32)
+
+        step_frac = step_idx / max(n_steps, 1)
+        eta_input = torch.tensor(
+            [reward, reward, step_frac], device=device,
+        )
+        etas = self.eta_head(eta_input).clamp(max=1.0)
+
+        for patch_idx in range(self.n_patches):
+            gate = (etas[patch_idx] * modulator * self.gate_scale).clamp(-1.0, 1.0)
+
+            # Residual patch update
+            if patch_idx in self._pre_activations:
+                delta_down, delta_up = self.hebb_rule.compute_update(
+                    patch_idx,
+                    self._pre_activations[patch_idx],
+                    self._post_activations[patch_idx],
+                    gate,
+                    exploration_noise=self.exploration_noise,
+                    training=self.training,
+                )
+                self.patches[patch_idx].accumulate_write("down", delta_down)
+                self.patches[patch_idx].accumulate_write("up", delta_up)
+
+            # Attention patch update
+            if patch_idx in self._attn_pre:
+                delta_down_a, delta_up_a = self.attn_hebb_rule.compute_update(
+                    patch_idx,
+                    self._attn_pre[patch_idx],
+                    self._attn_post[patch_idx],
+                    gate,
+                    exploration_noise=self.exploration_noise,
+                    training=self.training,
+                )
+                self.attn_patches[patch_idx].accumulate_write("down", delta_down_a)
+                self.attn_patches[patch_idx].accumulate_write("up", delta_up_a)
+
+        return value, modulator
+
+
+class DualHebbianPatchedModel(nn.Module):
+    """Wraps Qwen with both residual patches and attention output patches."""
+
+    def __init__(self, base_model, mach):
+        super().__init__()
+        self.base_model = base_model
+        self.mach = mach
+        self._hooks = []
+        self._register_hooks()
+
+    def _register_hooks(self):
+        for i, layer_idx in enumerate(self.mach.patch_layers):
+            layer = self.base_model.model.layers[layer_idx]
+            self_attn = layer.self_attn
+
+            # Attention output hook (NEW)
+            def make_attn_hook(patch_idx):
+                def hook(module, args, kwargs, output):
+                    h_in = kwargs['hidden_states']  # (batch, seq, d_model)
+                    attn_out = output[0]             # (batch, seq, d_model)
+
+                    self.mach._attn_pre[patch_idx] = h_in.detach()
+
+                    attn_patch = self.mach.attn_patches[patch_idx]
+                    correction = attn_patch(h_in.float())
+                    attn_out_new = attn_out + correction.to(attn_out.dtype)
+
+                    self.mach._attn_post[patch_idx] = attn_out_new.detach()
+
+                    return (attn_out_new,) + output[1:]
+                return hook
+
+            handle_attn = self_attn.register_forward_hook(
+                make_attn_hook(i), with_kwargs=True
+            )
+            self._hooks.append(handle_attn)
+
+            # Residual stream hook (existing pattern)
+            def make_layer_hook(patch_idx):
+                def hook(module, input, output):
+                    patch = self.mach.patches[patch_idx]
+
+                    if isinstance(output, tuple):
+                        h = output[0]
+                    else:
+                        h = output
+
+                    self.mach._pre_activations[patch_idx] = h.detach()
+
+                    patch_out = patch(h.float())
+                    gain = patch.get_gain()
+                    h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+
+                    self.mach._post_activations[patch_idx] = h_new.detach()
+
+                    if isinstance(output, tuple):
+                        return (h_new,) + output[1:]
+                    return h_new
+                return hook
+
+            handle_layer = layer.register_forward_hook(make_layer_hook(i))
+            self._hooks.append(handle_layer)
+
+    @property
+    def device(self):
+        return self.base_model.device
+
+    def forward(self, input_ids, labels=None, attention_mask=None):
+        return self.base_model(
+            input_ids=input_ids, labels=labels, attention_mask=attention_mask
+        )
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
