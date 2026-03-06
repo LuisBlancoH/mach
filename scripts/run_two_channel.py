@@ -27,7 +27,7 @@ from training.two_channel_train import (
     meta_train_two_channel, meta_train_demoread, meta_train_hebbian,
     ablate_hebbian,
     CONTINUOUS_LINEAR_CURRICULUM, TOKEN_MAP_CURRICULUM, MIXED_CURRICULUM,
-    FEW_SHOT_BASIC_CURRICULUM,
+    FEW_SHOT_BASIC_CURRICULUM, DIVERSE_OPS_CURRICULUM,
 )
 
 
@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument(
         "--task", type=str, default="continuous_linear",
-        choices=["continuous_linear", "token_map", "mixed", "few_shot_basic"],
+        choices=["continuous_linear", "token_map", "mixed", "few_shot_basic", "diverse_ops"],
     )
     parser.add_argument("--d-task", type=int, default=None)
     parser.add_argument("--d-obs", type=int, default=96)
@@ -143,6 +143,8 @@ def main():
         curriculum = MIXED_CURRICULUM
     elif args.task == "few_shot_basic":
         curriculum = FEW_SHOT_BASIC_CURRICULUM
+    elif args.task == "diverse_ops":
+        curriculum = DIVERSE_OPS_CURRICULUM
     else:
         curriculum = CONTINUOUS_LINEAR_CURRICULUM
 

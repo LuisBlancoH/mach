@@ -40,6 +40,18 @@ FEW_SHOT_BASIC_CURRICULUM = [
     (0, 5000, "few_shot_basic"),
 ]
 
+# Diverse ops for generalization training
+# Train on 12 ops, hold out 3 for generalization testing
+DIVERSE_TRAIN_OPS = [
+    "add", "sub", "mul", "div", "mod", "max", "min",
+    "gcd", "abs_diff", "avg", "first", "second",
+]
+DIVERSE_HELDOUT_OPS = ["digit_sum_add", "bitwise_and", "bitwise_xor"]
+
+DIVERSE_OPS_CURRICULUM = [
+    (0, 5000, "few_shot_diverse"),
+]
+
 
 def get_episode_mode(episode_idx, curriculum):
     for start, end, mode in curriculum:
@@ -61,6 +73,10 @@ def generate_episode_problems(n_problems, mode):
     elif mode == "few_shot_basic":
         # Only basic ops (add/sub/mul/div), all as test problems (no demos)
         op = random.choice(["add", "sub", "mul", "div"])
+        return generate_few_shot_episode(n_problems, n_demos=0, op_type=op)
+    elif mode == "few_shot_diverse":
+        # 12 diverse ops for generalization training
+        op = random.choice(DIVERSE_TRAIN_OPS)
         return generate_few_shot_episode(n_problems, n_demos=0, op_type=op)
     else:
         return generate_few_shot_episode(n_problems)
@@ -1195,9 +1211,13 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                         tokenizer, device, coeffs, episode_idx,
                     )
 
-            if mode in ("few_shot_basic", "few_shot"):
+            if mode in ("few_shot_basic", "few_shot", "few_shot_diverse"):
+                if mode == "few_shot_diverse":
+                    eval_ops = DIVERSE_TRAIN_OPS[:6]  # sample of trained ops
+                else:
+                    eval_ops = ["add", "sub", "mul", "div"]
                 print(f"  --- Operation classification ---")
-                for op in ["add", "sub", "mul", "div"]:
+                for op in eval_ops:
                     _run_op_validation_hebbian(
                         base_model, mach, patched_model,
                         tokenizer, device, op, episode_idx,
@@ -1274,7 +1294,10 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
     - INIT ONLY: reset once (gets random init), forward all, NO updates
     This tells us if the Hebbian updates contribute beyond random init + static basis.
     """
-    ops = ["add", "sub", "mul", "div", "mod", "max", "min"]
+    # Use diverse sets if available, otherwise basic + original held-out
+    all_train = DIVERSE_TRAIN_OPS
+    all_heldout = DIVERSE_HELDOUT_OPS
+    ops = all_train + all_heldout
     results = {"with_hebbian": {}, "no_update": {}, "no_init": {}}
 
     for op in ops:
@@ -1357,8 +1380,8 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
         mach.init_std = old_init_std
         results["no_init"][op] = correct_zero / max(total_zero, 1)
 
-    trained_ops = ["add", "sub", "mul", "div"]
-    heldout_ops = [op for op in ops if op not in trained_ops]
+    trained_ops = all_train
+    heldout_ops = all_heldout
 
     print("\n  === HEBBIAN ABLATION ===")
     print(f"  {'op':4s} | {'with_hebb':>10s} | {'no_update':>10s} | {'no_init':>10s}")

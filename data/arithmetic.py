@@ -74,6 +74,18 @@ def extract_number(text):
     return None
 
 
+def _digit_sum(n):
+    """Sum of digits of abs(n)."""
+    return sum(int(d) for d in str(abs(n)))
+
+
+def _gcd(a, b):
+    """Greatest common divisor."""
+    while b:
+        a, b = b, a % b
+    return a
+
+
 def _make_operands(op_type):
     """
     Generate operands with UNIFORM ranges across all operations.
@@ -87,7 +99,7 @@ def _make_operands(op_type):
     a = random.randint(10, 99)
     b = random.randint(10, 99)
 
-    if op_type in ("sub", "div") and b > a:
+    if op_type in ("sub", "div", "mod") and b > a:
         a, b = b, a
 
     if op_type == "add":
@@ -104,6 +116,22 @@ def _make_operands(op_type):
         return a, b, max(a, b)
     elif op_type == "min":
         return a, b, min(a, b)
+    elif op_type == "gcd":
+        return a, b, _gcd(a, b)
+    elif op_type == "abs_diff":
+        return a, b, abs(a - b)
+    elif op_type == "avg":
+        return a, b, (a + b) // 2
+    elif op_type == "digit_sum_add":
+        return a, b, _digit_sum(a + b)
+    elif op_type == "bitwise_and":
+        return a, b, a & b
+    elif op_type == "bitwise_xor":
+        return a, b, a ^ b
+    elif op_type == "first":
+        return a, b, a
+    elif op_type == "second":
+        return a, b, b
     else:
         raise ValueError(f"Unknown op_type: {op_type}")
 
