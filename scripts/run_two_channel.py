@@ -148,6 +148,10 @@ def main():
                         help="Enable memory consolidation across episodes")
     parser.add_argument("--ema-decay", type=float, default=0.95,
                         help="EMA decay for consolidation (default: 0.95)")
+    parser.add_argument("--cot", action="store_true",
+                        help="Chain of thought: model generates thinking tokens before answering")
+    parser.add_argument("--max-thinking", type=int, default=32,
+                        help="Max thinking tokens for CoT (default: 32)")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -251,6 +255,8 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                chain_of_thought=args.cot,
+                max_thinking_tokens=args.max_thinking,
             )
 
     elif args.dense_hebbian:
@@ -328,6 +334,8 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                chain_of_thought=args.cot,
+                max_thinking_tokens=args.max_thinking,
             )
 
     elif args.dual_hebbian:
@@ -409,6 +417,8 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                chain_of_thought=args.cot,
+                max_thinking_tokens=args.max_thinking,
             )
 
     elif args.act_hebbian:
@@ -492,6 +502,8 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                chain_of_thought=args.cot,
+                max_thinking_tokens=args.max_thinking,
             )
 
     elif args.hebbian:
@@ -566,6 +578,8 @@ def main():
                 checkpoint_path=args.checkpoint,
                 save_path=save_path,
                 curriculum=curriculum,
+                chain_of_thought=args.cot,
+                max_thinking_tokens=args.max_thinking,
             )
 
     elif args.demoread or args.oracle or args.oracle_minimal:

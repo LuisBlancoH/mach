@@ -1119,10 +1119,100 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
     return total_ce, rewards, problem_losses, avg_critic_loss
 
 
+def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
+                            problems, device, max_thinking_tokens=32):
+    """
+    Chain-of-thought Hebbian episode: model generates thinking tokens
+    before answering. Patches steer every generation step.
+
+    For each problem:
+    1. Encode prompt
+    2. Generate up to max_thinking_tokens freely (steered by patches)
+    3. Then force the correct answer tokens for CE loss (training signal)
+    4. Extract generated answer, compute reward
+    5. Hebbian update from reward
+
+    The thinking tokens give the model extra computation time.
+    The CE loss on the correct answer trains the Hebbian rule.
+    """
+    mach.reset_episode()
+
+    rewards = []
+    problem_losses = []
+    total_ce = torch.tensor(0.0, device=device, requires_grad=True)
+    critic_losses = []
+
+    for step, problem in enumerate(problems):
+        prompt_text = problem["prompt"]
+        answer_text = problem["answer"]
+        prompt_ids = tokenizer(prompt_text, return_tensors="pt").input_ids.to(device)
+        prompt_len = prompt_ids.shape[1]
+
+        # Phase 1: Generate thinking tokens (steered, no forced output)
+        with torch.no_grad():
+            generated = prompt_ids
+            for _ in range(max_thinking_tokens):
+                output = patched_model(input_ids=generated)
+                next_token = output.logits[0, -1:].argmax(dim=-1, keepdim=True)
+                generated = torch.cat([generated, next_token], dim=1)
+
+                # Stop if model generates "=" or a newline (it's ready to answer)
+                next_text = tokenizer.decode(next_token[0], skip_special_tokens=False)
+                if "=" in next_text or "\n" in next_text:
+                    break
+
+        # The generated thinking tokens (everything after prompt)
+        thinking_ids = generated[0, prompt_len:]
+
+        # Phase 2: Forward pass with thinking + correct answer for CE loss
+        # Context: prompt + thinking + answer
+        answer_ids = tokenizer(answer_text, return_tensors="pt",
+                               add_special_tokens=False).input_ids.to(device)
+        full_ids = torch.cat([generated, answer_ids], dim=1)
+
+        labels = full_ids.clone()
+        # Only compute loss on answer tokens (not prompt, not thinking)
+        labels[0, :generated.shape[1]] = -100
+
+        output = patched_model(input_ids=full_ids, labels=labels)
+        total_ce = total_ce + output.loss
+        problem_losses.append(output.loss.item())
+
+        # Phase 3: Check if model's generated answer was correct
+        with torch.no_grad():
+            # Look at what the model predicted right after thinking
+            gen_logits = output.logits[0, generated.shape[1] - 1:-1]
+            pred_tokens = gen_logits.argmax(dim=-1)
+            pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+
+            if problem.get("difficulty") == "token_map":
+                correct = (pred_text == answer_text)
+            else:
+                predicted = extract_number(pred_text)
+                correct = (predicted == answer_text)
+            reward = 1.0 if correct else -1.0
+        rewards.append(reward)
+
+        # Phase 4: Hebbian step
+        value, td_error = mach.hebbian_step(
+            reward, step, len(problems), device
+        )
+
+        # Phase 5: Critic loss
+        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
+        critic_loss = (value - critic_target) ** 2
+        critic_losses.append(critic_loss)
+
+    avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
+
+    return total_ce, rewards, problem_losses, avg_critic_loss
+
+
 def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                        device, n_episodes=None, lr=None,
                        curriculum=None, checkpoint_path=None,
-                       save_path=None):
+                       save_path=None, chain_of_thought=False,
+                       max_thinking_tokens=32):
     """Hebbian meta-training loop."""
     if n_episodes is None:
         n_episodes = config.PHASE5_EPISODES
@@ -1157,10 +1247,15 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
 
         optimizer.zero_grad()
 
+        episode_fn = run_episode_hebbian_cot if chain_of_thought else run_episode_hebbian
+        episode_kwargs = {}
+        if chain_of_thought:
+            episode_kwargs["max_thinking_tokens"] = max_thinking_tokens
+
         try:
-            ce_loss, rewards, problem_losses, critic_loss = run_episode_hebbian(
+            ce_loss, rewards, problem_losses, critic_loss = episode_fn(
                 base_model, mach, patched_model, tokenizer,
-                problems, device,
+                problems, device, **episode_kwargs,
             )
 
             total_loss = ce_loss + 0.1 * critic_loss
@@ -1173,9 +1268,9 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
             torch.cuda.empty_cache()
             optimizer.zero_grad()
             problems = problems[:max(5, len(problems) // 2)]
-            ce_loss, rewards, problem_losses, critic_loss = run_episode_hebbian(
+            ce_loss, rewards, problem_losses, critic_loss = episode_fn(
                 base_model, mach, patched_model, tokenizer,
-                problems, device,
+                problems, device, **episode_kwargs,
             )
             total_loss = ce_loss + 0.1 * critic_loss
             total_loss.backward()
