@@ -122,6 +122,8 @@ def main():
     parser.add_argument("--d-task", type=int, default=None)
     parser.add_argument("--d-obs", type=int, default=96)
     parser.add_argument("--n-basis", type=int, default=None)
+    parser.add_argument("--n-rank", type=int, default=None,
+                        help="Hebbian update rank (default: config.HEBBIAN_N_RANK=2)")
     parser.add_argument("--n-patch-layers", type=int, default=None)
     parser.add_argument("--n-prims", type=int, default=None)
     parser.add_argument("--write-cost-scale", type=float, default=None)
@@ -185,7 +187,7 @@ def main():
     if args.coprocessor:
         # MACHCoprocessor: direct injection (read early layer → process → inject at later layer)
         arch_name = "coprocessor"
-        n_rank = config.HEBBIAN_N_RANK
+        n_rank = args.n_rank if args.n_rank is not None else config.HEBBIAN_N_RANK
         d_proj = config.HEBBIAN_D_PROJ
         d_copro = config.COPRO_D_MODEL
         n_copro_layers = config.COPRO_N_LAYERS
@@ -273,7 +275,7 @@ def main():
     elif args.dense_hebbian:
         # MACHDenseHebbian: 12+ layers + top-down gain modulation
         arch_name = "dense_hebbian"
-        n_rank = config.HEBBIAN_N_RANK
+        n_rank = args.n_rank if args.n_rank is not None else config.HEBBIAN_N_RANK
         d_proj = config.HEBBIAN_D_PROJ
         dense_hidden = 64  # smaller patches, more layers
         n_dense_layers = n_patch_layers_actual if n_patch_layers_actual >= 8 else 12
@@ -354,7 +356,7 @@ def main():
     elif args.dual_hebbian:
         # MACHDualHebbian: residual patches + attention output patches
         arch_name = "dual_hebbian"
-        n_rank = config.HEBBIAN_N_RANK
+        n_rank = args.n_rank if args.n_rank is not None else config.HEBBIAN_N_RANK
         d_proj = config.HEBBIAN_D_PROJ
         attn_hidden = config.ATTN_PATCH_HIDDEN_DIM
         run_name = (
@@ -438,7 +440,7 @@ def main():
     elif args.act_hebbian:
         # MACHActivationHebbian: activation-derived Hebbian (no basis vectors)
         arch_name = "act_hebbian"
-        n_rank = config.HEBBIAN_N_RANK
+        n_rank = args.n_rank if args.n_rank is not None else config.HEBBIAN_N_RANK
         d_proj = 128 if args.frozen_proj else config.HEBBIAN_D_PROJ
         frozen = args.frozen_proj
         suffix = "-frozen" if frozen else ""
