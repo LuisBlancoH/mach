@@ -1233,12 +1233,17 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
     print(f"MACHHebbian trainable parameters: {n_meta:,}")
 
     def get_n_problems(episode_idx):
+        import random
         if episode_idx < 100:
             return 10
         elif episode_idx < 300:
-            return 15
+            return random.randint(10, 30)
         else:
-            return config.PHASE5_PROBLEMS_PER_EPISODE
+            # Random length: model can't rely on reset timing
+            # Occasional long episodes (10%) force self-regulation
+            if random.random() < 0.1:
+                return random.randint(100, 200)
+            return random.randint(10, 60)
 
     for episode_idx in range(n_episodes):
         mode = get_episode_mode(episode_idx, curriculum)
