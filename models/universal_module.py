@@ -2504,7 +2504,7 @@ class MACHActivationHebbian(nn.Module):
 
         # Neuromodulation: two learnable scalars (meta-trained via backprop)
         # Like evolution hardwiring dopamine sensitivity — not hand-tuned
-        self.eta_scale = nn.Parameter(torch.tensor(1.0))    # how much |TD error| boosts learning
+        self.eta_scale = nn.Parameter(torch.tensor(0.5))    # how much |TD error| boosts learning
         self.decay_base = nn.Parameter(torch.tensor(0.0))   # baseline memory retention
 
         # State
@@ -2580,8 +2580,8 @@ class MACHActivationHebbian(nn.Module):
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
 
         # Neuromodulation: scalar params → eta and decay
-        # eta: more surprise → more plasticity (dopamine)
-        eta = torch.sigmoid(self.eta_scale * td_error.abs())
+        # eta: more surprise → more plasticity (dopamine). Zero at td_error=0.
+        eta = (self.eta_scale * td_error.abs()).clamp(0.0, 1.0)
         # decay: learned memory timescale (bounded <1 by sigmoid, so patches can't grow unboundedly)
         decay = torch.sigmoid(self.decay_base)
 

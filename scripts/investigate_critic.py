@@ -57,9 +57,9 @@ def investigate(checkpoint_path, n_rank=None, ops=None, n_problems=60):
 
     print(f"\neta_scale={mach.eta_scale.item():.4f}, decay_base={mach.decay_base.item():.4f}")
     print(f"decay = sigmoid(decay_base) = {torch.sigmoid(mach.decay_base).item():.4f}")
-    print(f"eta at td_error=0: sigmoid(0) = 0.500")
-    print(f"eta at td_error=1: sigmoid({mach.eta_scale.item():.3f}) = {torch.sigmoid(mach.eta_scale * torch.tensor(1.0)).item():.4f}")
-    print(f"eta at td_error=2: sigmoid({2*mach.eta_scale.item():.3f}) = {torch.sigmoid(mach.eta_scale * torch.tensor(2.0)).item():.4f}")
+    print(f"eta at td_error=0: clamp(0) = 0.000")
+    print(f"eta at td_error=1: clamp({mach.eta_scale.item():.3f}) = {min(mach.eta_scale.item() * 1.0, 1.0):.4f}")
+    print(f"eta at td_error=2: clamp({2*mach.eta_scale.item():.3f}) = {min(mach.eta_scale.item() * 2.0, 1.0):.4f}")
 
     patched_model = ActivationHebbianPatchedModel(model, mach)
     mach.eval()
