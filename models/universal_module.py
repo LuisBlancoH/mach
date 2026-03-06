@@ -2516,16 +2516,17 @@ class MACHActivationHebbian(nn.Module):
         self.register_buffer('_decay_state', torch.zeros(1, 8))
         self.register_buffer('_expl_state', torch.zeros(1, 8))
 
-        # PFC context gate: task-dependent gating of patch outputs
+        # PFC context gate: task-dependent gating of patch outputs (d_model dimensions)
         # Like PFC → striatum selective disinhibition — same patches, different activation patterns
-        # GRU state (64) → per-patch gate over hidden_dim
+        # Bottleneck: GRU state (64) → 16 → d_model to keep param count reasonable
         self.context_gates = nn.ModuleList([
-            nn.Linear(64, hidden_dim) for _ in patch_layers
+            nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, d_model))
+            for _ in patch_layers
         ])
-        # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default (disinhibited)
+        # Initialize last bias to +1 so sigmoid ≈ 0.73 — mostly open by default (disinhibited)
         with torch.no_grad():
             for gate in self.context_gates:
-                gate.bias.fill_(1.0)
+                gate[-1].bias.fill_(1.0)
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
