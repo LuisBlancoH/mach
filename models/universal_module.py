@@ -29,6 +29,9 @@ class DifferentiablePatch(nn.Module):
         self.hidden_dim = hidden_dim
         self.act = nn.GELU()
 
+        # Device tracker (no parameters/buffers left after removing slow memory)
+        self.register_buffer('_device_tracker', torch.zeros(1))
+
         # Accumulated deltas — set externally, part of computational graph
         self.delta_down = None
         self.delta_up = None
@@ -36,10 +39,7 @@ class DifferentiablePatch(nn.Module):
 
     def reset_deltas(self, use_slow=False):
         """Zero all deltas."""
-        device = next(self.parameters(), torch.tensor(0)).device
-        # Find device from existing deltas or default
-        if self.delta_down is not None:
-            device = self.delta_down.device
+        device = self._device_tracker.device
         self.delta_down = torch.zeros(
             self.hidden_dim, self.d_model, device=device
         )
