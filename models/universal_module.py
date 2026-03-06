@@ -2914,7 +2914,7 @@ class HebbianCoprocessor(nn.Module):
         # proc_patches[0..n_layers-1], out_patches[0..n_virtual_tokens-1]
 
         # Scale factor (meta-trained, starts small)
-        self.output_scale = nn.Parameter(torch.tensor(0.1))
+        self.output_scale = nn.Parameter(torch.tensor(0.01))
 
         # State: pre/post activations for Hebbian updates
         self._copro_pre = {}
