@@ -1610,6 +1610,16 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["gain/min"] = gains.min().item()
         diag["gain/max"] = gains.max().item()
 
+    # Plasticity controller stats
+    if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+        diag["plasticity/eta_mean"] = mach._last_etas.mean().item()
+        diag["plasticity/eta_std"] = mach._last_etas.std().item()
+        diag["plasticity/decay_mean"] = mach._last_decays.mean().item()
+        diag["plasticity/decay_std"] = mach._last_decays.std().item()
+        diag["plasticity/consol_gate_mean"] = mach._last_consol_gates.mean().item()
+        diag["plasticity/consol_gate_std"] = mach._last_consol_gates.std().item()
+        diag["plasticity/reward_ema"] = mach._reward_ema
+
     # Consolidation stats
     if hasattr(mach, 'consolidation') and mach.consolidation:
         slow_norms = []

@@ -2617,6 +2617,11 @@ class MACHActivationHebbian(nn.Module):
         decays = torch.sigmoid(plasticity_out[:, 1])         # [0, 1] how much to retain
         consol_gates = torch.sigmoid(plasticity_out[:, 2])   # [0, 1] how much to consolidate
 
+        # Store for diagnostics
+        self._last_etas = etas.detach()
+        self._last_decays = decays.detach()
+        self._last_consol_gates = consol_gates.detach()
+
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
                 gate = (etas[patch_idx] * modulator * self.gate_scale).clamp(-1.0, 1.0)
