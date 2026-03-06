@@ -2537,9 +2537,10 @@ class MACHActivationHebbian(nn.Module):
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
         # eta: sigmoid(-0.5) ≈ 0.38 — moderate learning rate
         # expl: sigmoid(0.0) = 0.5 — default exploration (no bias needed)
+        # Adjusted for tonic+phasic range: eta=0.1+0.9*sigmoid(x), decay=0.1+0.9*sigmoid(x)
         with torch.no_grad():
-            self.decay_out.bias.fill_(2.0)
-            self.eta_out.bias.fill_(-0.5)
+            self.decay_out.bias.fill_(1.87)   # → decay ≈ 0.88
+            self.eta_out.bias.fill_(-0.80)    # → eta ≈ 0.38
 
         # State
         self._pre_activations = {}
@@ -2649,9 +2650,11 @@ class MACHActivationHebbian(nn.Module):
         self._decay_state = self.decay_gru(h_unsq, self._decay_state)
         self._expl_state = self.expl_gru(h_unsq, self._expl_state)
 
-        etas = torch.sigmoid(self.eta_out(self._eta_state.squeeze(0)))        # (n_patches,)
-        decays = torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # (n_patches,)
-        expls = torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) * 0.5 + self.exploration_noise  # (n_patches,)
+        # Tonic + phasic: hard floor (genetic constraint) + learned modulation
+        # Like tonic dopamine/NE/ACh — always-on baseline that can't be eliminated
+        etas = 0.1 + 0.9 * torch.sigmoid(self.eta_out(self._eta_state.squeeze(0)))        # [0.1, 1.0]
+        decays = 0.1 + 0.9 * torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # [0.1, 1.0]
+        expls = 0.1 + 0.4 * torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) + self.exploration_noise  # [0.1+noise, 0.5+noise]
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
