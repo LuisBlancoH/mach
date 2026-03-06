@@ -2516,14 +2516,16 @@ class MACHActivationHebbian(nn.Module):
         self.register_buffer('_decay_state', torch.zeros(1, 8))
         self.register_buffer('_expl_state', torch.zeros(1, 8))
 
-        # PFC context gate: task-dependent gating of patch outputs (d_model dimensions)
-        # Like PFC → striatum selective disinhibition — same patches, different activation patterns
-        # Bottleneck: GRU state (64) → 16 → d_model to keep param count reasonable
+        # PFC context gate: reads early sensory activations (like PFC reading visual cortex)
+        # Uses pre_activations from first patch layer — contains raw token representations
+        # where the operation symbol (+, -, ×, ÷) is still clearly encoded
+        # Bottleneck: d_model → 32 (compress sensory input) → d_model (per-patch gate)
+        self.context_gate_compress = nn.Linear(d_model, 32)  # shared sensory compression
         self.context_gates = nn.ModuleList([
-            nn.Sequential(nn.Linear(64, 16), nn.ReLU(), nn.Linear(16, d_model))
+            nn.Sequential(nn.Linear(32, 16), nn.ReLU(), nn.Linear(16, d_model))
             for _ in patch_layers
         ])
-        # Initialize last bias to +1 so sigmoid ≈ 0.73 — mostly open by default (disinhibited)
+        # Initialize last bias to +1 so sigmoid ≈ 0.73 — mostly open by default
         with torch.no_grad():
             for gate in self.context_gates:
                 gate[-1].bias.fill_(1.0)
@@ -2579,11 +2581,20 @@ class MACHActivationHebbian(nn.Module):
                 patch.consolidate(decay=self.ema_decay)
 
     def compute_context_gates(self):
-        """Precompute PFC context gates from current GRU state.
+        """Precompute PFC context gates from early sensory activations.
+        Like PFC reading visual cortex to determine task context.
         Called before each forward pass so hooks can apply task-dependent gating."""
-        h = self._critic_state.squeeze(0).detach()  # (64,) — detached: context gate reflects state, gradients flow through patch path
+        # Use first patch layer's pre-activation (earliest sensory representation we capture)
+        pre = self._pre_activations.get(0)
+        if pre is None:
+            return  # no activations yet (first forward pass)
+        # Mean-pool across sequence, detach (sensory snapshot, not gradient path)
+        sensory = pre.detach().float().mean(dim=-2)  # (batch, d_model) or (d_model,)
+        while sensory.dim() > 1:
+            sensory = sensory.mean(dim=0)  # (d_model,)
+        compressed = self.context_gate_compress(sensory)  # (32,)
         for i in range(self.n_patches):
-            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (hidden_dim,)
+            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](compressed))  # (d_model,)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input."""
