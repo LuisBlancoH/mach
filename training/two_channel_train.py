@@ -1943,6 +1943,12 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
     if hasattr(mach, 'eta_scale'):
         diag["neuromod/eta_scale"] = mach.eta_scale.item()
         diag["neuromod/decay_base"] = mach.decay_base.item()
+    if hasattr(mach, 'noise_scale'):
+        diag["neuromod/noise_scale"] = mach.noise_scale.item()
+    if hasattr(mach, '_last_exploration'):
+        diag["neuromod/exploration"] = mach._last_exploration
+    if hasattr(mach, '_failure_ema'):
+        diag["neuromod/failure_ema"] = mach._failure_ema
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

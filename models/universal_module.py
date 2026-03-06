@@ -2501,14 +2501,16 @@ class MACHActivationHebbian(nn.Module):
         self.critic_head = nn.Linear(64, 1)
         self.register_buffer('_critic_state', torch.zeros(1, 64))
 
-        # Neuromodulation: two learnable scalars (meta-trained via backprop)
-        # Like evolution hardwiring dopamine sensitivity — not hand-tuned
-        self.eta_scale = nn.Parameter(torch.tensor(0.5))    # how much |TD error| boosts learning
-        self.decay_base = nn.Parameter(torch.tensor(0.0))   # baseline memory retention
+        # Neuromodulation: three learnable scalars (meta-trained via backprop)
+        # Like evolution hardwiring receptor sensitivity — not hand-tuned
+        self.eta_scale = nn.Parameter(torch.tensor(0.5))    # dopamine: |TD error| → learning rate
+        self.decay_base = nn.Parameter(torch.tensor(0.0))   # memory timescale
+        self.noise_scale = nn.Parameter(torch.tensor(0.0))  # norepinephrine: sustained failure → exploration
 
         # State
         self._pre_activations = {}
         self._post_activations = {}
+        self._failure_ema = 0.0  # tracks sustained failure
 
     def reset_episode(self):
         """Call at the start of each episode."""
@@ -2519,8 +2521,9 @@ class MACHActivationHebbian(nn.Module):
                 patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
-        # Reset critic memory
+        # Reset critic memory and failure tracking
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
+        self._failure_ema = 0.0
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2584,16 +2587,20 @@ class MACHActivationHebbian(nn.Module):
         # Update reward EMA (continuous, no episode boundary)
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
 
-        # Neuromodulation: scalar params → eta and decay
-        # eta: more surprise → more plasticity (dopamine). Zero at td_error=0.
+        # Neuromodulation: scalar params → eta, decay, exploration
+        # Dopamine: more surprise → more plasticity. Zero at td_error=0.
         eta = (self.eta_scale * td_error.abs()).clamp(0.0, 1.0)
-        # decay: learned memory timescale (bounded <1 by sigmoid, so patches can't grow unboundedly)
+        # Memory timescale (bounded <1 by sigmoid)
         decay = torch.sigmoid(self.decay_base)
+        # Norepinephrine: sustained failure → exploration noise
+        self._failure_ema = 0.9 * self._failure_ema + 0.1 * max(0.0, -reward)
+        exploration = (self.noise_scale * self._failure_ema).clamp(0.0, 1.0)
 
         # Store for diagnostics
         self._last_etas = eta.detach().expand(self.n_patches)
         self._last_decays = decay.detach().expand(self.n_patches)
         self._last_td_error = td_error.item()
+        self._last_exploration = exploration.detach().item()
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
@@ -2603,8 +2610,8 @@ class MACHActivationHebbian(nn.Module):
                     self._pre_activations[patch_idx],
                     self._post_activations[patch_idx],
                     gate,
-                    exploration_noise=self.exploration_noise,
-                    training=self.training,
+                    exploration_noise=exploration,
+                    training=True,  # always apply exploration when failure_ema > 0
                 )
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
