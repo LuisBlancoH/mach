@@ -2505,7 +2505,7 @@ class MACHActivationHebbian(nn.Module):
         # Like evolution hardwiring receptor sensitivity — not hand-tuned
         self.eta_scale = nn.Parameter(torch.tensor(0.5))    # dopamine: |TD error| → learning rate
         self.decay_base = nn.Parameter(torch.tensor(0.0))   # memory timescale
-        self.noise_scale = nn.Parameter(torch.tensor(0.0))  # norepinephrine: sustained failure → exploration
+        self.noise_scale = nn.Parameter(torch.tensor(1.0))  # norepinephrine: sustained failure → exploration
 
         # State
         self._pre_activations = {}
@@ -2592,9 +2592,12 @@ class MACHActivationHebbian(nn.Module):
         eta = (self.eta_scale * td_error.abs()).clamp(0.0, 1.0)
         # Memory timescale (bounded <1 by sigmoid)
         decay = torch.sigmoid(self.decay_base)
-        # Norepinephrine: sustained failure → exploration noise
+        # Norepinephrine: sustained failure → floor on eta + exploration noise
+        # When failing repeatedly, arousal increases: keep writing (eta floor) and try new things (noise)
         self._failure_ema = 0.9 * self._failure_ema + 0.1 * max(0.0, -reward)
-        exploration = (self.noise_scale * self._failure_ema).clamp(0.0, 1.0)
+        ne_boost = (self.noise_scale * self._failure_ema).clamp(0.0, 1.0)
+        eta = eta + ne_boost * (1.0 - eta)  # push eta toward 1 when failing
+        exploration = self.exploration_noise + ne_boost
 
         # Store for diagnostics
         self._last_etas = eta.detach().expand(self.n_patches)
@@ -2611,7 +2614,7 @@ class MACHActivationHebbian(nn.Module):
                     self._post_activations[patch_idx],
                     gate,
                     exploration_noise=exploration,
-                    training=True,  # always apply exploration when failure_ema > 0
+                    training=self.training,
                 )
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
