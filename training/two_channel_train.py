@@ -1384,7 +1384,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           device, n_steps=40000, lr=None,
                           truncation_window=20, checkpoint_path=None,
                           save_path=None, curriculum=None,
-                          context_size=0, thinking_tokens=0):
+                          context_size=0, thinking_tokens=0,
+                          memory_path=None):
     """
     Continuous Hebbian training: no episodes, no resets.
 
@@ -1429,7 +1430,18 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     op_step_count = 0
     op_switch_interval = random.randint(10, 60)  # random task duration
 
-    # Context buffer: rolling history of solved problems (hippocampal memory)
+    # Hippocampus: persistent episodic memory
+    hippocampus = None
+    if memory_path is not None:
+        from models.hippocampus import Hippocampus
+        d_embed = len(mach.patch_layers) * mach.hebb_rule.d_proj
+        hippocampus = Hippocampus(
+            embedding_dim=d_embed,
+            save_path=memory_path,
+        )
+        print(f"Hippocampus: {len(hippocampus)} stored memories, dim={d_embed}")
+
+    # Context buffer: rolling history of recent problems (short-term)
     context_buffer = []  # list of "a ? b = answer\n" strings
 
     for step in range(n_steps):
@@ -1446,10 +1458,23 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
         problem = problems[0]
 
-        # Build context: last N solved problems prepended as demos
+        # Build context: retrieved memories + recent buffer
+        context_parts = []
+
+        # Hippocampus retrieval (long-term memory)
+        if hippocampus is not None and len(hippocampus) > 0:
+            act_summary = mach.get_activation_summary()
+            act_summary = act_summary / (act_summary.norm() + 1e-8)
+            retrieved = hippocampus.retrieve(act_summary, top_k=3)
+            for text, sim, strength in retrieved:
+                context_parts.append(text)
+
+        # Short-term buffer (recent problems)
         if context_size > 0 and context_buffer:
-            context_str = "".join(context_buffer[-context_size:])
-            full_prompt = context_str + problem["prompt"]
+            context_parts.extend(context_buffer[-context_size:])
+
+        if context_parts:
+            full_prompt = "".join(context_parts) + problem["prompt"]
         else:
             full_prompt = problem["prompt"]
 
@@ -1513,6 +1538,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
+
+        # Hippocampus: store surprising experiences
+        if hippocampus is not None:
+            act_summary = mach.get_activation_summary()
+            act_summary = act_summary / (act_summary.norm() + 1e-8)
+            experience_text = f"{problem['prompt']}{problem['answer']}\n"
+            hippocampus.store(act_summary, experience_text, mach._last_td_error)
 
         # Critic loss (predicts reward from activations)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
@@ -1605,6 +1637,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if save_path:
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
+
+            # Hippocampus: decay and save
+            if hippocampus is not None:
+                hippocampus.decay_all()
+                hippocampus.save()
+                print(f"  Hippocampus: {len(hippocampus)} memories")
 
 
 def _run_op_validation_hebbian(base_model, mach, patched_model,

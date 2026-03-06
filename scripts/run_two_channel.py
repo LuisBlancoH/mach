@@ -170,6 +170,8 @@ def main():
                         help="Number of past solved problems as context (0=off, 5-10=typical)")
     parser.add_argument("--thinking-tokens", type=int, default=0,
                         help="Max thinking tokens before answering (0=off, 16-32=typical)")
+    parser.add_argument("--memory-path", type=str, default=None,
+                        help="Path for persistent hippocampal memory (e.g. memory/episodic.json)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -528,6 +530,7 @@ def main():
                 curriculum=curriculum,
                 context_size=args.context_size,
                 thinking_tokens=args.thinking_tokens,
+                memory_path=args.memory_path,
             )
         else:
             meta_train_hebbian(
