@@ -2516,6 +2516,17 @@ class MACHActivationHebbian(nn.Module):
         self.register_buffer('_decay_state', torch.zeros(1, 8))
         self.register_buffer('_expl_state', torch.zeros(1, 8))
 
+        # PFC context gate: task-dependent gating of patch outputs
+        # Like PFC → striatum selective disinhibition — same patches, different activation patterns
+        # GRU state (64) → per-patch gate over hidden_dim
+        self.context_gates = nn.ModuleList([
+            nn.Linear(64, hidden_dim) for _ in patch_layers
+        ])
+        # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default (disinhibited)
+        with torch.no_grad():
+            for gate in self.context_gates:
+                gate.bias.fill_(1.0)
+
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
         # eta: sigmoid(-0.5) ≈ 0.38 — moderate learning rate
@@ -2527,6 +2538,7 @@ class MACHActivationHebbian(nn.Module):
         # State
         self._pre_activations = {}
         self._post_activations = {}
+        self._context_gate_values = {}  # precomputed gates for hooks
 
     def reset_episode(self):
         """Call at the start of each episode."""
@@ -2564,6 +2576,13 @@ class MACHActivationHebbian(nn.Module):
         if self._step_count % self.consolidation_interval == 0 and self._reward_ema > 0:
             for patch in self.patches:
                 patch.consolidate(decay=self.ema_decay)
+
+    def compute_context_gates(self):
+        """Precompute PFC context gates from current GRU state.
+        Called before each forward pass so hooks can apply task-dependent gating."""
+        h = self._critic_state.squeeze(0).detach()  # (64,) — detached: context gate reflects state, gradients flow through patch path
+        for i in range(self.n_patches):
+            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (hidden_dim,)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input."""
@@ -2669,6 +2688,10 @@ class ActivationHebbianPatchedModel(nn.Module):
                     self.mach._pre_activations[patch_idx] = h.detach()
 
                     patch_out = patch(h.float())
+                    # PFC context gate: task-dependent selection of patch dimensions
+                    ctx_gate = self.mach._context_gate_values.get(patch_idx)
+                    if ctx_gate is not None:
+                        patch_out = patch_out * ctx_gate.to(patch_out.dtype)
                     gain = patch.get_gain()
                     h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
 
@@ -2687,6 +2710,9 @@ class ActivationHebbianPatchedModel(nn.Module):
         return self.base_model.device
 
     def forward(self, input_ids, labels=None, attention_mask=None):
+        # Precompute PFC context gates before forward pass
+        if hasattr(self.mach, 'compute_context_gates'):
+            self.mach.compute_context_gates()
         return self.base_model(
             input_ids=input_ids, labels=labels, attention_mask=attention_mask
         )
