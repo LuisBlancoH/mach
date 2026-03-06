@@ -1263,7 +1263,7 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                 problems, device, **episode_kwargs,
             )
 
-            total_loss = ce_loss + 0.1 * critic_loss
+            total_loss = ce_loss + 0.5 * critic_loss
             total_loss.backward()
             loss_scalar = ce_loss.item()
             critic_scalar = critic_loss.item()
@@ -1277,7 +1277,7 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                 base_model, mach, patched_model, tokenizer,
                 problems, device, **episode_kwargs,
             )
-            total_loss = ce_loss + 0.1 * critic_loss
+            total_loss = ce_loss + 0.5 * critic_loss
             total_loss.backward()
             loss_scalar = ce_loss.item()
             critic_scalar = critic_loss.item()
@@ -1523,7 +1523,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
             avg_critic = torch.stack(window_critic_losses).mean()
-            total_loss = window_ce + 0.1 * avg_critic
+            total_loss = window_ce + 0.5 * avg_critic
             total_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -1532,7 +1532,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             optimizer.step()
             optimizer.zero_grad()
 
-            # Detach patch deltas (break computation graph, keep values)
+            # Detach patch deltas and critic state (break computation graph, keep values)
             for patch in mach.patches:
                 if patch.delta_down is not None:
                     patch.delta_down = patch.delta_down.detach()
@@ -1540,6 +1540,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     patch.delta_up = patch.delta_up.detach()
                 if patch.delta_gain is not None:
                     patch.delta_gain = patch.delta_gain.detach()
+            if hasattr(mach, '_critic_state'):
+                mach._critic_state = mach._critic_state.detach()
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
@@ -1581,6 +1583,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 for p in mach.patches
             ]
             saved_reward_ema = mach._reward_ema
+            saved_critic_state = mach._critic_state.detach().clone() if hasattr(mach, '_critic_state') else None
+            saved_last_reward = mach._last_reward if hasattr(mach, '_last_reward') else 0.0
             mach_training = mach.training
             mach.eval()
             for op in eval_ops:
@@ -1594,6 +1598,9 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 p.delta_up = du
                 p.delta_gain = dg
             mach._reward_ema = saved_reward_ema
+            if saved_critic_state is not None:
+                mach._critic_state = saved_critic_state
+                mach._last_reward = saved_last_reward
             if mach_training:
                 mach.train()
 
