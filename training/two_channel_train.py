@@ -942,6 +942,14 @@ def _log_demoread_diagnostics(mach, meta_params, episode_idx):
         diag["gain/min"] = gains.min().item()
         diag["gain/max"] = gains.max().item()
 
+    # Consolidation stats
+    if hasattr(mach, 'consolidation') and mach.consolidation:
+        slow_norms = []
+        for p in mach.patches:
+            slow_norms.append(p.slow_down.norm().item())
+        diag["consolidation/slow_mean_norm"] = sum(slow_norms) / len(slow_norms)
+        diag["consolidation/slow_max_norm"] = max(slow_norms)
+
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
         print(f"    {k}: {v:.6f}")
@@ -1178,6 +1186,11 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
             meta_params, max_norm=config.PHASE5_GRAD_CLIP
         )
         optimizer.step()
+
+        # Consolidate successful episodes into slow memory
+        if hasattr(mach, 'consolidate'):
+            avg_r = sum(rewards) / max(len(rewards), 1)
+            mach.consolidate(avg_reward=avg_r)
 
         if episode_idx % 10 == 0:
             n_total = len(rewards)
@@ -1501,6 +1514,14 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["gain/std"] = gains.std().item()
         diag["gain/min"] = gains.min().item()
         diag["gain/max"] = gains.max().item()
+
+    # Consolidation stats
+    if hasattr(mach, 'consolidation') and mach.consolidation:
+        slow_norms = []
+        for p in mach.patches:
+            slow_norms.append(p.slow_down.norm().item())
+        diag["consolidation/slow_mean_norm"] = sum(slow_norms) / len(slow_norms)
+        diag["consolidation/slow_max_norm"] = max(slow_norms)
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):

@@ -144,6 +144,10 @@ def main():
                         help="Coprocessor: direct injection + residual patches")
     parser.add_argument("--dense-hebbian", action="store_true",
                         help="Dense Hebbian: 12 layers + top-down gain modulation")
+    parser.add_argument("--consolidation", action="store_true",
+                        help="Enable memory consolidation across episodes")
+    parser.add_argument("--ema-decay", type=float, default=0.95,
+                        help="EMA decay for consolidation (default: 0.95)")
     parser.add_argument("--ablate", action="store_true",
                         help="Run Hebbian ablation (requires --hebbian/--act-hebbian --checkpoint)")
     args = parser.parse_args()
@@ -276,6 +280,8 @@ def main():
             hidden_dim=dense_hidden,
             n_rank=n_rank,
             d_proj=d_proj,
+            consolidation=args.consolidation,
+            ema_decay=args.ema_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())
@@ -439,6 +445,8 @@ def main():
             n_rank=n_rank,
             d_proj=d_proj,
             frozen_projections=frozen,
+            consolidation=args.consolidation,
+            ema_decay=args.ema_decay,
         ).to(config.DEVICE)
 
         n_params = sum(p.numel() for p in mach.parameters())

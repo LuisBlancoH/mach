@@ -19,6 +19,9 @@ class DifferentiablePatch(nn.Module):
     Base weights are fixed at zero (buffers, not parameters).
     Meta-learner writes accumulate as delta tensors that remain in the
     computational graph, enabling gradient flow back to the meta-learner.
+
+    Supports consolidation: slow_delta buffers accumulate successful
+    patterns across episodes (like synaptic consolidation during sleep).
     """
 
     def __init__(self, d_model, hidden_dim=256):
@@ -31,22 +34,46 @@ class DifferentiablePatch(nn.Module):
         self.register_buffer('down_base', torch.zeros(hidden_dim, d_model))
         self.register_buffer('up_base', torch.zeros(d_model, hidden_dim))
 
+        # Slow memory for consolidation (persists across episodes)
+        self.register_buffer('slow_down', torch.zeros(hidden_dim, d_model))
+        self.register_buffer('slow_up', torch.zeros(d_model, hidden_dim))
+
         # Accumulated deltas — set externally, part of computational graph
         self.delta_down = None
         self.delta_up = None
         self.delta_gain = None  # multiplicative gain vector (d_model,)
 
-    def reset_deltas(self):
-        """Call at start of each episode."""
-        self.delta_down = torch.zeros(
-            self.hidden_dim, self.d_model, device=self.down_base.device
-        )
-        self.delta_up = torch.zeros(
-            self.d_model, self.hidden_dim, device=self.up_base.device
-        )
+    def reset_deltas(self, use_slow=False):
+        """Call at start of each episode.
+        If use_slow=True, initialize from consolidated slow memory.
+        """
+        if use_slow:
+            self.delta_down = self.slow_down.clone()
+            self.delta_up = self.slow_up.clone()
+        else:
+            self.delta_down = torch.zeros(
+                self.hidden_dim, self.d_model, device=self.down_base.device
+            )
+            self.delta_up = torch.zeros(
+                self.d_model, self.hidden_dim, device=self.up_base.device
+            )
         self.delta_gain = torch.zeros(
             self.d_model, device=self.down_base.device
         )
+
+    def consolidate(self, decay=0.95):
+        """Blend current episode deltas into slow memory.
+        Like synaptic consolidation: frequently reinforced patterns persist.
+        """
+        with torch.no_grad():
+            if self.delta_down is not None:
+                self.slow_down.mul_(decay).add_(
+                    self.delta_down.detach(), alpha=1.0 - decay
+                )
+            if self.delta_up is not None:
+                self.slow_up.mul_(decay).add_(
+                    self.delta_up.detach(), alpha=1.0 - decay
+                )
 
     def accumulate_write(self, weight_name, delta_W):
         """Add a differentiable delta. delta_W must be in the computational graph."""
@@ -2447,7 +2474,7 @@ class MACHActivationHebbian(nn.Module):
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
-                 frozen_projections=False):
+                 frozen_projections=False, consolidation=False, ema_decay=0.95):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2457,6 +2484,8 @@ class MACHActivationHebbian(nn.Module):
         self.gate_scale = GATE_SCALE
         self.exploration_noise = exploration_noise
         self.init_std = init_std
+        self.consolidation = consolidation
+        self.ema_decay = ema_decay
 
         # Patches
         self.patches = nn.ModuleList([
@@ -2497,12 +2526,23 @@ class MACHActivationHebbian(nn.Module):
     def reset_episode(self):
         """Call at the start of each episode."""
         for patch in self.patches:
-            patch.reset_deltas()
+            patch.reset_deltas(use_slow=self.consolidation)
             if self.init_std > 0:
-                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
-                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
+                patch.delta_down = patch.delta_down + torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
+
+    def consolidate(self, avg_reward=None, threshold=0.0):
+        """Consolidate episode deltas into slow memory.
+        Only consolidates if avg_reward > threshold (reward-gated).
+        """
+        if not self.consolidation:
+            return
+        if avg_reward is not None and avg_reward <= threshold:
+            return
+        for patch in self.patches:
+            patch.consolidate(decay=self.ema_decay)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input."""
@@ -2627,7 +2667,8 @@ class MACHDenseHebbian(nn.Module):
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=64,
-                 n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001):
+                 n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
+                 consolidation=False, ema_decay=0.95):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2637,6 +2678,8 @@ class MACHDenseHebbian(nn.Module):
         self.gate_scale = GATE_SCALE
         self.exploration_noise = exploration_noise
         self.init_std = init_std
+        self.consolidation = consolidation
+        self.ema_decay = ema_decay
 
         # Dense patches — smaller hidden dim, more layers
         self.patches = nn.ModuleList([
@@ -2681,13 +2724,22 @@ class MACHDenseHebbian(nn.Module):
 
     def reset_episode(self):
         for patch in self.patches:
-            patch.reset_deltas()
+            patch.reset_deltas(use_slow=self.consolidation)
             if self.init_std > 0:
-                patch.delta_down = torch.randn_like(patch.delta_down) * self.init_std
-                patch.delta_up = torch.randn_like(patch.delta_up) * self.init_std
+                patch.delta_down = patch.delta_down + torch.randn_like(patch.delta_down) * self.init_std
+                patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
         self._gains = None
+
+    def consolidate(self, avg_reward=None, threshold=0.0):
+        """Consolidate episode deltas into slow memory."""
+        if not self.consolidation:
+            return
+        if avg_reward is not None and avg_reward <= threshold:
+            return
+        for patch in self.patches:
+            patch.consolidate(decay=self.ema_decay)
 
     def get_activation_summary(self):
         summaries = []
