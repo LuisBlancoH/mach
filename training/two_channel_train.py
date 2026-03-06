@@ -41,12 +41,14 @@ FEW_SHOT_BASIC_CURRICULUM = [
 ]
 
 # Diverse ops for generalization training
-# Train on 12 ops, hold out 3 for generalization testing
+# Train on 9 ops, hold out mod/max/min (Qwen CAN do these — fair generalization test)
+# Also test "impossible" ops (Qwen fundamentally can't compute) as control group
 DIVERSE_TRAIN_OPS = [
-    "add", "sub", "mul", "div", "mod", "max", "min",
+    "add", "sub", "mul", "div",
     "gcd", "abs_diff", "avg", "first", "second",
 ]
-DIVERSE_HELDOUT_OPS = ["digit_sum_add", "bitwise_and", "bitwise_xor"]
+DIVERSE_HELDOUT_OPS = ["mod", "max", "min"]
+DIVERSE_IMPOSSIBLE_OPS = ["digit_sum_add", "bitwise_and", "bitwise_xor"]
 
 DIVERSE_OPS_CURRICULUM = [
     (0, 5000, "few_shot_diverse"),
@@ -1301,10 +1303,11 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
     - INIT ONLY: reset once (gets random init), forward all, NO updates
     This tells us if the Hebbian updates contribute beyond random init + static basis.
     """
-    # Use diverse sets if available, otherwise basic + original held-out
+    # Use diverse sets: train + held-out (fair) + impossible (control)
     all_train = DIVERSE_TRAIN_OPS
     all_heldout = DIVERSE_HELDOUT_OPS
-    ops = all_train + all_heldout
+    all_impossible = DIVERSE_IMPOSSIBLE_OPS
+    ops = all_train + all_heldout + all_impossible
     results = {"with_hebbian": {}, "no_update": {}, "no_init": {}}
 
     for op in ops:
@@ -1389,6 +1392,7 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
 
     trained_ops = all_train
     heldout_ops = all_heldout
+    impossible_ops = all_impossible
 
     print("\n  === HEBBIAN ABLATION ===")
     print(f"  {'op':4s} | {'with_hebb':>10s} | {'no_update':>10s} | {'no_init':>10s}")
@@ -1402,13 +1406,22 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
     print(f"  {'tavg':4s} | {avg_hebb:>9.0%} | {avg_no:>9.0%} | {avg_zero:>9.0%}")
 
     if heldout_ops:
-        print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+        print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}  (held-out: Qwen CAN do)")
         for op in heldout_ops:
             print(f"  {op:4s} | {results['with_hebbian'][op]:>9.0%} | {results['no_update'][op]:>9.0%} | {results['no_init'][op]:>9.0%}")
         avg_hebb_h = sum(results['with_hebbian'][op] for op in heldout_ops) / len(heldout_ops)
         avg_no_h = sum(results['no_update'][op] for op in heldout_ops) / len(heldout_ops)
         avg_zero_h = sum(results['no_init'][op] for op in heldout_ops) / len(heldout_ops)
         print(f"  {'havg':4s} | {avg_hebb_h:>9.0%} | {avg_no_h:>9.0%} | {avg_zero_h:>9.0%}")
+
+    if impossible_ops:
+        print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}  (impossible: Qwen CAN'T do)")
+        for op in impossible_ops:
+            print(f"  {op:4s} | {results['with_hebbian'][op]:>9.0%} | {results['no_update'][op]:>9.0%} | {results['no_init'][op]:>9.0%}")
+        avg_hebb_i = sum(results['with_hebbian'][op] for op in impossible_ops) / len(impossible_ops)
+        avg_no_i = sum(results['no_update'][op] for op in impossible_ops) / len(impossible_ops)
+        avg_zero_i = sum(results['no_init'][op] for op in impossible_ops) / len(impossible_ops)
+        print(f"  {'iavg':4s} | {avg_hebb_i:>9.0%} | {avg_no_i:>9.0%} | {avg_zero_i:>9.0%}")
     print()
 
     if wandb is not None:
