@@ -1273,7 +1273,7 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
     - INIT ONLY: reset once (gets random init), forward all, NO updates
     This tells us if the Hebbian updates contribute beyond random init + static basis.
     """
-    ops = ["add", "sub", "mul", "div"]
+    ops = ["add", "sub", "mul", "div", "mod", "max", "min"]
     results = {"with_hebbian": {}, "no_update": {}, "no_init": {}}
 
     for op in ops:
@@ -1356,16 +1356,28 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
         mach.init_std = old_init_std
         results["no_init"][op] = correct_zero / max(total_zero, 1)
 
+    trained_ops = ["add", "sub", "mul", "div"]
+    heldout_ops = [op for op in ops if op not in trained_ops]
+
     print("\n  === HEBBIAN ABLATION ===")
     print(f"  {'op':4s} | {'with_hebb':>10s} | {'no_update':>10s} | {'no_init':>10s}")
     print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
-    for op in ops:
+    for op in trained_ops:
         print(f"  {op:4s} | {results['with_hebbian'][op]:>9.0%} | {results['no_update'][op]:>9.0%} | {results['no_init'][op]:>9.0%}")
 
-    avg_hebb = sum(results['with_hebbian'].values()) / len(ops)
-    avg_no = sum(results['no_update'].values()) / len(ops)
-    avg_zero = sum(results['no_init'].values()) / len(ops)
-    print(f"  {'avg':4s} | {avg_hebb:>9.0%} | {avg_no:>9.0%} | {avg_zero:>9.0%}")
+    avg_hebb = sum(results['with_hebbian'][op] for op in trained_ops) / len(trained_ops)
+    avg_no = sum(results['no_update'][op] for op in trained_ops) / len(trained_ops)
+    avg_zero = sum(results['no_init'][op] for op in trained_ops) / len(trained_ops)
+    print(f"  {'tavg':4s} | {avg_hebb:>9.0%} | {avg_no:>9.0%} | {avg_zero:>9.0%}")
+
+    if heldout_ops:
+        print(f"  {'-'*4}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+        for op in heldout_ops:
+            print(f"  {op:4s} | {results['with_hebbian'][op]:>9.0%} | {results['no_update'][op]:>9.0%} | {results['no_init'][op]:>9.0%}")
+        avg_hebb_h = sum(results['with_hebbian'][op] for op in heldout_ops) / len(heldout_ops)
+        avg_no_h = sum(results['no_update'][op] for op in heldout_ops) / len(heldout_ops)
+        avg_zero_h = sum(results['no_init'][op] for op in heldout_ops) / len(heldout_ops)
+        print(f"  {'havg':4s} | {avg_hebb_h:>9.0%} | {avg_no_h:>9.0%} | {avg_zero_h:>9.0%}")
     print()
 
     if wandb is not None:
