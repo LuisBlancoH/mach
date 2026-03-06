@@ -1584,7 +1584,6 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             ]
             saved_reward_ema = mach._reward_ema
             saved_critic_state = mach._critic_state.detach().clone() if hasattr(mach, '_critic_state') else None
-            saved_last_reward = mach._last_reward if hasattr(mach, '_last_reward') else 0.0
             mach_training = mach.training
             mach.eval()
             for op in eval_ops:
@@ -1600,7 +1599,6 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             mach._reward_ema = saved_reward_ema
             if saved_critic_state is not None:
                 mach._critic_state = saved_critic_state
-                mach._last_reward = saved_last_reward
             if mach_training:
                 mach.train()
 

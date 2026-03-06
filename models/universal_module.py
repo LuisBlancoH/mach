@@ -2494,13 +2494,12 @@ class MACHActivationHebbian(nn.Module):
                 param.requires_grad = False
 
         # Critic (basal ganglia): GRU with memory over steps
-        # Input: compressed activations + last reward
+        # Input: compressed activations only (reward trains it, not feeds it)
         d_critic_in = len(patch_layers) * d_proj
         self.critic_proj = nn.Linear(d_critic_in, 64)
-        self.critic_gru = nn.GRUCell(64 + 1, 64)  # activation(64) + reward(1) → hidden(64)
+        self.critic_gru = nn.GRUCell(64, 64)  # activation(64) → hidden(64)
         self.critic_head = nn.Linear(64, 1)
         self.register_buffer('_critic_state', torch.zeros(1, 64))
-        self._last_reward = 0.0
 
         # Neuromodulation: two learnable scalars (meta-trained via backprop)
         # Like evolution hardwiring dopamine sensitivity — not hand-tuned
@@ -2522,7 +2521,6 @@ class MACHActivationHebbian(nn.Module):
         self._post_activations.clear()
         # Reset critic memory
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
-        self._last_reward = 0.0
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2573,11 +2571,8 @@ class MACHActivationHebbian(nn.Module):
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
-        # Critic GRU: integrate activations + last reward over time
-        critic_input = torch.cat([
-            self.critic_proj(act_summary).unsqueeze(0),  # (1, 64)
-            torch.tensor([[self._last_reward]], device=device),  # (1, 1)
-        ], dim=-1)  # (1, 65)
+        # Critic GRU: integrate activations over time (state → value)
+        critic_input = self.critic_proj(act_summary).unsqueeze(0)  # (1, 64)
         self._critic_state = self.critic_gru(critic_input, self._critic_state)
         value = self.critic_head(self._critic_state).squeeze(-1).squeeze(-1)
 
@@ -2586,8 +2581,7 @@ class MACHActivationHebbian(nn.Module):
         # TD error = surprise = dopamine
         td_error = (reward_t - value).detach()
 
-        # Update state for next step
-        self._last_reward = reward
+        # Update reward EMA (continuous, no episode boundary)
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
 
         # Neuromodulation: scalar params → eta and decay
