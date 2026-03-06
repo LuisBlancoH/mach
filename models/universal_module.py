@@ -2499,20 +2499,30 @@ class MACHActivationHebbian(nn.Module):
         self.critic_gru = nn.GRUCell(64, 64)
         self.register_buffer('_critic_state', torch.zeros(1, 64))
 
-        # Separate nuclei: each reads GRU state, processes independently
-        # Like VTA/LC/basal forebrain — shared cortical input, separate circuits
-        self.value_head = nn.Linear(64, 1)                          # VTA: reward prediction
-        self.eta_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1))   # dopamine: plasticity
-        self.decay_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1)) # ACh: retention
-        self.expl_head = nn.Sequential(nn.Linear(64, 8), nn.ReLU(), nn.Linear(8, 1))  # LC: exploration
+        # Separate nuclei with recurrent dynamics: each has its own GRU (8-dim)
+        # Like VTA/LC/basal forebrain — shared cortical input, separate circuits + own temporal dynamics
+        n_p = len(patch_layers)
+        self.value_head = nn.Linear(64, 1)                              # VTA: reward prediction
+
+        # Each nucleus: GRU(64→8) for own temporal state, then Linear(8→n_patches) for per-patch output
+        self.eta_gru = nn.GRUCell(64, 8)                                # dopamine dynamics
+        self.eta_out = nn.Linear(8, n_p)                                # per-patch plasticity
+        self.decay_gru = nn.GRUCell(64, 8)                              # ACh dynamics
+        self.decay_out = nn.Linear(8, n_p)                              # per-patch retention
+        self.expl_gru = nn.GRUCell(64, 8)                               # LC dynamics
+        self.expl_out = nn.Linear(8, n_p)                               # per-patch exploration
+
+        self.register_buffer('_eta_state', torch.zeros(1, 8))
+        self.register_buffer('_decay_state', torch.zeros(1, 8))
+        self.register_buffer('_expl_state', torch.zeros(1, 8))
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
         # eta: sigmoid(-0.5) ≈ 0.38 — moderate learning rate
         # expl: sigmoid(0.0) = 0.5 — default exploration (no bias needed)
         with torch.no_grad():
-            self.decay_head[-1].bias.fill_(2.0)
-            self.eta_head[-1].bias.fill_(-0.5)
+            self.decay_out.bias.fill_(2.0)
+            self.eta_out.bias.fill_(-0.5)
 
         # State
         self._pre_activations = {}
@@ -2527,8 +2537,11 @@ class MACHActivationHebbian(nn.Module):
                 patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
-        # Reset critic memory
+        # Reset critic memory + nuclei states
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
+        self._eta_state = torch.zeros(1, 8, device=self._critic_state.device)
+        self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
+        self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2586,11 +2599,17 @@ class MACHActivationHebbian(nn.Module):
         self._critic_state = self.critic_gru(critic_input, self._critic_state)
         h = self._critic_state.squeeze(0)  # (64,)
 
-        # Separate nuclei — each processes GRU state independently
+        # Separate recurrent nuclei — each has own temporal dynamics + per-patch output
+        h_unsq = h.unsqueeze(0)  # (1, 64) for GRUCell input
         value = self.value_head(h).squeeze(-1)          # scalar
-        eta = torch.sigmoid(self.eta_head(h).squeeze(-1))        # [0, 1]
-        decay = torch.sigmoid(self.decay_head(h).squeeze(-1))    # [0, 1]
-        exploration = torch.sigmoid(self.expl_head(h).squeeze(-1)) * 0.5 + self.exploration_noise
+
+        self._eta_state = self.eta_gru(h_unsq, self._eta_state)
+        self._decay_state = self.decay_gru(h_unsq, self._decay_state)
+        self._expl_state = self.expl_gru(h_unsq, self._expl_state)
+
+        etas = torch.sigmoid(self.eta_out(self._eta_state.squeeze(0)))        # (n_patches,)
+        decays = torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # (n_patches,)
+        expls = torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) * 0.5 + self.exploration_noise  # (n_patches,)
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
@@ -2601,24 +2620,24 @@ class MACHActivationHebbian(nn.Module):
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
 
         # Store for diagnostics
-        self._last_etas = eta.detach().expand(self.n_patches)
-        self._last_decays = decay.detach().expand(self.n_patches)
+        self._last_etas = etas.detach()
+        self._last_decays = decays.detach()
         self._last_td_error = td_error.item()
-        self._last_exploration = exploration.detach().item()
+        self._last_exploration = expls.detach().mean().item()
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
-                gate = (eta * td_error * self.gate_scale).clamp(-1.0, 1.0)
+                gate = (etas[patch_idx] * td_error * self.gate_scale).clamp(-1.0, 1.0)
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx],
                     self._post_activations[patch_idx],
                     gate,
-                    exploration_noise=exploration,
+                    exploration_noise=expls[patch_idx],
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
-                self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
+                self.patches[patch_idx].accumulate_write("down", delta_down, decay=decays[patch_idx])
+                self.patches[patch_idx].accumulate_write("up", delta_up, decay=decays[patch_idx])
 
         return value, reward_t
 

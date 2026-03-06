@@ -1593,8 +1593,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     (p.delta_up.norm().item() if p.delta_up is not None else 0)
                     for p in mach.patches
                 )
-                neuromod_str = (f" | η={mach._last_etas[0].item():.3f}"
-                               f" decay={mach._last_decays[0].item():.3f}"
+                eta_vals = mach._last_etas
+                decay_vals = mach._last_decays
+                eta_str = "/".join(f"{e:.2f}" for e in eta_vals)
+                decay_str = "/".join(f"{d:.2f}" for d in decay_vals)
+                neuromod_str = (f" | η=[{eta_str}]"
+                               f" dec=[{decay_str}]"
                                f" expl={mach._last_exploration:.3f}"
                                f" {td_str} Δ={dnorm:.2f}")
             print(
