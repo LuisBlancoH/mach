@@ -1109,10 +1109,11 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             reward, step, len(problems), device
         )
 
-        # 4. Critic loss (TD learning)
+        # 4. Critic loss + plasticity loss (both direct signals)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
         critic_loss = (value - critic_target) ** 2
-        critic_losses.append(critic_loss)
+        plasticity_loss = mach._plasticity_loss if hasattr(mach, '_plasticity_loss') else 0.0
+        critic_losses.append(critic_loss + 0.1 * plasticity_loss)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
 
@@ -1453,10 +1454,14 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Critic loss
+        # Critic loss (direct signal — predicts reward from activations)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
         critic_loss = (value - critic_target) ** 2
-        window_critic_losses.append(critic_loss)
+
+        # Plasticity loss (direct signal — TD error drives eta/decay)
+        plasticity_loss = mach._plasticity_loss if hasattr(mach, '_plasticity_loss') else 0.0
+
+        window_critic_losses.append(critic_loss + 0.1 * plasticity_loss)
 
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
@@ -1782,6 +1787,8 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["plasticity/decay_mean"] = mach._last_decays.mean().item()
         diag["plasticity/decay_std"] = mach._last_decays.std().item()
         diag["plasticity/reward_ema"] = mach._reward_ema
+    if hasattr(mach, '_last_td_error'):
+        diag["plasticity/td_error"] = mach._last_td_error
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
