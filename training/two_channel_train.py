@@ -1575,7 +1575,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
             # Detach nuclei GRU states at truncation boundary
-            for attr in ('_eta_state', '_decay_state', '_expl_state'):
+            for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
 
@@ -1633,7 +1633,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             saved_critic_state = mach._critic_state.detach().clone() if hasattr(mach, '_critic_state') else None
             saved_nuclei = {
                 attr: getattr(mach, attr).detach().clone()
-                for attr in ('_eta_state', '_decay_state', '_expl_state')
+                for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state')
                 if hasattr(mach, attr)
             }
             mach_training = mach.training

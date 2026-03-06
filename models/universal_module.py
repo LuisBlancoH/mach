@@ -2516,19 +2516,22 @@ class MACHActivationHebbian(nn.Module):
         self.register_buffer('_decay_state', torch.zeros(1, 8))
         self.register_buffer('_expl_state', torch.zeros(1, 8))
 
-        # PFC context gate: reads early sensory activations (like PFC reading visual cortex)
-        # Uses pre_activations from first patch layer — contains raw token representations
-        # where the operation symbol (+, -, ×, ÷) is still clearly encoded
-        # Bottleneck: d_model → 32 (compress sensory input) → d_model (per-patch gate)
-        self.context_gate_compress = nn.Linear(d_model, 32)  # shared sensory compression
+        # PFC: recurrent circuit for task representation + context gating
+        # Reads all-layer activation summary (early=concrete, late=abstract)
+        # Maintains stable task set through own GRU dynamics
+        # Separate from critic GRU: critic predicts reward, PFC represents task context
+        d_pfc_in = len(patch_layers) * d_proj  # same as critic input (128)
+        self.pfc_proj = nn.Linear(d_pfc_in, 32)   # sensory compression
+        self.pfc_gru = nn.GRUCell(32, 32)          # recurrent task representation
+        self.register_buffer('_pfc_state', torch.zeros(1, 32))
+        # Per-patch gate from PFC state
         self.context_gates = nn.ModuleList([
-            nn.Sequential(nn.Linear(32, 16), nn.ReLU(), nn.Linear(16, d_model))
-            for _ in patch_layers
+            nn.Linear(32, d_model) for _ in patch_layers
         ])
-        # Initialize last bias to +1 so sigmoid ≈ 0.73 — mostly open by default
+        # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default
         with torch.no_grad():
             for gate in self.context_gates:
-                gate[-1].bias.fill_(1.0)
+                gate.bias.fill_(1.0)
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
@@ -2552,11 +2555,12 @@ class MACHActivationHebbian(nn.Module):
                 patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
         self._pre_activations.clear()
         self._post_activations.clear()
-        # Reset critic memory + nuclei states
+        # Reset critic memory, nuclei states, and PFC state
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
         self._eta_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
+        self._pfc_state = torch.zeros(1, 32, device=self._critic_state.device)
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2581,20 +2585,21 @@ class MACHActivationHebbian(nn.Module):
                 patch.consolidate(decay=self.ema_decay)
 
     def compute_context_gates(self):
-        """Precompute PFC context gates from early sensory activations.
-        Like PFC reading visual cortex to determine task context.
-        Called before each forward pass so hooks can apply task-dependent gating."""
-        # Use first patch layer's pre-activation (earliest sensory representation we capture)
-        pre = self._pre_activations.get(0)
-        if pre is None:
+        """PFC: integrate all-layer activations through recurrent circuit → context gates.
+        Like PFC reading early (concrete) + late (abstract) cortical areas,
+        maintaining stable task representation through recurrent dynamics."""
+        if not self._pre_activations:
             return  # no activations yet (first forward pass)
-        # Mean-pool across sequence, detach (sensory snapshot, not gradient path)
-        sensory = pre.detach().float().mean(dim=-2)  # (batch, d_model) or (d_model,)
-        while sensory.dim() > 1:
-            sensory = sensory.mean(dim=0)  # (d_model,)
-        compressed = self.context_gate_compress(sensory)  # (32,)
+        # Reuse activation summary (all 4 layers compressed to 128-dim)
+        act_summary = self.get_activation_summary().detach()
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
+        # PFC GRU: integrate sensory input, maintain task set
+        pfc_input = self.pfc_proj(act_summary).unsqueeze(0)  # (1, 32)
+        self._pfc_state = self.pfc_gru(pfc_input, self._pfc_state)
+        h = self._pfc_state.squeeze(0)  # (32,)
+        # Per-patch gates from PFC task representation
         for i in range(self.n_patches):
-            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](compressed))  # (d_model,)
+            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (d_model,)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input."""
