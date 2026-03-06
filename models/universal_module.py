@@ -2502,16 +2502,10 @@ class MACHActivationHebbian(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Plasticity controller: driven by TD error (like dopamine)
-        # Input: activation summary + td_error + reward_ema + per-patch delta norms
-        # Trained by its own loss, not backprop through Hebbian chain
-        n_patches = len(patch_layers)
-        plasticity_in = d_critic_in + 2 + n_patches
-        self.plasticity_head = nn.Sequential(
-            nn.Linear(plasticity_in, 64),
-            nn.GELU(),
-            nn.Linear(64, n_patches * 2),  # 2 outputs per patch: eta, decay
-        )
+        # Neuromodulation: two learnable scalars (meta-trained via backprop)
+        # Like evolution hardwiring dopamine sensitivity — not hand-tuned
+        self.eta_scale = nn.Parameter(torch.tensor(1.0))    # how much |TD error| boosts learning
+        self.decay_base = nn.Parameter(torch.tensor(0.0))   # baseline memory retention
 
         # State
         self._pre_activations = {}
@@ -2567,10 +2561,11 @@ class MACHActivationHebbian(nn.Module):
         return torch.cat(summaries)
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
-        """Compute activation-derived Hebbian updates with dopamine-like plasticity.
+        """Compute activation-derived Hebbian updates with scalar neuromodulation.
 
-        Critic predicts value, TD error drives plasticity controller.
-        Both get direct learning signals — no backprop through Hebbian chain.
+        Critic predicts value, TD error = dopamine signal.
+        Two learnable scalars (eta_scale, decay_base) control plasticity —
+        meta-trained via backprop through the Hebbian chain.
         """
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
@@ -2584,35 +2579,20 @@ class MACHActivationHebbian(nn.Module):
         # Update reward EMA (continuous, no episode boundary)
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward
 
-        # Compute per-patch delta norms
-        delta_norms = torch.tensor(
-            [p.delta_down.norm().item() + p.delta_up.norm().item()
-             for p in self.patches],
-            device=device,
-        )
-
-        # Plasticity controller input: TD error replaces raw reward
-        plasticity_input = torch.cat([
-            act_summary.detach(),                                           # what patches are doing
-            torch.tensor([td_error.item(), self._reward_ema], device=device),  # surprise + running reward
-            delta_norms,                                                    # how modified patches are
-        ])
-
-        # Output: eta (learning rate), decay (memory timescale) per patch
-        plasticity_out = self.plasticity_head(plasticity_input)
-        plasticity_out = plasticity_out.view(self.n_patches, 2)
-
-        etas = torch.sigmoid(plasticity_out[:, 0])           # [0, 1] learning rate
-        decays = torch.sigmoid(plasticity_out[:, 1])         # [0, 1] memory retention
+        # Neuromodulation: scalar params → eta and decay
+        # eta: more surprise → more plasticity (dopamine)
+        eta = torch.sigmoid(self.eta_scale * td_error.abs())
+        # decay: learned memory timescale (bounded <1 by sigmoid, so patches can't grow unboundedly)
+        decay = torch.sigmoid(self.decay_base)
 
         # Store for diagnostics
-        self._last_etas = etas.detach()
-        self._last_decays = decays.detach()
+        self._last_etas = eta.detach().expand(self.n_patches)
+        self._last_decays = decay.detach().expand(self.n_patches)
         self._last_td_error = td_error.item()
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
-                gate = (etas[patch_idx] * td_error * self.gate_scale).clamp(-1.0, 1.0)
+                gate = (eta * td_error * self.gate_scale).clamp(-1.0, 1.0)
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx],
@@ -2621,15 +2601,8 @@ class MACHActivationHebbian(nn.Module):
                     exploration_noise=self.exploration_noise,
                     training=self.training,
                 )
-                decay = decays[patch_idx]
                 self.patches[patch_idx].accumulate_write("down", delta_down, decay=decay)
                 self.patches[patch_idx].accumulate_write("up", delta_up, decay=decay)
-
-        # Plasticity controller loss: maximize reward through eta/decay choices
-        # Positive TD error → reinforce current eta/decay (do more of this)
-        # Negative TD error → push eta/decay away from current values
-        plasticity_loss = -(td_error * plasticity_out.sum())
-        self._plasticity_loss = plasticity_loss
 
         return value, reward_t
 

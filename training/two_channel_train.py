@@ -1109,11 +1109,10 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             reward, step, len(problems), device
         )
 
-        # 4. Critic loss + plasticity loss (both direct signals)
+        # 4. Critic loss (predicts reward from activations)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
         critic_loss = (value - critic_target) ** 2
-        plasticity_loss = mach._plasticity_loss if hasattr(mach, '_plasticity_loss') else 0.0
-        critic_losses.append(critic_loss + 0.1 * plasticity_loss)
+        critic_losses.append(critic_loss)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
 
@@ -1454,14 +1453,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Critic loss (direct signal — predicts reward from activations)
+        # Critic loss (predicts reward from activations)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
         critic_loss = (value - critic_target) ** 2
 
-        # Plasticity loss (direct signal — TD error drives eta/decay)
-        plasticity_loss = mach._plasticity_loss if hasattr(mach, '_plasticity_loss') else 0.0
-
-        window_critic_losses.append(critic_loss + 0.1 * plasticity_loss)
+        window_critic_losses.append(critic_loss)
 
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
@@ -1780,15 +1776,16 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["gain/min"] = gains.min().item()
         diag["gain/max"] = gains.max().item()
 
-    # Plasticity controller stats
+    # Neuromodulation stats
     if hasattr(mach, '_last_etas') and mach._last_etas is not None:
-        diag["plasticity/eta_mean"] = mach._last_etas.mean().item()
-        diag["plasticity/eta_std"] = mach._last_etas.std().item()
-        diag["plasticity/decay_mean"] = mach._last_decays.mean().item()
-        diag["plasticity/decay_std"] = mach._last_decays.std().item()
-        diag["plasticity/reward_ema"] = mach._reward_ema
+        diag["neuromod/eta"] = mach._last_etas.mean().item()
+        diag["neuromod/decay"] = mach._last_decays.mean().item()
+        diag["neuromod/reward_ema"] = mach._reward_ema
     if hasattr(mach, '_last_td_error'):
-        diag["plasticity/td_error"] = mach._last_td_error
+        diag["neuromod/td_error"] = mach._last_td_error
+    if hasattr(mach, 'eta_scale'):
+        diag["neuromod/eta_scale"] = mach.eta_scale.item()
+        diag["neuromod/decay_base"] = mach.decay_base.item()
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
