@@ -240,17 +240,22 @@ class Hippocampus(nn.Module):
 
             # Measure necessity BEFORE reinstatement:
             # How far is the cortex's PFC from the stored state?
-            # High distance = cortex hasn't learned this = memory essential
-            # Low distance = cortex already produces similar state = memory redundant
             stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
             with torch.no_grad():
-                pfc_distance = (mach._pfc_state - stored_pfc).norm().item()
-            necessity = min(pfc_distance, 1.0)  # cap at 1
+                pfc_distance = min((mach._pfc_state - stored_pfc).norm().item(), 1.0)
 
-            # Retrieval boost scaled by NECESSITY, not surprise
-            # Fixes case where hippocampus masks its own necessity:
-            # If cortex already knows this (low distance), memory fades
-            # If cortex needs this (high distance), memory persists
+            # Necessity depends on valence (approach vs avoidance):
+            # APPROACH (α > 0): stored state was good
+            #   High distance = cortex hasn't learned it = essential
+            #   Low distance = cortex already there = redundant
+            # AVOIDANCE (α < 0): stored state was bad
+            #   Low distance = cortex near danger = essential
+            #   High distance = cortex already avoids = redundant
+            if alpha_f >= 0:
+                necessity = pfc_distance           # far from good = essential
+            else:
+                necessity = 1.0 - pfc_distance     # close to bad = essential
+
             headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
             self._strengths[idx] += abs(alpha_f) * necessity * headroom
 
