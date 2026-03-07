@@ -2546,13 +2546,16 @@ class LearnedPlasticityRule(nn.Module):
             nn.init.zeros_(pnet[-1].weight)
             nn.init.zeros_(pnet[-1].bias)
 
-        # Eligibility traces: per-patch, per-rank scalar magnitude
-        # These are buffers (not parameters) — they accumulate during episodes
+        # Eligibility traces: list-of-lists of independent scalar tensors
+        # NOT a single 2D tensor — avoids in-place indexing that breaks autograd
         self._traces = None  # initialized in reset_traces()
 
     def reset_traces(self, device):
         """Reset eligibility traces at episode start."""
-        self._traces = torch.zeros(self.n_patches, self.n_rank, device=device)
+        self._traces = [
+            [torch.tensor(0.0, device=device) for _ in range(self.n_rank)]
+            for _ in range(self.n_patches)
+        ]
 
     def update_trace(self, patch_idx, pre_act, post_act, trace_decay):
         """
@@ -2578,11 +2581,10 @@ class LearnedPlasticityRule(nn.Module):
             post_feat = self.trace_post_proj[patch_idx][r](post_c) # (d_proj,)
             # Trace magnitude: dot product of projected features
             trace_val = (pre_feat * post_feat).sum()
-            # Accumulate with decay (eligibility trace dynamics)
-            # Detach old trace — gradient flows through current step's contribution only
-            self._traces[patch_idx, r] = (
-                trace_decay * self._traces[patch_idx, r].detach() + trace_val
-            )
+            # Detach old trace — gradient flows through current step only
+            # Each trace is an independent scalar tensor (no in-place indexing)
+            old_trace = self._traces[patch_idx][r].detach()
+            self._traces[patch_idx][r] = trace_decay * old_trace + trace_val
 
     def compute_update(self, patch_idx, pre_act, post_act, td_error,
                        eta, decay, exploration,
@@ -2607,7 +2609,7 @@ class LearnedPlasticityRule(nn.Module):
         post_norm = post / (post.norm() + 1e-8)
 
         # Plasticity network input: trace magnitudes + RPE + neuromod context
-        trace_vals = self._traces[patch_idx]  # (n_rank,)
+        trace_vals = torch.stack(self._traces[patch_idx])  # (n_rank,)
         plasticity_input = torch.cat([
             trace_vals,
             td_error.unsqueeze(0),       # RPE (dopamine)
