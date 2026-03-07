@@ -233,25 +233,30 @@ class Hippocampus(nn.Module):
             alpha_t = self.reinstatement_gate(gate_input).squeeze() * sim_t
             alpha_f = alpha_t.item()  # float copy for non-differentiable ops
 
-            # Retrieval strengthens memory, scaled by surprise (|TD error|)
-            # Expected retrievals barely strengthen — only surprising ones refresh
-            # Plus LTP saturation: strong memories gain less
-            surprise = min(abs(current_td_error), 1.0)  # cap at 1
-            headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
-            self._strengths[idx] += abs(alpha_f) * surprise * headroom
-
             if abs(alpha_f) < 1e-4:
                 continue
 
             max_alpha = max(max_alpha, abs(alpha_f))
 
+            # Measure necessity BEFORE reinstatement:
+            # How far is the cortex's PFC from the stored state?
+            # High distance = cortex hasn't learned this = memory essential
+            # Low distance = cortex already produces similar state = memory redundant
+            stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
+            with torch.no_grad():
+                pfc_distance = (mach._pfc_state - stored_pfc).norm().item()
+            necessity = min(pfc_distance, 1.0)  # cap at 1
+
+            # Retrieval boost scaled by NECESSITY, not surprise
+            # Fixes case where hippocampus masks its own necessity:
+            # If cortex already knows this (low distance), memory fades
+            # If cortex needs this (high distance), memory persists
+            headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+            self._strengths[idx] += abs(alpha_f) * necessity * headroom
+
             # Partial reinstatement or avoidance:
             # alpha > 0: blend TOWARD stored state (approach — repeat success)
             # alpha < 0: blend AWAY from stored state (avoidance — don't repeat failure)
-            # Math: pfc = (1 - α) * current + α * stored
-            #   α=+0.2 → 80% current + 20% stored (approach)
-            #   α=-0.2 → 120% current - 20% stored (move away)
-            stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
             mach._pfc_state = (1 - alpha_t) * mach._pfc_state + alpha_t * stored_pfc
 
             # Neuromod bias: approach → blend toward stored, avoidance → blend away
