@@ -1598,6 +1598,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
+            # Detach eligibility traces
+            if hasattr(mach, 'hebb_rule') and hasattr(mach.hebb_rule, '_traces') and mach.hebb_rule._traces is not None:
+                for p_traces in mach.hebb_rule._traces:
+                    for r in range(len(p_traces)):
+                        p_traces[r] = p_traces[r].detach()
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
