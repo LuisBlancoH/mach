@@ -2734,10 +2734,13 @@ class MACHActivationHebbian(nn.Module):
         self.decay_out = nn.Linear(8, n_p)                              # per-patch retention
         self.expl_gru = nn.GRUCell(64, 8)                               # LC dynamics
         self.expl_out = nn.Linear(8, n_p)                               # per-patch exploration
+        self.gamma_gru = nn.GRUCell(64, 8)                               # serotonin dynamics
+        self.gamma_out = nn.Linear(8, 1)                                 # scalar discount factor
 
         self.register_buffer('_eta_state', torch.zeros(1, 8))
         self.register_buffer('_decay_state', torch.zeros(1, 8))
         self.register_buffer('_expl_state', torch.zeros(1, 8))
+        self.register_buffer('_gamma_state', torch.zeros(1, 8))
 
         # PFC: recurrent circuit for task representation + context gating
         # Reads all-layer activation summary (early=concrete, late=abstract)
@@ -2764,6 +2767,7 @@ class MACHActivationHebbian(nn.Module):
         with torch.no_grad():
             self.decay_out.bias.fill_(1.87)   # → decay ≈ 0.88
             self.eta_out.bias.fill_(-0.80)    # → eta ≈ 0.38
+            self.gamma_out.bias.fill_(1.5)    # → gamma ≈ 0.91 (patient by default)
 
         # State
         self._pre_activations = {}
@@ -2790,6 +2794,7 @@ class MACHActivationHebbian(nn.Module):
         self._eta_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
+        self._gamma_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._pfc_state = torch.zeros(1, 32, device=self._critic_state.device)
         # Reset eligibility traces for both residual and attention patches
         self.hebb_rule.reset_traces(self._critic_state.device)
@@ -2798,6 +2803,7 @@ class MACHActivationHebbian(nn.Module):
         self._prev_value = 0.0
         self._prev_critic_value = None
         self._prev_reward = None
+        self._prev_gamma = None
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2895,20 +2901,22 @@ class MACHActivationHebbian(nn.Module):
         self._eta_state = self.eta_gru(h_unsq, self._eta_state)
         self._decay_state = self.decay_gru(h_unsq, self._decay_state)
         self._expl_state = self.expl_gru(h_unsq, self._expl_state)
+        self._gamma_state = self.gamma_gru(h_unsq, self._gamma_state)
 
         # Tonic + phasic: hard floor (genetic constraint) + learned modulation
         etas = 0.1 + 0.9 * torch.sigmoid(self.eta_out(self._eta_state.squeeze(0)))        # [0.1, 1.0]
         decays = 0.1 + 0.9 * torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # [0.1, 1.0]
         expls = 0.1 + 0.4 * torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) + self.exploration_noise
+        # Serotonin: learned discount factor (patience)
+        # Floor 0.5 (never fully myopic) + range 0.5 → [0.5, 1.0]
+        gamma = 0.5 + 0.5 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
-        # TD error with bootstrapping = RPE = dopamine signal
-        # δ = r_t + γ·V(s_t) - V(s_{t-1})
-        # Like dopamine: fires when current state is better/worse than expected
-        # Value signal propagates backward in time — reward at step 50
-        # creates TD error at step 49, then 48, etc.
-        td_error = (reward_t + self.gamma * value.detach() - self._prev_value).detach()
+        # TD error with learned discount = RPE = dopamine signal
+        # δ = r_t + γ(t)·V(s_t) - V(s_{t-1})
+        # γ is now dynamic — serotonin nucleus learns when to be patient
+        td_error = (reward_t + gamma.detach() * value.detach() - self._prev_value).detach()
         self._prev_value = value.detach().item()
 
         # Update reward EMA (for logging only)
@@ -2920,6 +2928,8 @@ class MACHActivationHebbian(nn.Module):
         self._last_td_error = td_error.item()
         self._last_expls = expls.detach()
         self._last_exploration = expls.detach().mean().item()
+        self._last_gamma = gamma.detach().item()
+        self._current_gamma = gamma  # tensor, for critic TD target
 
         for patch_idx in range(self.n_patches):
             # Gradient flows through scale/decay to nuclei GRUs.
@@ -2992,7 +3002,7 @@ class MACHActivationHebbian(nn.Module):
         # Positive RPE → reinforce current modulation. Negative → shift away.
         # This bypasses the attenuated write path (CE → hooks → patches → nuclei).
         # td_error is detached — we don't want critic gradient here, just the scalar signal.
-        self._nuclei_loss = -td_error * (etas.sum() + decays.sum() + expls.sum())
+        self._nuclei_loss = -td_error * (etas.sum() + decays.sum() + expls.sum() + gamma)
 
         return value, reward_t
 

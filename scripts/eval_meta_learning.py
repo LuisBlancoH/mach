@@ -112,11 +112,13 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             value, _ = mach.hebbian_step(reward, step, n_steps, device)
             # TD bootstrapped critic loss
             if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
-                td_target = mach._prev_reward + mach.gamma * value.detach()
+                prev_gamma = mach._prev_gamma if hasattr(mach, '_prev_gamma') and mach._prev_gamma is not None else mach.gamma
+                td_target = mach._prev_reward + prev_gamma * value.detach()
                 critic_loss = (mach._prev_critic_value - td_target) ** 2
                 window_critic_losses.append(critic_loss)
             mach._prev_critic_value = value
             mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
+            mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
             if hasattr(mach, '_nuclei_loss'):
                 window_nuclei_losses.append(mach._nuclei_loss)
         elif mode == "hebbian":
@@ -162,7 +164,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                         patch.delta_gain = patch.delta_gain.detach()
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
-            for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
+            for attr in ('_eta_state', '_decay_state', '_expl_state', '_gamma_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
             for rule_attr in ('hebb_rule', 'attn_hebb_rule'):

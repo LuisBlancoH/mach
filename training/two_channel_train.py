@@ -1132,10 +1132,12 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
 
         # 4. Critic loss: TD bootstrapped target
         if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
-            td_target = mach._prev_reward + mach.gamma * value.detach()
+            prev_gamma = mach._prev_gamma if hasattr(mach, '_prev_gamma') and mach._prev_gamma is not None else mach.gamma
+            td_target = mach._prev_reward + prev_gamma * value.detach()
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
         if hasattr(mach, '_nuclei_loss'):
             nuclei_losses.append(mach._nuclei_loss)
@@ -1228,10 +1230,12 @@ def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
 
         # Phase 5: Critic loss: TD bootstrapped target
         if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
-            td_target = mach._prev_reward + mach.gamma * value.detach()
+            prev_gamma = mach._prev_gamma if hasattr(mach, '_prev_gamma') and mach._prev_gamma is not None else mach.gamma
+            td_target = mach._prev_reward + prev_gamma * value.detach()
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
         if hasattr(mach, '_nuclei_loss'):
             nuclei_losses.append(mach._nuclei_loss)
@@ -1593,10 +1597,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # V(s_{t-1}) should equal r_{t-1} + γ·V(s_t)
         # At step t, we know V(s_t) and can compute the target for V(s_{t-1})
         if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
-            td_target = mach._prev_reward + mach.gamma * value.detach()
+            prev_gamma = mach._prev_gamma if hasattr(mach, '_prev_gamma') and mach._prev_gamma is not None else mach.gamma
+            td_target = mach._prev_reward + prev_gamma * value.detach()
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             window_critic_losses.append(critic_loss)
         mach._prev_critic_value = value
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
         # Nuclei loss: direct RPE signal to neuromodulatory nuclei
@@ -1639,7 +1645,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
             # Detach nuclei GRU states at truncation boundary
-            for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
+            for attr in ('_eta_state', '_decay_state', '_expl_state', '_gamma_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
             # Detach eligibility traces (residual + attention)
@@ -1688,9 +1694,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 eta_str = "/".join(f"{e:.2f}" for e in mach._last_etas)
                 decay_str = "/".join(f"{d:.2f}" for d in mach._last_decays)
                 expl_str = "/".join(f"{x:.2f}" for x in mach._last_expls) if hasattr(mach, '_last_expls') else f"{mach._last_exploration:.3f}"
+                gamma_str = f" γ={mach._last_gamma:.2f}" if hasattr(mach, '_last_gamma') else ""
                 neuromod_str = (f" | η=[{eta_str}]"
                                f" dec=[{decay_str}]"
                                f" expl=[{expl_str}]"
+                               f"{gamma_str}"
                                f" {td_str} Δ={dnorm:.2f}")
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
@@ -2060,6 +2068,8 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
         diag["neuromod/td_error"] = mach._last_td_error
     if hasattr(mach, '_last_exploration'):
         diag["neuromod/exploration"] = mach._last_exploration
+    if hasattr(mach, '_last_gamma'):
+        diag["neuromod/gamma"] = mach._last_gamma
 
     print(f"  Diagnostics at episode {episode_idx}:")
     for k, v in sorted(diag.items()):
