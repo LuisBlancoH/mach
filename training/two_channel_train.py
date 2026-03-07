@@ -1516,11 +1516,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         problem = problems[0]
 
         # Hippocampus retrieval: reinstate similar neural states (partial blend)
+        hipp_alpha = 0.0
         if hippocampus is not None and len(hippocampus) > 0:
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
             td_err = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
-            alpha = hippocampus.retrieve_and_reinstate(
+            hipp_alpha = hippocampus.retrieve_and_reinstate(
                 mach, act_summary, td_err, top_k=3, device=device
             )
 
@@ -1724,9 +1725,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             elapsed = time.time() - step_timer
             steps_per_sec = 100 / elapsed if elapsed > 0 else 0
             step_timer = time.time()
+            hipp_str = ""
+            if hippocampus is not None:
+                hipp_str = f" | hipp: {len(hippocampus)}mem α={hipp_alpha:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
+                f"{hipp_str}"
                 f" [{steps_per_sec:.1f} st/s]"
             )
             if wandb is not None:
@@ -1796,7 +1801,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hippocampus is not None and len(hippocampus) > 0:
                 hippocampus.decay_all()
                 hippocampus.save()
-                print(f"  Hippocampus: {len(hippocampus)} memories")
+                avg_str = sum(hippocampus._strengths) / len(hippocampus._strengths)
+                max_str = max(hippocampus._strengths)
+                print(f"  Hippocampus: {len(hippocampus)} memories, "
+                      f"avg_strength={avg_str:.3f}, max_strength={max_str:.3f}, "
+                      f"decay={hippocampus._decay_rate:.4f}, recon_scale={hippocampus._recon_scale:.2f}")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,
