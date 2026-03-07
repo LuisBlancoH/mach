@@ -201,7 +201,14 @@ def main():
                         help="Feedback every N steps in sparse mode")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--quick", action="store_true",
+                        help="Quick smoke test: 25 steps, 1 op per category")
     args = parser.parse_args()
+
+    if args.quick:
+        args.n_steps = 25
+        args.held_out_ops = [args.held_out_ops[0]]  # just first held-out op
+        args.train_ops = [args.train_ops[0]]          # just first trained op
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -287,16 +294,19 @@ def main():
 
             # Report accuracy at key points
             tag = "HELD-OUT" if is_held_out else "trained"
-            first20 = sum(r[1] for r in results[:20]) / 20
-            last20 = sum(r[1] for r in results[-20:]) / 20
-            first50 = sum(r[1] for r in results[:50]) / 50
-            last50 = sum(r[1] for r in results[-50:]) / 50
-            total = sum(r[1] for r in results) / len(results)
-            delta = last50 - first50
+            n = len(results)
+            w1 = min(20, n // 2)
+            w2 = min(50, n // 2)
+            first_w1 = sum(r[1] for r in results[:w1]) / max(w1, 1)
+            last_w1 = sum(r[1] for r in results[-w1:]) / max(w1, 1)
+            first_w2 = sum(r[1] for r in results[:w2]) / max(w2, 1)
+            last_w2 = sum(r[1] for r in results[-w2:]) / max(w2, 1)
+            total = sum(r[1] for r in results) / n
+            delta = last_w2 - first_w2
 
             print(f"  {op:12s} [{tag:8s}] | "
-                  f"first20={first20:.0%} last20={last20:.0%} | "
-                  f"first50={first50:.0%} last50={last50:.0%} | "
+                  f"first{w1}={first_w1:.0%} last{w1}={last_w1:.0%} | "
+                  f"first{w2}={first_w2:.0%} last{w2}={last_w2:.0%} | "
                   f"Δ={delta:+.0%} total={total:.0%}")
 
             patched_model.remove_hooks()
