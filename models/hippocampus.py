@@ -233,11 +233,12 @@ class Hippocampus(nn.Module):
             alpha_t = self.reinstatement_gate(gate_input).squeeze() * sim_t
             alpha_f = alpha_t.item()  # float copy for non-differentiable ops
 
-            # Retrieval strengthens memory with saturation (LTP ceiling)
-            # Diminishing returns: strong memories gain less from retrieval
-            # Like biological synapses — LTP saturates at a maximum
+            # Retrieval strengthens memory, scaled by surprise (|TD error|)
+            # Expected retrievals barely strengthen — only surprising ones refresh
+            # Plus LTP saturation: strong memories gain less
+            surprise = min(abs(current_td_error), 1.0)  # cap at 1
             headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
-            self._strengths[idx] += abs(alpha_f) * headroom
+            self._strengths[idx] += abs(alpha_f) * surprise * headroom
 
             if abs(alpha_f) < 1e-4:
                 continue
