@@ -2987,6 +2987,13 @@ class MACHActivationHebbian(nn.Module):
                     "up", scale * delta_up_a, decay=write_decay
                 )
 
+        # Nuclei auxiliary loss: direct RPE signal to neuromodulatory nuclei
+        # Like VTA/LC plasticity — dopamine RPE acts on nuclei's own synapses.
+        # Positive RPE → reinforce current modulation. Negative → shift away.
+        # This bypasses the attenuated write path (CE → hooks → patches → nuclei).
+        # td_error is detached — we don't want critic gradient here, just the scalar signal.
+        self._nuclei_loss = -td_error * (etas.sum() + decays.sum() + expls.sum())
+
         return value, reward_t
 
 

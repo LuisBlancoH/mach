@@ -62,6 +62,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
     results = []  # (step, correct, reward, td_error)
     window_ce = torch.tensor(0.0, device=device, requires_grad=True)
     window_critic_losses = []
+    window_nuclei_losses = []
     truncation_window = 20
 
     for step, problem in enumerate(problems):
@@ -116,6 +117,8 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                 window_critic_losses.append(critic_loss)
             mach._prev_critic_value = value
             mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
+            if hasattr(mach, '_nuclei_loss'):
+                window_nuclei_losses.append(mach._nuclei_loss)
         elif mode == "hebbian":
             with torch.no_grad():
                 value, _ = mach.hebbian_step(reward, step, n_steps, device)
@@ -132,6 +135,10 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                     total_loss = 0.5 * avg_critic
                 else:
                     total_loss = window_ce + 0.5 * avg_critic
+                # Nuclei auxiliary loss
+                if window_nuclei_losses:
+                    avg_nuclei = torch.stack(window_nuclei_losses).mean()
+                    total_loss = total_loss + 0.1 * avg_nuclei
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
                 optimizer.step()
@@ -181,6 +188,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
 
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []
+            window_nuclei_losses = []
 
     return results
 

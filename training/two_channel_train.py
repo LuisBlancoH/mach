@@ -1095,6 +1095,7 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
     problem_losses = []
     total_ce = torch.tensor(0.0, device=device, requires_grad=True)
     critic_losses = []
+    nuclei_losses = []
 
     for step, problem in enumerate(problems):
         # 1. Forward pass (hooks capture pre/post activations)
@@ -1136,10 +1137,13 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
+        if hasattr(mach, '_nuclei_loss'):
+            nuclei_losses.append(mach._nuclei_loss)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
+    avg_nuclei_loss = torch.stack(nuclei_losses).mean() if nuclei_losses else torch.tensor(0.0, device=device)
 
-    return total_ce, rewards, problem_losses, avg_critic_loss
+    return total_ce, rewards, problem_losses, avg_critic_loss + 0.1 * avg_nuclei_loss
 
 
 def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
@@ -1164,6 +1168,7 @@ def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
     problem_losses = []
     total_ce = torch.tensor(0.0, device=device, requires_grad=True)
     critic_losses = []
+    nuclei_losses = []
 
     for step, problem in enumerate(problems):
         prompt_text = problem["prompt"]
@@ -1228,10 +1233,13 @@ def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
+        if hasattr(mach, '_nuclei_loss'):
+            nuclei_losses.append(mach._nuclei_loss)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
+    avg_nuclei_loss = torch.stack(nuclei_losses).mean() if nuclei_losses else torch.tensor(0.0, device=device)
 
-    return total_ce, rewards, problem_losses, avg_critic_loss
+    return total_ce, rewards, problem_losses, avg_critic_loss + 0.1 * avg_nuclei_loss
 
 
 def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
@@ -1451,6 +1459,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     # Running stats
     window_ce = torch.tensor(0.0, device=device, requires_grad=True)
     window_critic_losses = []
+    window_nuclei_losses = []
     all_rewards = []
     current_op = random.choice(DIVERSE_TRAIN_OPS)
     op_step_count = 0
@@ -1590,10 +1599,18 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         mach._prev_critic_value = value
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
+        # Nuclei loss: direct RPE signal to neuromodulatory nuclei
+        if hasattr(mach, '_nuclei_loss'):
+            window_nuclei_losses.append(mach._nuclei_loss)
+
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
-            avg_critic = torch.stack(window_critic_losses).mean()
+            avg_critic = torch.stack(window_critic_losses).mean() if window_critic_losses else torch.tensor(0.0, device=device)
             total_loss = window_ce + 0.5 * avg_critic
+            # Nuclei auxiliary loss: direct RPE → nuclei (like VTA plasticity)
+            if window_nuclei_losses:
+                avg_nuclei = torch.stack(window_nuclei_losses).mean()
+                total_loss = total_loss + 0.1 * avg_nuclei
             total_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -1652,6 +1669,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []
+            window_nuclei_losses = []
 
         # Logging
         if step % 100 == 0 and step > 0:
