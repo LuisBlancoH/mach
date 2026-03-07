@@ -1450,18 +1450,15 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     op_step_count = 0
     op_switch_interval = random.randint(10, 60)  # random task duration
 
-    # Hippocampus: episodic memory with neural state reinstatement
+    # Hippocampus: compressed episodic memory
     hippocampus = None
     if memory_path is not None:
         from models.hippocampus import Hippocampus
         key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
         hippocampus = Hippocampus(
             key_dim=key_dim,
-            n_patches=mach.n_patches,
-            d_model=mach.d_model,
-            patch_hidden_dim=mach.patches[0].hidden_dim,
-            attn_hidden_dim=mach.attn_hidden_dim,
             pfc_dim=32,
+            n_patches=mach.n_patches,
             save_path=memory_path,
         ).to(device)
         # Add hippocampus params to optimizer
@@ -1568,8 +1565,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Hippocampus: store surprising neural states
+        # Hippocampus: reconsolidate retrieved memories, then store current state
         if hippocampus is not None:
+            # Reconsolidate: update memories retrieved last step based on outcome
+            hippocampus.reconsolidate(mach._last_td_error)
+            # Store current state (strength = |td_error|, no threshold)
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
             hippocampus.store(mach, act_summary, reward, mach._last_td_error)

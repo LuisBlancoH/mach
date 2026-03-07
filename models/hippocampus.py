@@ -1,27 +1,28 @@
 """
-Hippocampus: episodic memory that stores and reinstates neural states.
+Hippocampus: compressed episodic memory with neural state reinstatement.
 
 Real hippocampus circuit:
-  Cortex → Entorhinal → Dentate Gyrus (pattern separation) →
+  Cortex → Entorhinal (compression) → Dentate Gyrus (pattern separation) →
   CA3 (pattern completion, recurrent attractors) →
-  CA1 (novelty detection, comparison) → back to Cortex
+  CA1 (novelty/comparison) → back to Cortex (reinstatement)
 
-Key insight: the hippocampus stores and retrieves NEURAL STATES,
-not text. Retrieval reinstates the cortical activation pattern —
-the patch deltas, PFC state, neuromod context that worked before.
+Key design decisions (brain-faithful):
+- Stores COMPRESSED state: PFC state (32d) + neuromod values (12d),
+  NOT raw patch deltas. The hippocampus stores the index, cortex
+  reconstructs the details via plasticity.
+- No storage threshold: everything gets encoded, with initial strength
+  proportional to |TD error|. Weak memories decay away naturally.
+- Reconsolidation: retrieved memories are updated by subsequent TD error.
+  Positive surprise strengthens, negative surprise weakens. No threshold.
+- Sequential structure: PFC GRU state drifts slowly, so memories from
+  the same task block naturally cluster. Temporal context is implicit.
+- Pattern separation (DG): orthogonalizes similar keys so add/sub
+  don't collide.
+- Reinstatement is PARTIAL: blend stored PFC + neuromod into current
+  state. The system reconstructs appropriate patches from the bias.
 
-Reinstatement is PARTIAL (blended with current state), not complete.
-Memories are reconstructive — they bias current processing, not replace it.
-Stronger matches reinstate more strongly.
-
-Brain mapping:
-- Encoding: patch_deltas + pfc_state + neuromod → compressed episode (entorhinal → hippocampus)
-- Pattern separation: DG-like projection makes similar inputs distinct
-- Storage: content-addressable (CA3 pattern completion)
-- Retrieval: similarity search → partial reinstatement of stored neural state
-- Novelty detection: CA1 comparator (is this new? → store it)
-- Consolidation: replay → gradient updates (hippocampus → cortex during sleep)
-- Forgetting: decay without reinforcement
+Storage per memory: ~170 floats = 680 bytes.
+500 memories = 340KB (vs 6.5GB for raw patch deltas).
 """
 
 import os
@@ -31,36 +32,32 @@ import numpy as np
 
 
 class Hippocampus(nn.Module):
-    """Episodic memory that stores and reinstates neural states.
+    """Compressed episodic memory with neural state reinstatement.
 
-    Stores: (key_embedding, patch_deltas, pfc_state, neuromod_values, reward)
-    Retrieves: blends stored state into current state (partial reinstatement)
+    Stores: (key, pfc_state, neuromod_values, reward)
+    Retrieves: blends stored PFC + neuromod into current state
+    Cortex (plasticity system) reconstructs patch deltas from the bias.
     """
 
-    def __init__(self, key_dim, n_patches, d_model, patch_hidden_dim,
-                 attn_hidden_dim, pfc_dim=32, max_memories=500,
-                 surprise_threshold=0.3, decay_rate=0.999,
-                 save_path=None):
+    def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=500,
+                 decay_rate=0.999, save_path=None):
         super().__init__()
         self.key_dim = key_dim
-        self.n_patches = n_patches
-        self.d_model = d_model
-        self.patch_hidden_dim = patch_hidden_dim
-        self.attn_hidden_dim = attn_hidden_dim
         self.pfc_dim = pfc_dim
+        self.n_patches = n_patches
         self.max_memories = max_memories
-        self.surprise_threshold = surprise_threshold
         self.decay_rate = decay_rate
         self.save_path = save_path
 
         # Pattern separation: key_dim → key_dim (like dentate gyrus)
-        # Orthogonalizes similar inputs so add/sub don't collide
+        # Sparse ReLU = DG's extremely sparse firing (~2% active)
+        # Orthogonalizes similar inputs so add/sub get distinct codes
         self.pattern_sep = nn.Sequential(
             nn.Linear(key_dim, key_dim * 2),
-            nn.ReLU(),  # sparse activation (DG has very sparse firing)
+            nn.ReLU(),
             nn.Linear(key_dim * 2, key_dim),
         )
-        # Init to near-identity so it works before training
+        # Init near-identity so it works before training
         with torch.no_grad():
             nn.init.eye_(self.pattern_sep[0].weight[:key_dim])
             nn.init.zeros_(self.pattern_sep[0].weight[key_dim:])
@@ -69,8 +66,8 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.pattern_sep[2].weight[:, key_dim:])
             nn.init.zeros_(self.pattern_sep[2].bias)
 
-        # Reinstatement gate: controls blend strength based on similarity
-        # Input: similarity scalar + current td_error + stored reward
+        # Reinstatement gate: learned blend strength
+        # Input: similarity + |current_td_error| + stored_reward
         self.reinstatement_gate = nn.Sequential(
             nn.Linear(3, 8),
             nn.Tanh(),
@@ -81,91 +78,65 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.reinstatement_gate[-2].bias.fill_(-1.0)
 
-        # Storage (not nn.Parameters — these are memory contents, not weights)
-        self._keys = []          # list of numpy arrays (key_dim,)
-        self._strengths = []     # list of floats (decay over time)
-        self._rewards = []       # list of floats (reward at storage time)
-        self._td_errors = []     # list of floats (surprise at storage)
-
-        # Stored neural states (numpy for disk persistence)
-        self._patch_deltas_down = []   # list of list of numpy (hidden, d_model)
-        self._patch_deltas_up = []     # list of list of numpy (d_model, hidden)
-        self._attn_deltas_down = []    # list of list of numpy (attn_hidden, d_model)
-        self._attn_deltas_up = []      # list of list of numpy (d_model, attn_hidden)
-        self._pfc_states = []          # list of numpy (pfc_dim,)
-        self._neuromod_values = []     # list of dict {eta, decay, expl}
+        # Storage: compressed neural states (~170 floats per memory)
+        self._keys = []           # (key_dim,) — pattern-separated activation key
+        self._strengths = []      # scalar — decays over time, updated by reconsolidation
+        self._rewards = []        # scalar — reward at storage time
+        self._pfc_states = []     # (pfc_dim,) — compressed task representation
+        self._neuromod_etas = []  # (n_patches,) — per-patch learning rates
+        self._neuromod_decays = []  # (n_patches,) — per-patch retention
+        self._neuromod_expls = []   # (n_patches,) — per-patch exploration
+        # Track which memories were retrieved this step (for reconsolidation)
+        self._last_retrieved_indices = []
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
 
     def encode_key(self, activation_summary):
-        """Entorhinal → DG: encode activation summary into memory key.
-
-        Pattern separation makes similar inputs more distinct.
-        """
+        """Entorhinal → DG: compress and pattern-separate."""
         return self.pattern_sep(activation_summary)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """Store current neural state if surprising enough (CA1 novelty detection).
+        """Encode current state into memory. Strength proportional to surprise.
 
-        Args:
-            mach: MACHActivationHebbian instance (we read its state)
-            activation_summary: compressed activations (key_dim,)
-            reward: scalar reward received
-            td_error: scalar TD error (surprise)
+        No threshold — everything gets stored. Weak memories decay away.
+        Near-duplicates reinforce existing memory instead of duplicating.
         """
-        if abs(td_error) < self.surprise_threshold:
-            return False
+        strength = abs(td_error)  # initial strength = how surprising
+        if strength < 1e-6:
+            strength = 1e-6  # floor so memory exists
 
-        # Pattern-separated key
         with torch.no_grad():
             key = self.encode_key(activation_summary)
             key_np = key.cpu().numpy().astype(np.float32)
 
-        # Check for near-duplicate (CA3 — don't store if already known)
+        # Near-duplicate check (CA3 — don't store what you already know)
         if self._keys:
             sims = self._cosine_similarities(key_np)
             if sims.max() > 0.9:
-                # Reinforce existing memory instead of duplicating
+                # Reinforce existing memory via reconsolidation
                 idx = int(sims.argmax())
-                self._strengths[idx] = min(self._strengths[idx] + 0.1, 1.0)
+                self._strengths[idx] += strength
                 return False
 
-        # Extract neural state to store
-        patch_dd = []
-        patch_du = []
-        attn_dd = []
-        attn_du = []
-        for patch in mach.patches:
-            dd = patch.delta_down.detach().cpu().numpy().astype(np.float16) if patch.delta_down is not None else None
-            du = patch.delta_up.detach().cpu().numpy().astype(np.float16) if patch.delta_up is not None else None
-            patch_dd.append(dd)
-            patch_du.append(du)
-        for patch in mach.attn_patches:
-            dd = patch.delta_down.detach().cpu().numpy().astype(np.float16) if patch.delta_down is not None else None
-            du = patch.delta_up.detach().cpu().numpy().astype(np.float16) if patch.delta_up is not None else None
-            attn_dd.append(dd)
-            attn_du.append(du)
-
+        # Extract compressed state
         pfc = mach._pfc_state.detach().squeeze(0).cpu().numpy().astype(np.float32)
 
-        neuromod = {}
-        if hasattr(mach, '_last_etas'):
-            neuromod['eta'] = mach._last_etas.cpu().numpy().astype(np.float32).tolist()
-            neuromod['decay'] = mach._last_decays.cpu().numpy().astype(np.float32).tolist()
-            neuromod['expl'] = mach._last_expls.cpu().numpy().astype(np.float32).tolist()
+        etas = np.zeros(self.n_patches, dtype=np.float32)
+        decays = np.zeros(self.n_patches, dtype=np.float32)
+        expls = np.zeros(self.n_patches, dtype=np.float32)
+        if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+            etas = mach._last_etas.cpu().numpy().astype(np.float32)
+            decays = mach._last_decays.cpu().numpy().astype(np.float32)
+            expls = mach._last_expls.cpu().numpy().astype(np.float32)
 
-        # Store
         self._keys.append(key_np)
-        self._strengths.append(1.0)
+        self._strengths.append(float(strength))
         self._rewards.append(float(reward))
-        self._td_errors.append(float(abs(td_error)))
-        self._patch_deltas_down.append(patch_dd)
-        self._patch_deltas_up.append(patch_du)
-        self._attn_deltas_down.append(attn_dd)
-        self._attn_deltas_up.append(attn_du)
         self._pfc_states.append(pfc)
-        self._neuromod_values.append(neuromod)
+        self._neuromod_etas.append(etas)
+        self._neuromod_decays.append(decays)
+        self._neuromod_expls.append(expls)
 
         # Evict weakest if over capacity
         if len(self._keys) > self.max_memories:
@@ -176,20 +147,14 @@ class Hippocampus(nn.Module):
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
-        """Retrieve similar memories and partially reinstate their neural states.
+        """Retrieve similar memories and partially reinstate their state.
 
-        Partial reinstatement: blend stored state into current state.
-        Blend strength depends on similarity, surprise, and learned gate.
-
-        Args:
-            mach: MACHActivationHebbian instance (we modify its state)
-            activation_summary: current compressed activations
-            current_td_error: how surprised we are right now
-            top_k: number of memories to consider
-            device: torch device
+        Reinstatement biases PFC state and neuromod values toward stored state.
+        The plasticity system then reconstructs appropriate patches from the bias.
+        Blend strength = learned gate × similarity (no arbitrary thresholds).
 
         Returns:
-            float: max reinstatement alpha used (0 = no reinstatement)
+            float: max reinstatement alpha used (0 = no retrieval)
         """
         if not self._keys:
             return 0.0
@@ -208,60 +173,69 @@ class Hippocampus(nn.Module):
         top_indices = np.argsort(weighted_sims)[-k:][::-1]
 
         max_alpha = 0.0
+        self._last_retrieved_indices = []
 
         for idx in top_indices:
             sim = float(sims[idx])
-            if sim < 0.3:  # too dissimilar, skip
+            if sim < 0.1:
                 continue
 
-            # Reinforce retrieved memory (retrieval strengthens memory)
-            self._strengths[idx] = min(self._strengths[idx] + 0.05, 1.0)
+            self._last_retrieved_indices.append(int(idx))
 
-            # Compute reinstatement strength via learned gate
-            # Input: similarity, current surprise, stored reward
+            # Learned reinstatement gate
             gate_input = torch.tensor([
                 sim,
                 abs(current_td_error),
                 self._rewards[idx],
             ], device=device, dtype=torch.float32)
             alpha = self.reinstatement_gate(gate_input).item()
-            alpha = alpha * sim  # scale by similarity (very different → almost no reinstatement)
+            alpha = alpha * sim  # similarity-scaled
 
-            if alpha < 0.01:
+            if alpha < 0.001:
                 continue
 
             max_alpha = max(max_alpha, alpha)
 
-            # Partial reinstatement: blend stored neural state into current
-            # patch_deltas = (1 - alpha) * current + alpha * stored
-            for i, patch in enumerate(mach.patches):
-                stored_dd = self._patch_deltas_down[idx][i]
-                stored_du = self._patch_deltas_up[idx][i]
-                if stored_dd is not None and patch.delta_down is not None:
-                    stored_t = torch.from_numpy(stored_dd.astype(np.float32)).to(device)
-                    patch.delta_down = (1 - alpha) * patch.delta_down + alpha * stored_t
-                if stored_du is not None and patch.delta_up is not None:
-                    stored_t = torch.from_numpy(stored_du.astype(np.float32)).to(device)
-                    patch.delta_up = (1 - alpha) * patch.delta_up + alpha * stored_t
-
-            for i, patch in enumerate(mach.attn_patches):
-                stored_dd = self._attn_deltas_down[idx][i]
-                stored_du = self._attn_deltas_up[idx][i]
-                if stored_dd is not None and patch.delta_down is not None:
-                    stored_t = torch.from_numpy(stored_dd.astype(np.float32)).to(device)
-                    patch.delta_down = (1 - alpha) * patch.delta_down + alpha * stored_t
-                if stored_du is not None and patch.delta_up is not None:
-                    stored_t = torch.from_numpy(stored_du.astype(np.float32)).to(device)
-                    patch.delta_up = (1 - alpha) * patch.delta_up + alpha * stored_t
-
-            # Blend PFC state
+            # Partial reinstatement: blend stored PFC state into current
             stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
             mach._pfc_state = (1 - alpha) * mach._pfc_state + alpha * stored_pfc
 
+            # Bias neuromod nuclei toward stored values
+            # We bias the GRU states that produce eta/decay/expl
+            # This is indirect — the nuclei will drift from this bias,
+            # but it gives them a starting point
+            if hasattr(mach, '_eta_state') and len(self._neuromod_etas[idx]) > 0:
+                # We can't directly set eta/decay/expl (they're computed from GRU states)
+                # Instead, store a bias that gets applied at the next hebbian_step
+                if not hasattr(mach, '_neuromod_bias'):
+                    mach._neuromod_bias = None
+                mach._neuromod_bias = {
+                    'eta': torch.from_numpy(self._neuromod_etas[idx]).to(device),
+                    'decay': torch.from_numpy(self._neuromod_decays[idx]).to(device),
+                    'expl': torch.from_numpy(self._neuromod_expls[idx]).to(device),
+                    'alpha': alpha,
+                }
+
         return max_alpha
 
+    def reconsolidate(self, td_error):
+        """Update retrieved memories based on outcome (reconsolidation).
+
+        Called after the step that used retrieved memories.
+        Positive TD error (better than expected) → strengthen.
+        Negative TD error (worse than expected) → weaken.
+        No threshold — the TD error IS the update signal.
+        """
+        for idx in self._last_retrieved_indices:
+            if idx < len(self._strengths):
+                self._strengths[idx] += td_error
+                # Clamp: strength can't go negative (memory dies at 0)
+                if self._strengths[idx] < 0:
+                    self._strengths[idx] = 0.0
+        self._last_retrieved_indices = []
+
     def decay_all(self):
-        """Apply passive decay. Unretrieved memories fade."""
+        """Passive decay. Unretrieved memories fade (use it or lose it)."""
         alive = []
         for i in range(len(self._strengths)):
             self._strengths[i] *= self.decay_rate
@@ -270,33 +244,6 @@ class Hippocampus(nn.Module):
 
         if len(alive) < len(self._strengths):
             self._filter_indices(alive)
-
-    def get_replay_batch(self, batch_size=10):
-        """Sample stored neural states for sleep replay, weighted by strength.
-
-        Returns list of dicts with full neural state for each memory.
-        """
-        if not self._keys:
-            return []
-
-        strengths = np.array(self._strengths)
-        probs = strengths / strengths.sum()
-        k = min(batch_size, len(self._keys))
-        indices = np.random.choice(len(self._keys), size=k, replace=False, p=probs)
-
-        results = []
-        for idx in indices:
-            results.append({
-                'patch_deltas_down': self._patch_deltas_down[idx],
-                'patch_deltas_up': self._patch_deltas_up[idx],
-                'attn_deltas_down': self._attn_deltas_down[idx],
-                'attn_deltas_up': self._attn_deltas_up[idx],
-                'pfc_state': self._pfc_states[idx],
-                'neuromod': self._neuromod_values[idx],
-                'reward': self._rewards[idx],
-                'td_error': self._td_errors[idx],
-            })
-        return results
 
     def _cosine_similarities(self, query):
         if not self._keys:
@@ -307,49 +254,31 @@ class Hippocampus(nn.Module):
         return m_norms @ q_norm
 
     def _evict(self, idx):
-        for lst in (self._keys, self._strengths, self._rewards, self._td_errors,
-                    self._patch_deltas_down, self._patch_deltas_up,
-                    self._attn_deltas_down, self._attn_deltas_up,
-                    self._pfc_states, self._neuromod_values):
+        for lst in (self._keys, self._strengths, self._rewards,
+                    self._pfc_states, self._neuromod_etas,
+                    self._neuromod_decays, self._neuromod_expls):
             lst.pop(idx)
 
     def _filter_indices(self, alive):
-        for attr in ('_keys', '_strengths', '_rewards', '_td_errors',
-                     '_patch_deltas_down', '_patch_deltas_up',
-                     '_attn_deltas_down', '_attn_deltas_up',
-                     '_pfc_states', '_neuromod_values'):
+        for attr in ('_keys', '_strengths', '_rewards',
+                     '_pfc_states', '_neuromod_etas',
+                     '_neuromod_decays', '_neuromod_expls'):
             lst = getattr(self, attr)
             setattr(self, attr, [lst[i] for i in alive])
 
     def save(self, path=None):
-        """Persist memories to disk."""
+        """Persist to disk."""
         path = path or self.save_path
         if path is None:
             return
-
         data = {
             'keys': [k.tolist() for k in self._keys],
             'strengths': self._strengths,
             'rewards': self._rewards,
-            'td_errors': self._td_errors,
-            'patch_deltas_down': [
-                [d.tolist() if d is not None else None for d in pdd]
-                for pdd in self._patch_deltas_down
-            ],
-            'patch_deltas_up': [
-                [d.tolist() if d is not None else None for d in pdu]
-                for pdu in self._patch_deltas_up
-            ],
-            'attn_deltas_down': [
-                [d.tolist() if d is not None else None for d in add]
-                for add in self._attn_deltas_down
-            ],
-            'attn_deltas_up': [
-                [d.tolist() if d is not None else None for d in adu]
-                for adu in self._attn_deltas_up
-            ],
             'pfc_states': [p.tolist() for p in self._pfc_states],
-            'neuromod_values': self._neuromod_values,
+            'neuromod_etas': [e.tolist() for e in self._neuromod_etas],
+            'neuromod_decays': [d.tolist() for d in self._neuromod_decays],
+            'neuromod_expls': [x.tolist() for x in self._neuromod_expls],
         }
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save(data, path)
@@ -361,25 +290,10 @@ class Hippocampus(nn.Module):
         self._keys = [np.array(k, dtype=np.float32) for k in data['keys']]
         self._strengths = data['strengths']
         self._rewards = data['rewards']
-        self._td_errors = data['td_errors']
-        self._patch_deltas_down = [
-            [np.array(d, dtype=np.float16) if d is not None else None for d in pdd]
-            for pdd in data['patch_deltas_down']
-        ]
-        self._patch_deltas_up = [
-            [np.array(d, dtype=np.float16) if d is not None else None for d in pdu]
-            for pdu in data['patch_deltas_up']
-        ]
-        self._attn_deltas_down = [
-            [np.array(d, dtype=np.float16) if d is not None else None for d in add]
-            for add in data['attn_deltas_down']
-        ]
-        self._attn_deltas_up = [
-            [np.array(d, dtype=np.float16) if d is not None else None for d in adu]
-            for adu in data['attn_deltas_up']
-        ]
         self._pfc_states = [np.array(p, dtype=np.float32) for p in data['pfc_states']]
-        self._neuromod_values = data['neuromod_values']
+        self._neuromod_etas = [np.array(e, dtype=np.float32) for e in data['neuromod_etas']]
+        self._neuromod_decays = [np.array(d, dtype=np.float32) for d in data['neuromod_decays']]
+        self._neuromod_expls = [np.array(x, dtype=np.float32) for x in data['neuromod_expls']]
 
     def __len__(self):
         return len(self._keys)
