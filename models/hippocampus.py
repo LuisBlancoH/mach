@@ -176,6 +176,9 @@ class Hippocampus(nn.Module):
         The plasticity system then reconstructs appropriate patches from the bias.
         Blend strength = learned gate × similarity (no arbitrary thresholds).
 
+        Gradient flows through reinstatement_gate → alpha → PFC blend → downstream
+        loss. The gate learns what blend strength to use for different contexts.
+
         Returns:
             float: max reinstatement alpha used (0 = no retrieval)
         """
@@ -185,9 +188,11 @@ class Hippocampus(nn.Module):
         if device is None:
             device = activation_summary.device
 
-        with torch.no_grad():
-            key = self.encode_key(activation_summary)
-            key_np = key.cpu().numpy().astype(np.float32)
+        # Pattern separation with gradient flow:
+        # 1. Numpy similarity for fast top-k selection (no grad needed here)
+        # 2. Differentiable similarity for selected candidates (grad → pattern_sep)
+        key = self.encode_key(activation_summary)  # gradient flows through pattern_sep
+        key_np = key.detach().cpu().numpy().astype(np.float32)
 
         sims = self._cosine_similarities(key_np)
         weighted_sims = sims * np.array(self._strengths)
@@ -195,50 +200,54 @@ class Hippocampus(nn.Module):
         k = min(top_k, len(self._keys))
         top_indices = np.argsort(weighted_sims)[-k:][::-1]
 
+        # Recompute similarity differentiably for top-k (gradient → pattern_sep)
+        key_norm = key / (key.norm() + 1e-8)
+
         max_alpha = 0.0
         self._last_retrieved_indices = []
 
         for idx in top_indices:
-            sim = float(sims[idx])
+            # Differentiable cosine similarity: gradient flows through key → pattern_sep
+            stored_key = torch.from_numpy(self._keys[idx]).to(device)
+            stored_norm = stored_key / (stored_key.norm() + 1e-8)
+            sim_t = (key_norm * stored_norm).sum()  # tensor with grad
+            sim = sim_t.item()  # float for non-diff ops
 
             self._last_retrieved_indices.append(int(idx))
 
-            # Learned reinstatement gate (replaces hardcoded sim cutoff)
-            gate_input = torch.tensor([
-                sim,
-                abs(current_td_error),
-                self._rewards[idx],
-            ], device=device, dtype=torch.float32)
-            alpha = self.reinstatement_gate(gate_input).item()
-            alpha = alpha * sim  # similarity-scaled
+            # Learned reinstatement gate — alpha stays as TENSOR for gradient flow
+            # Gate learns: (similarity, surprise, stored_reward) → blend strength
+            # sim_t is differentiable → gradient flows through pattern_sep
+            gate_input = torch.stack([
+                sim_t,
+                torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
+                torch.tensor(self._rewards[idx], device=device, dtype=torch.float32),
+            ])
+            alpha_t = self.reinstatement_gate(gate_input).squeeze() * sim_t
+            alpha_f = alpha_t.item()  # float copy for non-differentiable ops
 
             # Retrieval strengthens memory proportional to reinstatement strength
-            # Stronger retrieval = more strengthening (no hardcoded constant)
-            self._strengths[idx] += alpha
+            self._strengths[idx] += alpha_f
 
-            if alpha < 1e-4:
+            if alpha_f < 1e-4:
                 continue
 
-            max_alpha = max(max_alpha, alpha)
+            max_alpha = max(max_alpha, alpha_f)
 
             # Partial reinstatement: blend stored PFC state into current
+            # GRADIENT FLOWS: loss → pfc_state → alpha_t → gate weights
             stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
-            mach._pfc_state = (1 - alpha) * mach._pfc_state + alpha * stored_pfc
+            mach._pfc_state = (1 - alpha_t) * mach._pfc_state + alpha_t * stored_pfc
 
             # Bias neuromod nuclei toward stored values
-            # We bias the GRU states that produce eta/decay/expl
-            # This is indirect — the nuclei will drift from this bias,
-            # but it gives them a starting point
             if hasattr(mach, '_eta_state') and len(self._neuromod_etas[idx]) > 0:
-                # We can't directly set eta/decay/expl (they're computed from GRU states)
-                # Instead, store a bias that gets applied at the next hebbian_step
                 if not hasattr(mach, '_neuromod_bias'):
                     mach._neuromod_bias = None
                 mach._neuromod_bias = {
                     'eta': torch.from_numpy(self._neuromod_etas[idx]).to(device),
                     'decay': torch.from_numpy(self._neuromod_decays[idx]).to(device),
                     'expl': torch.from_numpy(self._neuromod_expls[idx]).to(device),
-                    'alpha': alpha,
+                    'alpha': alpha_f,
                 }
 
         return max_alpha
