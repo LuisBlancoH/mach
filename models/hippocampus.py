@@ -40,13 +40,12 @@ class Hippocampus(nn.Module):
     """
 
     def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=500,
-                 decay_rate=0.999, save_path=None):
+                 save_path=None):
         super().__init__()
         self.key_dim = key_dim
         self.pfc_dim = pfc_dim
         self.n_patches = n_patches
         self.max_memories = max_memories
-        self.decay_rate = decay_rate
         self.save_path = save_path
 
         # Pattern separation: key_dim → key_dim (like dentate gyrus)
@@ -78,6 +77,13 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.reinstatement_gate[-2].bias.fill_(-1.0)
 
+        # Learned memory dynamics (replace hardcoded constants)
+        # All constrained to sensible ranges via sigmoid
+        # _raw values are unconstrained; properties apply sigmoid + range mapping
+        self._raw_decay = nn.Parameter(torch.tensor(3.0))       # → ~0.999 via sigmoid mapping
+        self._raw_dup_thresh = nn.Parameter(torch.tensor(2.0))  # → ~0.9 via sigmoid mapping
+        self._raw_recon_scale = nn.Parameter(torch.tensor(0.0)) # → ~1.0 via exp mapping
+
         # Storage: compressed neural states (~170 floats per memory)
         self._keys = []           # (key_dim,) — pattern-separated activation key
         self._strengths = []      # scalar — decays over time, updated by reconsolidation
@@ -91,6 +97,21 @@ class Hippocampus(nn.Module):
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
+
+    @property
+    def decay_rate(self):
+        """Learned decay rate ∈ [0.99, 0.9999]. Higher = slower forgetting."""
+        return 0.99 + 0.0099 * torch.sigmoid(self._raw_decay)
+
+    @property
+    def dup_threshold(self):
+        """Learned near-duplicate threshold ∈ [0.5, 0.99]."""
+        return 0.5 + 0.49 * torch.sigmoid(self._raw_dup_thresh)
+
+    @property
+    def recon_scale(self):
+        """Learned reconsolidation scale ∈ [0.01, 10]. Controls TD error → strength."""
+        return 0.01 + 9.99 * torch.sigmoid(self._raw_recon_scale)
 
     def encode_key(self, activation_summary):
         """Entorhinal → DG: compress and pattern-separate."""
@@ -113,7 +134,7 @@ class Hippocampus(nn.Module):
         # Near-duplicate check (CA3 — don't store what you already know)
         if self._keys:
             sims = self._cosine_similarities(key_np)
-            if sims.max() > 0.9:
+            if sims.max() > self.dup_threshold.item():
                 # Reinforce existing memory via reconsolidation
                 idx = int(sims.argmax())
                 self._strengths[idx] += strength
@@ -177,16 +198,10 @@ class Hippocampus(nn.Module):
 
         for idx in top_indices:
             sim = float(sims[idx])
-            if sim < 0.1:
-                continue
 
             self._last_retrieved_indices.append(int(idx))
 
-            # Retrieval strengthens memory (use it or lose it)
-            # Counteracts passive decay — frequently useful memories persist
-            self._strengths[idx] += 0.01
-
-            # Learned reinstatement gate
+            # Learned reinstatement gate (replaces hardcoded sim cutoff)
             gate_input = torch.tensor([
                 sim,
                 abs(current_td_error),
@@ -195,7 +210,11 @@ class Hippocampus(nn.Module):
             alpha = self.reinstatement_gate(gate_input).item()
             alpha = alpha * sim  # similarity-scaled
 
-            if alpha < 0.001:
+            # Retrieval strengthens memory proportional to reinstatement strength
+            # Stronger retrieval = more strengthening (no hardcoded constant)
+            self._strengths[idx] += alpha
+
+            if alpha < 1e-4:
                 continue
 
             max_alpha = max(max_alpha, alpha)
@@ -228,11 +247,12 @@ class Hippocampus(nn.Module):
         Called after the step that used retrieved memories.
         Positive TD error (better than expected) → strengthen.
         Negative TD error (worse than expected) → weaken.
-        No threshold — the TD error IS the update signal.
+        Scale is learned — controls how sensitive memory is to surprise.
         """
+        scale = self.recon_scale.item()
         for idx in self._last_retrieved_indices:
             if idx < len(self._strengths):
-                self._strengths[idx] += td_error
+                self._strengths[idx] += td_error * scale
                 # Clamp: strength can't go negative (memory dies at 0)
                 if self._strengths[idx] < 0:
                     self._strengths[idx] = 0.0
@@ -240,10 +260,11 @@ class Hippocampus(nn.Module):
 
     def decay_all(self):
         """Passive decay. Unretrieved memories fade (use it or lose it)."""
+        decay = self.decay_rate.item()
         alive = []
         for i in range(len(self._strengths)):
-            self._strengths[i] *= self.decay_rate
-            if self._strengths[i] >= 0.01:
+            self._strengths[i] *= decay
+            if self._strengths[i] >= 1e-4:
                 alive.append(i)
 
         if len(alive) < len(self._strengths):
