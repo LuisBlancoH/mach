@@ -1494,6 +1494,9 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     # Context buffer: rolling history of recent problems (short-term)
     context_buffer = []  # list of "a ? b = answer\n" strings
 
+    import time
+    step_timer = time.time()
+
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
         op_step_count += 1
@@ -1711,9 +1714,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                                f" expl=[{expl_str}]"
                                f"{gamma_str}"
                                f" {td_str} Δ={dnorm:.2f}")
+            elapsed = time.time() - step_timer
+            steps_per_sec = 100 / elapsed if elapsed > 0 else 0
+            step_timer = time.time()
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
+                f" [{steps_per_sec:.1f} st/s]"
             )
             if wandb is not None:
                 wandb.log({
