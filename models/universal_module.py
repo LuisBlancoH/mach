@@ -2679,14 +2679,27 @@ class MACHActivationHebbian(nn.Module):
         self._step_count = 0
         self._reward_ema = 0.0
 
-        # Patches
+        # Residual stream patches (existing)
         self.patches = nn.ModuleList([
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
-        # Brain-like learned plasticity rule (replaces simple Hebbian outer products)
+        # Attention output patches: modify what information gets routed
+        # Smaller hidden dim (64 vs 256) — subtle corrections to attention routing
+        from config import ATTN_PATCH_HIDDEN_DIM
+        self.attn_hidden_dim = ATTN_PATCH_HIDDEN_DIM
+        self.attn_patches = nn.ModuleList([
+            DifferentiablePatch(d_model, ATTN_PATCH_HIDDEN_DIM) for _ in patch_layers
+        ])
+
+        # Brain-like learned plasticity rule for residual patches
         self.hebb_rule = LearnedPlasticityRule(
             d_model, hidden_dim, len(patch_layers), n_rank, d_proj
+        )
+
+        # Separate plasticity rule for attention patches
+        self.attn_hebb_rule = LearnedPlasticityRule(
+            d_model, ATTN_PATCH_HIDDEN_DIM, len(patch_layers), n_rank, d_proj
         )
 
         # Freeze projections for reservoir-style learning
@@ -2746,6 +2759,8 @@ class MACHActivationHebbian(nn.Module):
         # State
         self._pre_activations = {}
         self._post_activations = {}
+        self._attn_pre_activations = {}   # input to self_attn
+        self._attn_post_activations = {}  # attention output (after patch)
         self._context_gate_values = {}  # precomputed gates for hooks
 
     def reset_episode(self):
@@ -2755,16 +2770,21 @@ class MACHActivationHebbian(nn.Module):
             if self.init_std > 0:
                 patch.delta_down = patch.delta_down + torch.randn_like(patch.delta_down) * self.init_std
                 patch.delta_up = patch.delta_up + torch.randn_like(patch.delta_up) * self.init_std
+        for patch in self.attn_patches:
+            patch.reset_deltas()
         self._pre_activations.clear()
         self._post_activations.clear()
+        self._attn_pre_activations.clear()
+        self._attn_post_activations.clear()
         # Reset critic memory, nuclei states, and PFC state
         self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
         self._eta_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._pfc_state = torch.zeros(1, 32, device=self._critic_state.device)
-        # Reset eligibility traces
+        # Reset eligibility traces for both residual and attention patches
         self.hebb_rule.reset_traces(self._critic_state.device)
+        self.attn_hebb_rule.reset_traces(self._critic_state.device)
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2878,9 +2898,11 @@ class MACHActivationHebbian(nn.Module):
         self._last_exploration = expls.detach().mean().item()
 
         for patch_idx in range(self.n_patches):
+            scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0)
+
+            # --- Residual patch update ---
             if patch_idx in self._pre_activations:
                 # Phase 1: Update eligibility trace (tag active synapses)
-                # Trace decays with learned retention — recent activity more eligible
                 self.hebb_rule.update_trace(
                     patch_idx,
                     self._pre_activations[patch_idx],
@@ -2889,7 +2911,6 @@ class MACHActivationHebbian(nn.Module):
                 )
 
                 # Phase 2: RPE converts traces → weight changes via learned program
-                # The plasticity network decides HOW to convert traces given the context
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx],
@@ -2901,13 +2922,38 @@ class MACHActivationHebbian(nn.Module):
                     exploration_noise=expls[patch_idx],
                     training=self.training,
                 )
-                # Scale by eta * gate_scale (overall plasticity rate)
-                scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0)
                 self.patches[patch_idx].accumulate_write(
                     "down", scale * delta_down, decay=decays[patch_idx]
                 )
                 self.patches[patch_idx].accumulate_write(
                     "up", scale * delta_up, decay=decays[patch_idx]
+                )
+
+            # --- Attention patch update ---
+            if patch_idx in self._attn_pre_activations:
+                self.attn_hebb_rule.update_trace(
+                    patch_idx,
+                    self._attn_pre_activations[patch_idx],
+                    self._attn_post_activations[patch_idx],
+                    trace_decay=decays[patch_idx].detach(),
+                )
+
+                delta_down_a, delta_up_a = self.attn_hebb_rule.compute_update(
+                    patch_idx,
+                    self._attn_pre_activations[patch_idx],
+                    self._attn_post_activations[patch_idx],
+                    td_error=td_error,
+                    eta=etas[patch_idx],
+                    decay=decays[patch_idx],
+                    exploration=expls[patch_idx],
+                    exploration_noise=expls[patch_idx],
+                    training=self.training,
+                )
+                self.attn_patches[patch_idx].accumulate_write(
+                    "down", scale * delta_down_a, decay=decays[patch_idx]
+                )
+                self.attn_patches[patch_idx].accumulate_write(
+                    "up", scale * delta_up_a, decay=decays[patch_idx]
                 )
 
         return value, reward_t
@@ -2927,6 +2973,31 @@ class ActivationHebbianPatchedModel(nn.Module):
         for i, layer_idx in enumerate(self.mach.patch_layers):
             layer = self.base_model.model.layers[layer_idx]
 
+            # --- Attention output hook: modifies information routing ---
+            def make_attn_hook(patch_idx):
+                def hook(module, args, kwargs, output):
+                    h_in = kwargs['hidden_states']  # (batch, seq, d_model)
+                    attn_out = output[0]             # (batch, seq, d_model)
+
+                    # Capture for Hebbian
+                    self.mach._attn_pre_activations[patch_idx] = h_in
+
+                    # Apply attention patch
+                    attn_patch = self.mach.attn_patches[patch_idx]
+                    correction = attn_patch(h_in.float())
+                    attn_out_new = attn_out + correction.to(attn_out.dtype)
+
+                    self.mach._attn_post_activations[patch_idx] = attn_out_new
+
+                    return (attn_out_new,) + output[1:]
+                return hook
+
+            attn_handle = layer.self_attn.register_forward_hook(
+                make_attn_hook(i), with_kwargs=True
+            )
+            self._hooks.append(attn_handle)
+
+            # --- Residual stream hook: existing patch logic ---
             def make_hook(patch_idx):
                 def hook(module, input, output):
                     patch = self.mach.patches[patch_idx]
@@ -2937,7 +3008,6 @@ class ActivationHebbianPatchedModel(nn.Module):
                         h = output
 
                     # Undetached: gradient flows through compress → critic/PFC
-                    # Like PFC top-down feedback shaping sensory representations
                     self.mach._pre_activations[patch_idx] = h
 
                     patch_out = patch(h.float())

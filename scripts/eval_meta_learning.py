@@ -131,19 +131,35 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                     patch.delta_up = patch.delta_up.detach()
                 if patch.delta_gain is not None:
                     patch.delta_gain = patch.delta_gain.detach()
+            if hasattr(mach, 'attn_patches'):
+                for patch in mach.attn_patches:
+                    if patch.delta_down is not None:
+                        patch.delta_down = patch.delta_down.detach()
+                    if patch.delta_up is not None:
+                        patch.delta_up = patch.delta_up.detach()
+                    if patch.delta_gain is not None:
+                        patch.delta_gain = patch.delta_gain.detach()
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
             for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
-            if hasattr(mach, 'hebb_rule') and hasattr(mach.hebb_rule, '_traces') and mach.hebb_rule._traces is not None:
-                for p_traces in mach.hebb_rule._traces:
-                    for r in range(len(p_traces)):
-                        p_traces[r] = p_traces[r].detach()
+            for rule_attr in ('hebb_rule', 'attn_hebb_rule'):
+                rule = getattr(mach, rule_attr, None)
+                if rule is not None and hasattr(rule, '_traces') and rule._traces is not None:
+                    for p_traces in rule._traces:
+                        for r in range(len(p_traces)):
+                            p_traces[r] = p_traces[r].detach()
             for key in list(mach._pre_activations.keys()):
                 mach._pre_activations[key] = mach._pre_activations[key].detach()
             for key in list(mach._post_activations.keys()):
                 mach._post_activations[key] = mach._post_activations[key].detach()
+            if hasattr(mach, '_attn_pre_activations'):
+                for key in list(mach._attn_pre_activations.keys()):
+                    mach._attn_pre_activations[key] = mach._attn_pre_activations[key].detach()
+            if hasattr(mach, '_attn_post_activations'):
+                for key in list(mach._attn_post_activations.keys()):
+                    mach._attn_post_activations[key] = mach._attn_post_activations[key].detach()
 
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []

@@ -1592,22 +1592,40 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     patch.delta_up = patch.delta_up.detach()
                 if patch.delta_gain is not None:
                     patch.delta_gain = patch.delta_gain.detach()
+            # Detach attention patch deltas
+            if hasattr(mach, 'attn_patches'):
+                for patch in mach.attn_patches:
+                    if patch.delta_down is not None:
+                        patch.delta_down = patch.delta_down.detach()
+                    if patch.delta_up is not None:
+                        patch.delta_up = patch.delta_up.detach()
+                    if patch.delta_gain is not None:
+                        patch.delta_gain = patch.delta_gain.detach()
             if hasattr(mach, '_critic_state'):
                 mach._critic_state = mach._critic_state.detach()
             # Detach nuclei GRU states at truncation boundary
             for attr in ('_eta_state', '_decay_state', '_expl_state', '_pfc_state'):
                 if hasattr(mach, attr):
                     setattr(mach, attr, getattr(mach, attr).detach())
-            # Detach eligibility traces
-            if hasattr(mach, 'hebb_rule') and hasattr(mach.hebb_rule, '_traces') and mach.hebb_rule._traces is not None:
-                for p_traces in mach.hebb_rule._traces:
-                    for r in range(len(p_traces)):
-                        p_traces[r] = p_traces[r].detach()
+            # Detach eligibility traces (residual + attention)
+            for rule_attr in ('hebb_rule', 'attn_hebb_rule'):
+                rule = getattr(mach, rule_attr, None)
+                if rule is not None and hasattr(rule, '_traces') and rule._traces is not None:
+                    for p_traces in rule._traces:
+                        for r in range(len(p_traces)):
+                            p_traces[r] = p_traces[r].detach()
             # Detach stored activations (undetached obs path)
             for key in list(mach._pre_activations.keys()):
                 mach._pre_activations[key] = mach._pre_activations[key].detach()
             for key in list(mach._post_activations.keys()):
                 mach._post_activations[key] = mach._post_activations[key].detach()
+            # Detach attention activations
+            if hasattr(mach, '_attn_pre_activations'):
+                for key in list(mach._attn_pre_activations.keys()):
+                    mach._attn_pre_activations[key] = mach._attn_pre_activations[key].detach()
+            if hasattr(mach, '_attn_post_activations'):
+                for key in list(mach._attn_post_activations.keys()):
+                    mach._attn_post_activations[key] = mach._attn_post_activations[key].detach()
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
@@ -1659,6 +1677,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                  p.delta_gain.detach().clone() if p.delta_gain is not None else None)
                 for p in mach.patches
             ]
+            saved_attn_deltas = [
+                (p.delta_down.detach().clone() if p.delta_down is not None else None,
+                 p.delta_up.detach().clone() if p.delta_up is not None else None,
+                 p.delta_gain.detach().clone() if p.delta_gain is not None else None)
+                for p in mach.attn_patches
+            ] if hasattr(mach, 'attn_patches') else None
             saved_reward_ema = mach._reward_ema
             saved_critic_state = mach._critic_state.detach().clone() if hasattr(mach, '_critic_state') else None
             saved_nuclei = {
@@ -1678,6 +1702,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 p.delta_down = dd
                 p.delta_up = du
                 p.delta_gain = dg
+            if saved_attn_deltas is not None:
+                for p, (dd, du, dg) in zip(mach.attn_patches, saved_attn_deltas):
+                    p.delta_down = dd
+                    p.delta_up = du
+                    p.delta_gain = dg
             mach._reward_ema = saved_reward_ema
             if saved_critic_state is not None:
                 mach._critic_state = saved_critic_state
