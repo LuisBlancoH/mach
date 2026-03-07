@@ -109,9 +109,13 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
         # Hebbian step
         if mode in ("full", "sparse", "reward_only"):
             value, _ = mach.hebbian_step(reward, step, n_steps, device)
-            critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
-            critic_loss = (value - critic_target) ** 2
-            window_critic_losses.append(critic_loss)
+            # TD bootstrapped critic loss
+            if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+                td_target = mach._prev_reward + mach.gamma * value.detach()
+                critic_loss = (mach._prev_critic_value - td_target) ** 2
+                window_critic_losses.append(critic_loss)
+            mach._prev_critic_value = value
+            mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
         elif mode == "hebbian":
             with torch.no_grad():
                 value, _ = mach.hebbian_step(reward, step, n_steps, device)
@@ -170,6 +174,10 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             if hasattr(mach, '_attn_post_activations'):
                 for key in list(mach._attn_post_activations.keys()):
                     mach._attn_post_activations[key] = mach._attn_post_activations[key].detach()
+
+            # Detach TD bootstrapping state
+            if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+                mach._prev_critic_value = mach._prev_critic_value.detach()
 
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []

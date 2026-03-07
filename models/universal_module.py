@@ -2669,7 +2669,7 @@ class MACHActivationHebbian(nn.Module):
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
                  frozen_projections=False, consolidation=False, ema_decay=0.95,
-                 delta_decay=1.0, consolidation_interval=0):
+                 delta_decay=1.0, consolidation_interval=0, gamma=0.95):
         super().__init__()
         from config import GATE_SCALE
         self.d_model = d_model
@@ -2683,8 +2683,10 @@ class MACHActivationHebbian(nn.Module):
         self.ema_decay = ema_decay
         self.delta_decay = delta_decay
         self.consolidation_interval = consolidation_interval
+        self.gamma = gamma  # TD discount factor
         self._step_count = 0
         self._reward_ema = 0.0
+        self._prev_value = 0.0  # V(s_{t-1}) for TD bootstrapping
 
         # Residual stream patches (existing)
         self.patches = nn.ModuleList([
@@ -2792,6 +2794,10 @@ class MACHActivationHebbian(nn.Module):
         # Reset eligibility traces for both residual and attention patches
         self.hebb_rule.reset_traces(self._critic_state.device)
         self.attn_hebb_rule.reset_traces(self._critic_state.device)
+        # Reset TD bootstrapping
+        self._prev_value = 0.0
+        self._prev_critic_value = None
+        self._prev_reward = None
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2897,8 +2903,13 @@ class MACHActivationHebbian(nn.Module):
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
-        # TD error = RPE = dopamine signal
-        td_error = (reward_t - value).detach()
+        # TD error with bootstrapping = RPE = dopamine signal
+        # δ = r_t + γ·V(s_t) - V(s_{t-1})
+        # Like dopamine: fires when current state is better/worse than expected
+        # Value signal propagates backward in time — reward at step 50
+        # creates TD error at step 49, then 48, etc.
+        td_error = (reward_t + self.gamma * value.detach() - self._prev_value).detach()
+        self._prev_value = value.detach().item()
 
         # Update reward EMA (for logging only)
         self._reward_ema = 0.9 * self._reward_ema + 0.1 * reward

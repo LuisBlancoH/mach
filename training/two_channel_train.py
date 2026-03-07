@@ -1129,10 +1129,13 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             reward, step, len(problems), device
         )
 
-        # 4. Critic loss (predicts reward from activations)
-        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
-        critic_loss = (value - critic_target) ** 2
-        critic_losses.append(critic_loss)
+        # 4. Critic loss: TD bootstrapped target
+        if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+            td_target = mach._prev_reward + mach.gamma * value.detach()
+            critic_loss = (mach._prev_critic_value - td_target) ** 2
+            critic_losses.append(critic_loss)
+        mach._prev_critic_value = value
+        mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
 
@@ -1218,10 +1221,13 @@ def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
             reward, step, len(problems), device
         )
 
-        # Phase 5: Critic loss
-        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
-        critic_loss = (value - critic_target) ** 2
-        critic_losses.append(critic_loss)
+        # Phase 5: Critic loss: TD bootstrapped target
+        if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+            td_target = mach._prev_reward + mach.gamma * value.detach()
+            critic_loss = (mach._prev_critic_value - td_target) ** 2
+            critic_losses.append(critic_loss)
+        mach._prev_critic_value = value
+        mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
     avg_critic_loss = torch.stack(critic_losses).mean() if critic_losses else torch.tensor(0.0, device=device)
 
@@ -1574,11 +1580,15 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             act_summary = act_summary / (act_summary.norm() + 1e-8)
             hippocampus.store(mach, act_summary, reward, mach._last_td_error)
 
-        # Critic loss (predicts reward from activations)
-        critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
-        critic_loss = (value - critic_target) ** 2
-
-        window_critic_losses.append(critic_loss)
+        # Critic loss: TD target for previous step's value prediction
+        # V(s_{t-1}) should equal r_{t-1} + γ·V(s_t)
+        # At step t, we know V(s_t) and can compute the target for V(s_{t-1})
+        if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+            td_target = mach._prev_reward + mach.gamma * value.detach()
+            critic_loss = (mach._prev_critic_value - td_target) ** 2
+            window_critic_losses.append(critic_loss)
+        mach._prev_critic_value = value
+        mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
@@ -1634,6 +1644,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hasattr(mach, '_attn_post_activations'):
                 for key in list(mach._attn_post_activations.keys()):
                     mach._attn_post_activations[key] = mach._attn_post_activations[key].detach()
+
+            # Detach TD bootstrapping state
+            if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+                mach._prev_critic_value = mach._prev_critic_value.detach()
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
