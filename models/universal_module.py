@@ -2794,8 +2794,9 @@ class MACHActivationHebbian(nn.Module):
         maintaining stable task representation through recurrent dynamics."""
         if not self._pre_activations:
             return  # no activations yet (first forward pass)
-        # Reuse activation summary (all 4 layers compressed to 128-dim)
-        act_summary = self.get_activation_summary().detach()
+        # Undetached: gradient flows through compress, forcing it to preserve
+        # task-discriminative features (like PFC top-down feedback to sensory cortex)
+        act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
         # PFC GRU: sensory input + critic context → task representation
         critic_context = self._critic_state.squeeze(0).detach()  # (64,)
@@ -2933,7 +2934,9 @@ class ActivationHebbianPatchedModel(nn.Module):
                     else:
                         h = output
 
-                    self.mach._pre_activations[patch_idx] = h.detach()
+                    # Undetached: gradient flows through compress → critic/PFC
+                    # Like PFC top-down feedback shaping sensory representations
+                    self.mach._pre_activations[patch_idx] = h
 
                     patch_out = patch(h.float())
                     # PFC context gate: task-dependent selection of patch dimensions
@@ -2943,7 +2946,7 @@ class ActivationHebbianPatchedModel(nn.Module):
                     gain = patch.get_gain()
                     h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
 
-                    self.mach._post_activations[patch_idx] = h_new.detach()
+                    self.mach._post_activations[patch_idx] = h_new
 
                     if isinstance(output, tuple):
                         return (h_new,) + output[1:]
