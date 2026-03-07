@@ -65,17 +65,22 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.pattern_sep[2].weight[:, key_dim:])
             nn.init.zeros_(self.pattern_sep[2].bias)
 
-        # Reinstatement gate: learned blend strength
+        # Reinstatement gate: learned blend strength with valence
         # Input: similarity + |current_td_error| + stored_reward
+        # Output: Tanh → [-1, 1]
+        #   Positive = approach (reinstate stored state)
+        #   Negative = avoidance (move AWAY from stored state)
+        # Like amygdala valence tagging: good memories → approach, bad → avoid
         self.reinstatement_gate = nn.Sequential(
             nn.Linear(3, 8),
             nn.Tanh(),
             nn.Linear(8, 1),
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
-        # Init conservative — low reinstatement by default
+        # Init near-zero — conservative by default
         with torch.no_grad():
-            self.reinstatement_gate[-2].bias.fill_(-1.0)
+            self.reinstatement_gate[-2].weight.mul_(0.1)
+            self.reinstatement_gate[-2].bias.fill_(0.0)
 
         # Memory dynamics are set externally by neuromodulatory nuclei each step.
         # Like the brain: memory persistence is controlled by serotonin/norepinephrine,
@@ -223,23 +228,28 @@ class Hippocampus(nn.Module):
                 torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
                 torch.tensor(self._rewards[idx], device=device, dtype=torch.float32),
             ])
+            # Tanh gate: positive = approach, negative = avoidance
             alpha_t = self.reinstatement_gate(gate_input).squeeze() * sim_t
             alpha_f = alpha_t.item()  # float copy for non-differentiable ops
 
-            # Retrieval strengthens memory proportional to reinstatement strength
-            self._strengths[idx] += alpha_f
+            # Retrieval strengthens memory (both approach and avoidance are useful)
+            self._strengths[idx] += abs(alpha_f)
 
-            if alpha_f < 1e-4:
+            if abs(alpha_f) < 1e-4:
                 continue
 
-            max_alpha = max(max_alpha, alpha_f)
+            max_alpha = max(max_alpha, abs(alpha_f))
 
-            # Partial reinstatement: blend stored PFC state into current
-            # GRADIENT FLOWS: loss → pfc_state → alpha_t → gate weights
+            # Partial reinstatement or avoidance:
+            # alpha > 0: blend TOWARD stored state (approach — repeat success)
+            # alpha < 0: blend AWAY from stored state (avoidance — don't repeat failure)
+            # Math: pfc = (1 - α) * current + α * stored
+            #   α=+0.2 → 80% current + 20% stored (approach)
+            #   α=-0.2 → 120% current - 20% stored (move away)
             stored_pfc = torch.from_numpy(self._pfc_states[idx]).to(device).unsqueeze(0)
             mach._pfc_state = (1 - alpha_t) * mach._pfc_state + alpha_t * stored_pfc
 
-            # Bias neuromod nuclei toward stored values
+            # Neuromod bias: approach → blend toward stored, avoidance → blend away
             if hasattr(mach, '_eta_state') and len(self._neuromod_etas[idx]) > 0:
                 if not hasattr(mach, '_neuromod_bias'):
                     mach._neuromod_bias = None
@@ -247,7 +257,7 @@ class Hippocampus(nn.Module):
                     'eta': torch.from_numpy(self._neuromod_etas[idx]).to(device),
                     'decay': torch.from_numpy(self._neuromod_decays[idx]).to(device),
                     'expl': torch.from_numpy(self._neuromod_expls[idx]).to(device),
-                    'alpha': alpha_f,
+                    'alpha': alpha_f,  # negative = invert stored neuromod
                 }
 
         return max_alpha

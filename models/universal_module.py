@@ -2912,13 +2912,14 @@ class MACHActivationHebbian(nn.Module):
         gamma = 0.1 + 0.9 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
 
         # Hippocampal reinstatement: blend stored neuromod values into current
-        # Like cortex reinstating a previous brain state from episodic memory
+        # alpha > 0: approach (blend toward stored state)
+        # alpha < 0: avoidance (blend AWAY from stored state)
         if hasattr(self, '_neuromod_bias') and self._neuromod_bias is not None:
             bias = self._neuromod_bias
             a = bias['alpha']
-            etas = (1 - a) * etas + a * bias['eta']
-            decays = (1 - a) * decays + a * bias['decay']
-            expls = (1 - a) * expls + a * bias['expl']
+            etas = ((1 - a) * etas + a * bias['eta']).clamp(0.1, 1.0)
+            decays = ((1 - a) * decays + a * bias['decay']).clamp(0.1, 1.0)
+            expls = ((1 - a) * expls + a * bias['expl']).clamp(0.1, 0.5)
             self._neuromod_bias = None  # consumed
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
