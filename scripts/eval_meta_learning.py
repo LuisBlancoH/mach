@@ -36,7 +36,7 @@ from training.two_channel_train import graded_reward
 
 def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                         op_type, n_steps=200, mode="full", sparse_interval=1,
-                        lr=1e-4):
+                        lr=1e-4, hippocampus=None):
     """
     Run n_steps of a single operation and track accuracy over time.
 
@@ -52,6 +52,10 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
     if mode in ("full", "sparse", "reward_only"):
         mach.train()
         meta_params = [p for p in mach.parameters() if p.requires_grad]
+        if hippocampus is not None:
+            for p in hippocampus.parameters():
+                if p.requires_grad:
+                    meta_params.append(p)
         optimizer = torch.optim.Adam(meta_params, lr=lr)
     else:
         mach.eval()
@@ -82,6 +86,15 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                 correct = (predicted == problem["answer"])
                 results.append((step, int(correct), 0, 0))
             continue
+
+        # Hippocampus retrieval: reinstate similar neural states
+        if hippocampus is not None and len(hippocampus) > 0:
+            act_summary = mach.get_activation_summary()
+            act_summary = act_summary / (act_summary.norm() + 1e-8)
+            td_err = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
+            hippocampus.retrieve_and_reinstate(
+                mach, act_summary, td_err, top_k=3, device=device
+            )
 
         if mode in ("full", "sparse"):
             output = patched_model(input_ids=encoding.input_ids, labels=labels)
@@ -126,6 +139,17 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                 value, _ = mach.hebbian_step(reward, step, n_steps, device)
 
         td_error = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
+
+        # Hippocampus: reconsolidate + store + update dynamics
+        if hippocampus is not None and mode != "baseline":
+            gamma = mach._last_gamma if hasattr(mach, '_last_gamma') else 0.95
+            avg_decay = mach._last_decays.mean().item() if hasattr(mach, '_last_decays') and mach._last_decays is not None else 0.9
+            hippocampus.set_neuromod(gamma, avg_decay)
+            hippocampus.reconsolidate(td_error)
+            act_summary = mach.get_activation_summary()
+            act_summary = act_summary / (act_summary.norm() + 1e-8)
+            hippocampus.store(mach, act_summary, reward, td_error)
+
         results.append((step, int(correct), reward, td_error))
 
         # Truncated backprop
@@ -221,6 +245,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--quick", action="store_true",
                         help="Quick smoke test: 25 steps, 1 op per category")
+    parser.add_argument("--memory-path", type=str, default=None,
+                        help="Path to hippocampal memory file (adds +hippocampus eval modes)")
     args = parser.parse_args()
 
     if args.quick:
@@ -276,13 +302,18 @@ def main():
 
     # --- Test each mode ---
     modes = [
-        ("HEBBIAN ONLY (frozen meta-params)", "hebbian"),
-        ("FULL SYSTEM (gradient + Hebbian)", "full"),
-        ("REWARD ONLY (no CE — simulates deployment)", "reward_only"),
-        (f"SPARSE REWARD (every {args.sparse_interval} steps)", "sparse"),
+        ("HEBBIAN ONLY (frozen meta-params)", "hebbian", False),
+        ("FULL SYSTEM (gradient + Hebbian)", "full", False),
+        ("REWARD ONLY (no CE — simulates deployment)", "reward_only", False),
+        (f"SPARSE REWARD (every {args.sparse_interval} steps)", "sparse", False),
     ]
+    if args.memory_path:
+        modes.extend([
+            ("FULL + HIPPOCAMPUS", "full", True),
+            ("REWARD ONLY + HIPPOCAMPUS", "reward_only", True),
+        ])
 
-    for mode_name, mode_key in modes:
+    for mode_name, mode_key, use_hipp in modes:
         print("\n" + "=" * 80)
         print(mode_name)
         print("=" * 80)
@@ -302,10 +333,21 @@ def main():
 
             patched_model = ActivationHebbianPatchedModel(base_model, mach)
 
+            # Create hippocampus if needed (fresh per op, or loaded from file)
+            hipp = None
+            if use_hipp and args.memory_path:
+                from models.hippocampus import Hippocampus
+                key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
+                hipp = Hippocampus(
+                    key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
+                    save_path=args.memory_path,
+                ).to(config.DEVICE)
+
             results = run_adaptation_test(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,
                 op, n_steps=args.n_steps, mode=mode_key,
                 sparse_interval=args.sparse_interval, lr=args.lr,
+                hippocampus=hipp,
             )
 
             curve = compute_learning_curve(results, window=20)
@@ -322,13 +364,17 @@ def main():
             total = sum(r[1] for r in results) / n
             delta = last_w2 - first_w2
 
+            hipp_str = ""
+            if hipp is not None:
+                hipp_str = f" mem={len(hipp)}"
+
             print(f"  {op:12s} [{tag:8s}] | "
                   f"first{w1}={first_w1:.0%} last{w1}={last_w1:.0%} | "
                   f"first{w2}={first_w2:.0%} last{w2}={last_w2:.0%} | "
-                  f"Δ={delta:+.0%} total={total:.0%}")
+                  f"Δ={delta:+.0%} total={total:.0%}{hipp_str}")
 
             patched_model.remove_hooks()
-            del mach, patched_model
+            del mach, patched_model, hipp
             torch.cuda.empty_cache()
 
 
