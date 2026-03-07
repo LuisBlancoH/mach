@@ -1805,7 +1805,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 max_str = max(hippocampus._strengths)
                 print(f"  Hippocampus: {len(hippocampus)} memories, "
                       f"avg_strength={avg_str:.3f}, max_strength={max_str:.3f}, "
-                      f"decay={hippocampus._decay_rate:.4f}, recon_scale={hippocampus._recon_scale:.2f}")
+                      f"decay={hippocampus._decay_rate:.4f}, recon_scale={hippocampus._recon_scale:.2f}, "
+                      f"ceiling={hippocampus.strength_ceiling:.2f}")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,

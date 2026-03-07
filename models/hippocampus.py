@@ -85,6 +85,27 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.reinstatement_gate[-2].bias.fill_(0.3)
 
+        # Learned merge gate: decides if two keys are "same memory" (CA3)
+        # Input: cosine similarity between keys
+        # Output: Sigmoid → merge probability
+        # Replaces hardcoded duplicate threshold
+        self.merge_gate = nn.Sequential(
+            nn.Linear(1, 4),
+            nn.Tanh(),
+            nn.Linear(4, 1),
+            nn.Sigmoid(),
+        )
+        # Init: merge when sim > ~0.8 (sigmoid crosses 0.5 at input ≈ 0.8)
+        with torch.no_grad():
+            self.merge_gate[0].weight.fill_(10.0)  # sharpen
+            self.merge_gate[0].bias.fill_(-8.0)     # shift to cross at ~0.8
+            self.merge_gate[2].weight.fill_(1.0)
+            self.merge_gate[2].bias.fill_(0.0)
+
+        # Learned strength ceiling — replaces hardcoded 10.0
+        # Log-space so it's always positive; init at ln(10) ≈ 2.3
+        self.log_strength_ceiling = nn.Parameter(torch.tensor(2.302585))
+
         # Memory dynamics are set externally by neuromodulatory nuclei each step.
         # Like the brain: memory persistence is controlled by serotonin/norepinephrine,
         # not learned independently by the hippocampus itself.
@@ -105,6 +126,10 @@ class Hippocampus(nn.Module):
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
+
+    @property
+    def strength_ceiling(self):
+        return self.log_strength_ceiling.exp().item()
 
     def set_neuromod(self, gamma, avg_decay):
         """Called by the neuromodulatory system each step.
@@ -154,13 +179,21 @@ class Hippocampus(nn.Module):
             key_np = key.cpu().numpy().astype(np.float32)
 
         # Near-duplicate check (CA3 — don't store what you already know)
+        # Learned merge gate replaces hardcoded threshold
         if self._keys:
             sims = self._cosine_similarities(key_np)
-            if sims.max() > 0.7:  # lower threshold — arithmetic ops have similar activations
+            best_idx = int(sims.argmax())
+            best_sim = float(sims[best_idx])
+            # Merge gate: learned decision boundary for "same memory"
+            with torch.no_grad():
+                merge_prob = self.merge_gate(
+                    torch.tensor([best_sim], dtype=torch.float32)
+                ).item()
+            if merge_prob > 0.5:
                 # Reinforce existing memory with saturation
-                idx = int(sims.argmax())
-                headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
-                self._strengths[idx] += strength * headroom
+                ceil = self.strength_ceiling
+                headroom = max(0.0, ceil - self._strengths[best_idx]) / ceil
+                self._strengths[best_idx] += strength * headroom
                 return False
 
         # Extract compressed state
@@ -272,7 +305,8 @@ class Hippocampus(nn.Module):
             else:
                 necessity = 1.0 - pfc_distance     # close to bad = essential
 
-            headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+            ceil = self.strength_ceiling
+            headroom = max(0.0, ceil - self._strengths[idx]) / ceil
             self._strengths[idx] += abs(alpha_f) * necessity * headroom
 
             # Partial reinstatement or avoidance:
@@ -307,7 +341,8 @@ class Hippocampus(nn.Module):
                 update = td_error * scale
                 # Saturation: positive updates diminish as strength approaches ceiling
                 if update > 0:
-                    headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+                    ceil = self.strength_ceiling
+                    headroom = max(0.0, ceil - self._strengths[idx]) / ceil
                     update *= headroom
                 self._strengths[idx] += update
                 # Clamp: strength can't go negative (memory dies at 0)
