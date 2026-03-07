@@ -2828,12 +2828,20 @@ class MACHActivationHebbian(nn.Module):
             self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (d_model,)
 
     def get_activation_summary(self):
-        """Summarize captured activations for critic input."""
+        """Summarize captured activations for critic input.
+
+        Activations are detached before compress: gradient flows through
+        compress weights (they learn to extract useful features) but NOT
+        back through Qwen (that path explodes to NaN due to bfloat16
+        amplification across 36 layers). Compress learns from critic loss
+        on its output, not from backprop through Qwen.
+        """
         summaries = []
         for i in range(self.n_patches):
             pre = self._pre_activations.get(i)
             if pre is not None:
-                compressed = self.hebb_rule.compress[i](pre.float())
+                # Detach: don't backprop through Qwen
+                compressed = self.hebb_rule.compress[i](pre.detach().float())
                 while compressed.dim() > 1:
                     compressed = compressed.mean(dim=0)
                 summaries.append(compressed)
@@ -2898,62 +2906,73 @@ class MACHActivationHebbian(nn.Module):
         self._last_exploration = expls.detach().mean().item()
 
         for patch_idx in range(self.n_patches):
-            scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0)
+            # Neuromod values for writes: detach from CE loss path.
+            # Nuclei learn from critic loss (reward prediction), not from
+            # CE loss backpropping through Qwen — that path goes NaN.
+            # Brain-like: VTA/LC learn from reward signals, not cortical errors.
+            scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0).detach()
+            write_decay = decays[patch_idx].detach()
 
             # --- Residual patch update ---
             if patch_idx in self._pre_activations:
                 # Phase 1: Update eligibility trace (tag active synapses)
                 self.hebb_rule.update_trace(
                     patch_idx,
-                    self._pre_activations[patch_idx],
-                    self._post_activations[patch_idx],
-                    trace_decay=decays[patch_idx].detach(),
+                    self._pre_activations[patch_idx].detach(),
+                    self._post_activations[patch_idx].detach(),
+                    trace_decay=write_decay,
                 )
 
-                # Phase 2: RPE converts traces → weight changes via learned program
+                # Phase 2: RPE converts traces → weight changes
+                # All inputs detached: plasticity_net learns from critic loss
+                # (via write_magnitude added to critic path below), NOT from
+                # CE loss through Qwen (that path explodes to NaN).
+                # Brain-like: molecular machinery shaped by reward (evolution),
+                # not by cortical error backprop.
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
-                    self._pre_activations[patch_idx],
-                    self._post_activations[patch_idx],
+                    self._pre_activations[patch_idx].detach(),
+                    self._post_activations[patch_idx].detach(),
                     td_error=td_error,
-                    eta=etas[patch_idx],
-                    decay=decays[patch_idx],
-                    exploration=expls[patch_idx],
-                    exploration_noise=expls[patch_idx],
+                    eta=etas[patch_idx].detach(),
+                    decay=decays[patch_idx].detach(),
+                    exploration=expls[patch_idx].detach(),
+                    exploration_noise=expls[patch_idx].detach(),
                     training=self.training,
                 )
+                # Detach writes: no gradient from CE loss through patch deltas
                 self.patches[patch_idx].accumulate_write(
-                    "down", scale * delta_down, decay=decays[patch_idx]
+                    "down", (scale * delta_down).detach(), decay=write_decay
                 )
                 self.patches[patch_idx].accumulate_write(
-                    "up", scale * delta_up, decay=decays[patch_idx]
+                    "up", (scale * delta_up).detach(), decay=write_decay
                 )
 
             # --- Attention patch update ---
             if patch_idx in self._attn_pre_activations:
                 self.attn_hebb_rule.update_trace(
                     patch_idx,
-                    self._attn_pre_activations[patch_idx],
-                    self._attn_post_activations[patch_idx],
-                    trace_decay=decays[patch_idx].detach(),
+                    self._attn_pre_activations[patch_idx].detach(),
+                    self._attn_post_activations[patch_idx].detach(),
+                    trace_decay=write_decay,
                 )
 
                 delta_down_a, delta_up_a = self.attn_hebb_rule.compute_update(
                     patch_idx,
-                    self._attn_pre_activations[patch_idx],
-                    self._attn_post_activations[patch_idx],
+                    self._attn_pre_activations[patch_idx].detach(),
+                    self._attn_post_activations[patch_idx].detach(),
                     td_error=td_error,
-                    eta=etas[patch_idx],
-                    decay=decays[patch_idx],
-                    exploration=expls[patch_idx],
-                    exploration_noise=expls[patch_idx],
+                    eta=etas[patch_idx].detach(),
+                    decay=decays[patch_idx].detach(),
+                    exploration=expls[patch_idx].detach(),
+                    exploration_noise=expls[patch_idx].detach(),
                     training=self.training,
                 )
                 self.attn_patches[patch_idx].accumulate_write(
-                    "down", scale * delta_down_a, decay=decays[patch_idx]
+                    "down", (scale * delta_down_a).detach(), decay=write_decay
                 )
                 self.attn_patches[patch_idx].accumulate_write(
-                    "up", scale * delta_up_a, decay=decays[patch_idx]
+                    "up", (scale * delta_up_a).detach(), decay=write_decay
                 )
 
         return value, reward_t
@@ -3012,9 +3031,11 @@ class ActivationHebbianPatchedModel(nn.Module):
 
                     patch_out = patch(h.float())
                     # PFC context gate: task-dependent selection of patch dimensions
+                    # Detached: gates are fixed for this forward pass. PFC/context_gates
+                    # learn from critic loss, not CE loss through Qwen (that goes NaN).
                     ctx_gate = self.mach._context_gate_values.get(patch_idx)
                     if ctx_gate is not None:
-                        patch_out = patch_out * ctx_gate.to(patch_out.dtype)
+                        patch_out = patch_out * ctx_gate.detach().to(patch_out.dtype)
                     gain = patch.get_gain()
                     h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
 
