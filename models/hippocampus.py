@@ -77,12 +77,12 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.reinstatement_gate[-2].bias.fill_(-1.0)
 
-        # Learned memory dynamics (replace hardcoded constants)
-        # All constrained to sensible ranges via sigmoid
-        # _raw values are unconstrained; properties apply sigmoid + range mapping
-        self._raw_decay = nn.Parameter(torch.tensor(3.0))       # → ~0.999 via sigmoid mapping
-        self._raw_dup_thresh = nn.Parameter(torch.tensor(2.0))  # → ~0.9 via sigmoid mapping
-        self._raw_recon_scale = nn.Parameter(torch.tensor(0.0)) # → ~1.0 via exp mapping
+        # Memory dynamics are set externally by neuromodulatory nuclei each step.
+        # Like the brain: memory persistence is controlled by serotonin/norepinephrine,
+        # not learned independently by the hippocampus itself.
+        # Defaults are sensible baselines; nuclei override via set_neuromod().
+        self._decay_rate = 0.999
+        self._recon_scale = 1.0
 
         # Storage: compressed neural states (~170 floats per memory)
         self._keys = []           # (key_dim,) — pattern-separated activation key
@@ -98,20 +98,22 @@ class Hippocampus(nn.Module):
         if save_path and os.path.exists(save_path):
             self._load(save_path)
 
-    @property
-    def decay_rate(self):
-        """Learned decay rate ∈ [0.99, 0.9999]. Higher = slower forgetting."""
-        return 0.99 + 0.0099 * torch.sigmoid(self._raw_decay)
+    def set_neuromod(self, gamma, avg_decay):
+        """Called by the neuromodulatory system each step.
 
-    @property
-    def dup_threshold(self):
-        """Learned near-duplicate threshold ∈ [0.5, 0.99]."""
-        return 0.5 + 0.49 * torch.sigmoid(self._raw_dup_thresh)
+        gamma (serotonin/patience) → memory persistence:
+          Patient system (high γ) → slow memory decay (memories last longer)
+          Impatient system (low γ) → fast decay (forget quickly, adapt fast)
 
-    @property
-    def recon_scale(self):
-        """Learned reconsolidation scale ∈ [0.01, 10]. Controls TD error → strength."""
-        return 0.01 + 9.99 * torch.sigmoid(self._raw_recon_scale)
+        avg_decay (from decay nuclei) → reconsolidation sensitivity:
+          High decay = stable patches = stable memories = lower recon scale
+          Low decay = volatile patches = volatile memories = higher recon scale
+        """
+        # γ ∈ [0.1, 1.0] → decay ∈ [0.99, 0.9999]
+        self._decay_rate = 0.99 + 0.0099 * gamma
+        # avg_decay ∈ [0.1, 1.0] → recon_scale ∈ [0.1, 5.0]
+        # Lower patch decay = more volatile = stronger reconsolidation
+        self._recon_scale = 0.1 + 4.9 * (1.0 - avg_decay)
 
     def encode_key(self, activation_summary):
         """Entorhinal → DG: compress and pattern-separate."""
@@ -134,7 +136,7 @@ class Hippocampus(nn.Module):
         # Near-duplicate check (CA3 — don't store what you already know)
         if self._keys:
             sims = self._cosine_similarities(key_np)
-            if sims.max() > self.dup_threshold.item():
+            if sims.max() > 0.9:  # fixed — pattern_sep learns separation
                 # Reinforce existing memory via reconsolidation
                 idx = int(sims.argmax())
                 self._strengths[idx] += strength
@@ -249,7 +251,7 @@ class Hippocampus(nn.Module):
         Negative TD error (worse than expected) → weaken.
         Scale is learned — controls how sensitive memory is to surprise.
         """
-        scale = self.recon_scale.item()
+        scale = self._recon_scale
         for idx in self._last_retrieved_indices:
             if idx < len(self._strengths):
                 self._strengths[idx] += td_error * scale
@@ -260,7 +262,7 @@ class Hippocampus(nn.Module):
 
     def decay_all(self):
         """Passive decay. Unretrieved memories fade (use it or lose it)."""
-        decay = self.decay_rate.item()
+        decay = self._decay_rate
         alive = []
         for i in range(len(self._strengths)):
             self._strengths[i] *= decay

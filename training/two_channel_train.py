@@ -1601,8 +1601,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Hippocampus: reconsolidate retrieved memories, then store current state
+        # Hippocampus: update dynamics from nuclei, reconsolidate, then store
         if hippocampus is not None:
+            # Neuromod → hippocampus: nuclei control memory dynamics
+            gamma = mach._last_gamma if hasattr(mach, '_last_gamma') else 0.95
+            avg_decay = mach._last_decays.mean().item() if hasattr(mach, '_last_decays') and mach._last_decays is not None else 0.9
+            hippocampus.set_neuromod(gamma, avg_decay)
             # Reconsolidate: update memories retrieved last step based on outcome
             hippocampus.reconsolidate(mach._last_td_error)
             # Store current state (strength = |td_error|, no threshold)
