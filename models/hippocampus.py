@@ -77,10 +77,10 @@ class Hippocampus(nn.Module):
             nn.Linear(8, 1),
             nn.Tanh(),
         )
-        # Init near-zero — conservative by default
+        # Init with mild positive bias — default to gentle approach
+        # Tanh(0.3) ≈ 0.29, × sim ≈ 0.2 blend strength (similar to old Sigmoid init)
         with torch.no_grad():
-            self.reinstatement_gate[-2].weight.mul_(0.1)
-            self.reinstatement_gate[-2].bias.fill_(0.0)
+            self.reinstatement_gate[-2].bias.fill_(0.3)
 
         # Memory dynamics are set externally by neuromodulatory nuclei each step.
         # Like the brain: memory persistence is controlled by serotonin/norepinephrine,
