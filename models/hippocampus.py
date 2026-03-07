@@ -182,6 +182,10 @@ class Hippocampus(nn.Module):
 
             self._last_retrieved_indices.append(int(idx))
 
+            # Retrieval strengthens memory (use it or lose it)
+            # Counteracts passive decay — frequently useful memories persist
+            self._strengths[idx] += 0.01
+
             # Learned reinstatement gate
             gate_input = torch.tensor([
                 sim,
