@@ -1450,16 +1450,26 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     op_step_count = 0
     op_switch_interval = random.randint(10, 60)  # random task duration
 
-    # Hippocampus: persistent episodic memory
+    # Hippocampus: episodic memory with neural state reinstatement
     hippocampus = None
     if memory_path is not None:
         from models.hippocampus import Hippocampus
-        d_embed = len(mach.patch_layers) * mach.hebb_rule.d_proj
+        key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
         hippocampus = Hippocampus(
-            embedding_dim=d_embed,
+            key_dim=key_dim,
+            n_patches=mach.n_patches,
+            d_model=mach.d_model,
+            patch_hidden_dim=mach.patches[0].hidden_dim,
+            attn_hidden_dim=mach.attn_hidden_dim,
+            pfc_dim=32,
             save_path=memory_path,
-        )
-        print(f"Hippocampus: {len(hippocampus)} stored memories, dim={d_embed}")
+        ).to(device)
+        # Add hippocampus params to optimizer
+        for p in hippocampus.parameters():
+            if p.requires_grad:
+                optimizer.add_param_group({'params': [p], 'lr': lr})
+        n_hipp_params = sum(p.numel() for p in hippocampus.parameters())
+        print(f"Hippocampus: {len(hippocampus)} stored memories, key_dim={key_dim}, params={n_hipp_params:,}")
 
     # Context buffer: rolling history of recent problems (short-term)
     context_buffer = []  # list of "a ? b = answer\n" strings
@@ -1478,18 +1488,17 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
         problem = problems[0]
 
-        # Build context: retrieved memories + recent buffer
-        context_parts = []
-
-        # Hippocampus retrieval (long-term memory)
+        # Hippocampus retrieval: reinstate similar neural states (partial blend)
         if hippocampus is not None and len(hippocampus) > 0:
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
-            retrieved = hippocampus.retrieve(act_summary, top_k=3)
-            for text, sim, strength in retrieved:
-                context_parts.append(text)
+            td_err = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
+            alpha = hippocampus.retrieve_and_reinstate(
+                mach, act_summary, td_err, top_k=3, device=device
+            )
 
-        # Short-term buffer (recent problems)
+        # Short-term context buffer
+        context_parts = []
         if context_size > 0 and context_buffer:
             context_parts.extend(context_buffer[-context_size:])
 
@@ -1559,12 +1568,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Hippocampus: store surprising experiences
+        # Hippocampus: store surprising neural states
         if hippocampus is not None:
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
-            experience_text = f"{problem['prompt']}{problem['answer']}\n"
-            hippocampus.store(act_summary, experience_text, mach._last_td_error)
+            hippocampus.store(mach, act_summary, reward, mach._last_td_error)
 
         # Critic loss (predicts reward from activations)
         critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
@@ -1719,14 +1727,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
 
-            # Hippocampus: decay, consolidate (sleep), save
+            # Hippocampus: decay + save (sleep replay TBD)
             if hippocampus is not None and len(hippocampus) > 0:
                 hippocampus.decay_all()
-                n_replayed = _consolidation_replay(
-                    mach, patched_model, tokenizer, device, hippocampus,
-                )
                 hippocampus.save()
-                print(f"  Hippocampus: {len(hippocampus)} memories, replayed {n_replayed}")
+                print(f"  Hippocampus: {len(hippocampus)} memories")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,
