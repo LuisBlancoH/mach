@@ -48,18 +48,21 @@ class Hippocampus(nn.Module):
         self.max_memories = max_memories
         self.save_path = save_path
 
-        # Pattern separation: key_dim → key_dim (like dentate gyrus)
+        # Pattern separation: (key_dim + pfc_dim) → key_dim (like dentate gyrus)
+        # Input includes PFC state for task-discriminative keys
         # Sparse ReLU = DG's extremely sparse firing (~2% active)
         # Orthogonalizes similar inputs so add/sub get distinct codes
+        full_input_dim = key_dim + pfc_dim
         self.pattern_sep = nn.Sequential(
-            nn.Linear(key_dim, key_dim * 2),
+            nn.Linear(full_input_dim, key_dim * 2),
             nn.ReLU(),
             nn.Linear(key_dim * 2, key_dim),
         )
-        # Init near-identity so it works before training
+        # Init: activation part near-identity, PFC part near-zero
+        # So it works before training but PFC can add discrimination
         with torch.no_grad():
-            nn.init.eye_(self.pattern_sep[0].weight[:key_dim])
-            nn.init.zeros_(self.pattern_sep[0].weight[key_dim:])
+            nn.init.zeros_(self.pattern_sep[0].weight)
+            self.pattern_sep[0].weight[:key_dim, :key_dim].copy_(torch.eye(key_dim))
             nn.init.zeros_(self.pattern_sep[0].bias)
             nn.init.eye_(self.pattern_sep[2].weight[:, :key_dim])
             nn.init.zeros_(self.pattern_sep[2].weight[:, key_dim:])
@@ -120,9 +123,20 @@ class Hippocampus(nn.Module):
         # Lower patch decay = more volatile = stronger reconsolidation
         self._recon_scale = 0.1 + 4.9 * (1.0 - avg_decay)
 
-    def encode_key(self, activation_summary):
-        """Entorhinal → DG: compress and pattern-separate."""
-        return self.pattern_sep(activation_summary)
+    def encode_key(self, activation_summary, pfc_state=None):
+        """Entorhinal → DG: compress and pattern-separate.
+        Includes PFC state for task-discriminative keys.
+        """
+        if pfc_state is not None:
+            pfc = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
+            combined = torch.cat([activation_summary, pfc])
+        else:
+            # Fallback: pad with zeros if no PFC
+            combined = torch.cat([
+                activation_summary,
+                torch.zeros(self.pfc_dim, device=activation_summary.device),
+            ])
+        return self.pattern_sep(combined)
 
     def store(self, mach, activation_summary, reward, td_error):
         """Encode current state into memory. Strength proportional to surprise.
@@ -135,13 +149,14 @@ class Hippocampus(nn.Module):
             strength = 1e-6  # floor so memory exists
 
         with torch.no_grad():
-            key = self.encode_key(activation_summary)
+            pfc = mach._pfc_state.detach() if hasattr(mach, '_pfc_state') else None
+            key = self.encode_key(activation_summary, pfc)
             key_np = key.cpu().numpy().astype(np.float32)
 
         # Near-duplicate check (CA3 — don't store what you already know)
         if self._keys:
             sims = self._cosine_similarities(key_np)
-            if sims.max() > 0.9:  # fixed — pattern_sep learns separation
+            if sims.max() > 0.7:  # lower threshold — arithmetic ops have similar activations
                 # Reinforce existing memory with saturation
                 idx = int(sims.argmax())
                 headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
@@ -197,7 +212,8 @@ class Hippocampus(nn.Module):
         # Pattern separation with gradient flow:
         # 1. Numpy similarity for fast top-k selection (no grad needed here)
         # 2. Differentiable similarity for selected candidates (grad → pattern_sep)
-        key = self.encode_key(activation_summary)  # gradient flows through pattern_sep
+        pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
+        key = self.encode_key(activation_summary, pfc)  # gradient flows through pattern_sep
         key_np = key.detach().cpu().numpy().astype(np.float32)
 
         sims = self._cosine_similarities(key_np)
