@@ -2908,8 +2908,8 @@ class MACHActivationHebbian(nn.Module):
         decays = 0.1 + 0.9 * torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # [0.1, 1.0]
         expls = 0.1 + 0.4 * torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) + self.exploration_noise
         # Serotonin: learned discount factor (patience)
-        # Floor 0.5 (never fully myopic) + range 0.5 → [0.5, 1.0]
-        gamma = 0.5 + 0.5 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
+        # Floor 0.1 (never fully myopic) + range 0.9 → [0.1, 1.0]
+        gamma = 0.1 + 0.9 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
