@@ -377,6 +377,215 @@ def main():
             del mach, patched_model, hipp
             torch.cuda.empty_cache()
 
+    # --- Sequential multi-op eval (simulates real deployment) ---
+    if args.memory_path:
+        all_ops = args.held_out_ops + args.train_ops
+        steps_per_op = min(50, args.n_steps // 5)  # shorter blocks, more cycles
+        n_cycles = 5
+
+        for mode_name, mode_key, use_hipp in [
+            ("SEQUENTIAL: full (no hipp)", "full", False),
+            ("SEQUENTIAL: full + hippocampus", "full", True),
+            ("SEQUENTIAL: reward_only (no hipp)", "reward_only", False),
+            ("SEQUENTIAL: reward_only + hippocampus", "reward_only", True),
+        ]:
+            print("\n" + "=" * 80)
+            print(f"{mode_name} — {steps_per_op} steps/op × {n_cycles} cycles")
+            print("=" * 80)
+
+            op_results, hipp_count = run_sequential_eval(
+                base_model, d_model, n_layers, patch_layers, tokenizer,
+                args.checkpoint, args.n_rank, all_ops, steps_per_op, n_cycles,
+                args.lr, mode_key, use_hipp, args.memory_path,
+            )
+
+            for op in all_ops:
+                is_held_out = op in args.held_out_ops
+                tag = "HELD-OUT" if is_held_out else "trained"
+                accs = [a for _, a in op_results[op]]
+                first = accs[0]
+                last = accs[-1]
+                avg = sum(accs) / len(accs)
+                cycle_str = " → ".join(f"{a:.0%}" for a in accs)
+                print(f"  {op:12s} [{tag:8s}] | {cycle_str} | avg={avg:.0%}")
+
+            if hipp_count > 0:
+                print(f"  Hippocampus: {hipp_count} memories")
+
+
+def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
+                        checkpoint, n_rank, ops, steps_per_op, n_cycles, lr,
+                        mode, use_hipp, memory_path):
+    """Run ops sequentially with shared mach + hippocampus across all ops.
+
+    Simulates real deployment: ops interleave, patches persist, hippocampus
+    builds memories across ops and reinstates when ops repeat.
+
+    Returns dict of {op: [(cycle, accuracy)]}
+    """
+    from models.hippocampus import Hippocampus
+
+    mach = MACHActivationHebbian(
+        d_model=d_model, n_layers=n_layers, patch_layers=patch_layers,
+        hidden_dim=config.PATCH_HIDDEN_DIM, n_rank=n_rank, d_proj=32,
+    ).to(config.DEVICE)
+    state = torch.load(checkpoint, map_location=config.DEVICE)
+    mach.load_state_dict(state, strict=False)
+    patched_model = ActivationHebbianPatchedModel(base_model, mach)
+
+    hipp = None
+    if use_hipp:
+        key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
+        hipp = Hippocampus(
+            key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
+        ).to(config.DEVICE)
+
+    # No reset_episode — patches and state persist across everything
+    mach.reset_episode()
+    mach.train()
+    meta_params = [p for p in mach.parameters() if p.requires_grad]
+    if hipp is not None:
+        for p in hipp.parameters():
+            if p.requires_grad:
+                meta_params.append(p)
+    optimizer = torch.optim.Adam(meta_params, lr=lr)
+
+    op_results = {op: [] for op in ops}
+    truncation_window = 20
+    window_ce = torch.tensor(0.0, device=config.DEVICE, requires_grad=True)
+    window_critic_losses = []
+    window_nuclei_losses = []
+    global_step = 0
+
+    for cycle in range(n_cycles):
+        for op in ops:
+            problems = generate_few_shot_episode(steps_per_op, n_demos=0, op_type=op)
+            corrects = []
+
+            for problem in problems:
+                full_text = problem["prompt"] + problem["answer"]
+                encoding = tokenizer(full_text, return_tensors="pt").to(config.DEVICE)
+                prompt_len = len(tokenizer(problem["prompt"]).input_ids)
+                labels = encoding.input_ids.clone()
+                labels[0, :prompt_len] = -100
+
+                # Hippocampus retrieval
+                if hipp is not None and len(hipp) > 0:
+                    act_summary = mach.get_activation_summary()
+                    act_summary = act_summary / (act_summary.norm() + 1e-8)
+                    td_err = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
+                    hipp.retrieve_and_reinstate(mach, act_summary, td_err, top_k=3, device=config.DEVICE)
+
+                if mode == "full":
+                    output = patched_model(input_ids=encoding.input_ids, labels=labels)
+                    window_ce = window_ce + output.loss
+                else:  # reward_only
+                    output = patched_model(input_ids=encoding.input_ids, labels=labels)
+
+                with torch.no_grad():
+                    logits = output.logits
+                    pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                    pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                    predicted = extract_number(pred_text)
+                    correct = (predicted == problem["answer"])
+                    reward = graded_reward(predicted, problem["answer"])
+
+                corrects.append(int(correct))
+
+                value, _ = mach.hebbian_step(reward, 0, 1, config.DEVICE)
+
+                # Hippocampus store + reconsolidate
+                if hipp is not None:
+                    td_error = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
+                    gamma = mach._last_gamma if hasattr(mach, '_last_gamma') else 0.95
+                    avg_decay = mach._last_decays.mean().item() if hasattr(mach, '_last_decays') and mach._last_decays is not None else 0.9
+                    hipp.set_neuromod(gamma, avg_decay)
+                    hipp.reconsolidate(td_error)
+                    act_summary = mach.get_activation_summary()
+                    act_summary = act_summary / (act_summary.norm() + 1e-8)
+                    hipp.store(mach, act_summary, reward, td_error)
+
+                # Critic loss
+                if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+                    prev_gamma = mach._prev_gamma if hasattr(mach, '_prev_gamma') and mach._prev_gamma is not None else mach.gamma
+                    td_target = mach._prev_reward + prev_gamma * value.detach()
+                    critic_loss = (mach._prev_critic_value - td_target) ** 2
+                    window_critic_losses.append(critic_loss)
+                mach._prev_critic_value = value
+                mach._prev_reward = torch.tensor(reward, device=config.DEVICE, dtype=torch.float32)
+                mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
+                if hasattr(mach, '_nuclei_loss'):
+                    window_nuclei_losses.append(mach._nuclei_loss)
+
+                global_step += 1
+
+                # Truncated backprop
+                if global_step % truncation_window == 0:
+                    if window_critic_losses:
+                        avg_critic = torch.stack(window_critic_losses).mean()
+                        if mode == "reward_only":
+                            total_loss = 0.5 * avg_critic
+                        else:
+                            total_loss = window_ce + 0.5 * avg_critic
+                        if window_nuclei_losses:
+                            avg_nuclei = torch.stack(window_nuclei_losses).mean()
+                            total_loss = total_loss + 0.1 * avg_nuclei
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
+                        optimizer.step()
+                        optimizer.zero_grad()
+
+                    # Detach all state
+                    for patch in mach.patches:
+                        if patch.delta_down is not None:
+                            patch.delta_down = patch.delta_down.detach()
+                        if patch.delta_up is not None:
+                            patch.delta_up = patch.delta_up.detach()
+                        if patch.delta_gain is not None:
+                            patch.delta_gain = patch.delta_gain.detach()
+                    if hasattr(mach, 'attn_patches'):
+                        for patch in mach.attn_patches:
+                            if patch.delta_down is not None:
+                                patch.delta_down = patch.delta_down.detach()
+                            if patch.delta_up is not None:
+                                patch.delta_up = patch.delta_up.detach()
+                            if patch.delta_gain is not None:
+                                patch.delta_gain = patch.delta_gain.detach()
+                    if hasattr(mach, '_critic_state'):
+                        mach._critic_state = mach._critic_state.detach()
+                    for attr in ('_eta_state', '_decay_state', '_expl_state', '_gamma_state', '_pfc_state'):
+                        if hasattr(mach, attr):
+                            setattr(mach, attr, getattr(mach, attr).detach())
+                    for rule_attr in ('hebb_rule', 'attn_hebb_rule'):
+                        rule = getattr(mach, rule_attr, None)
+                        if rule is not None and hasattr(rule, '_traces') and rule._traces is not None:
+                            for p_traces in rule._traces:
+                                for r in range(len(p_traces)):
+                                    p_traces[r] = p_traces[r].detach()
+                    for key in list(mach._pre_activations.keys()):
+                        mach._pre_activations[key] = mach._pre_activations[key].detach()
+                    for key in list(mach._post_activations.keys()):
+                        mach._post_activations[key] = mach._post_activations[key].detach()
+                    if hasattr(mach, '_attn_pre'):
+                        for key in list(mach._attn_pre.keys()):
+                            mach._attn_pre[key] = mach._attn_pre[key].detach()
+                    if hasattr(mach, '_attn_post'):
+                        for key in list(mach._attn_post.keys()):
+                            mach._attn_post[key] = mach._attn_post[key].detach()
+                    if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
+                        mach._prev_critic_value = mach._prev_critic_value.detach()
+
+                    window_ce = torch.tensor(0.0, device=config.DEVICE, requires_grad=True)
+                    window_critic_losses = []
+                    window_nuclei_losses = []
+
+            acc = sum(corrects) / len(corrects)
+            op_results[op].append((cycle, acc))
+
+    patched_model.remove_hooks()
+    hipp_count = len(hipp) if hipp is not None else 0
+    return op_results, hipp_count
+
 
 if __name__ == "__main__":
     main()
