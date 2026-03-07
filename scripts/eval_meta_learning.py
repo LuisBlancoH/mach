@@ -45,10 +45,11 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
         "hebbian" — Hebbian only, no gradient (frozen meta-params)
         "baseline" — no patches, no updates
         "sparse" — full system but reward only every sparse_interval steps
+        "reward_only" — NO CE loss, only critic loss + Hebbian (simulates deployment)
     """
     mach.reset_episode()
 
-    if mode == "full" or mode == "sparse":
+    if mode in ("full", "sparse", "reward_only"):
         mach.train()
         meta_params = [p for p in mach.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(meta_params, lr=lr)
@@ -84,6 +85,11 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
         if mode in ("full", "sparse"):
             output = patched_model(input_ids=encoding.input_ids, labels=labels)
             window_ce = window_ce + output.loss
+        elif mode == "reward_only":
+            # Forward pass WITH patches (so they affect output) but NO CE loss
+            # Gradient flows only through critic loss → machinery
+            output = patched_model(input_ids=encoding.input_ids, labels=labels)
+            # Don't add output.loss to window_ce — CE is not available at deployment
         else:
             with torch.no_grad():
                 output = patched_model(input_ids=encoding.input_ids, labels=labels)
@@ -101,7 +107,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             reward = 0.0  # no feedback this step
 
         # Hebbian step
-        if mode in ("full", "sparse"):
+        if mode in ("full", "sparse", "reward_only"):
             value, _ = mach.hebbian_step(reward, step, n_steps, device)
             critic_target = torch.tensor(reward, device=device, dtype=torch.float32)
             critic_loss = (value - critic_target) ** 2
@@ -113,11 +119,15 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
         td_error = mach._last_td_error if hasattr(mach, '_last_td_error') else 0
         results.append((step, int(correct), reward, td_error))
 
-        # Truncated backprop (full and sparse modes only)
-        if mode in ("full", "sparse") and (step + 1) % truncation_window == 0:
+        # Truncated backprop
+        if mode in ("full", "sparse", "reward_only") and (step + 1) % truncation_window == 0:
             if window_critic_losses:
                 avg_critic = torch.stack(window_critic_losses).mean()
-                total_loss = window_ce + 0.5 * avg_critic
+                # reward_only: critic loss ONLY (no CE — simulates deployment)
+                if mode == "reward_only":
+                    total_loss = 0.5 * avg_critic
+                else:
+                    total_loss = window_ce + 0.5 * avg_critic
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
                 optimizer.step()
@@ -243,6 +253,7 @@ def main():
     modes = [
         ("HEBBIAN ONLY (frozen meta-params)", "hebbian"),
         ("FULL SYSTEM (gradient + Hebbian)", "full"),
+        ("REWARD ONLY (no CE — simulates deployment)", "reward_only"),
         (f"SPARSE REWARD (every {args.sparse_interval} steps)", "sparse"),
     ]
 
