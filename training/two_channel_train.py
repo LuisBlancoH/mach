@@ -1468,6 +1468,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     current_op = random.choice(DIVERSE_TRAIN_OPS)
     op_step_count = 0
     op_switch_interval = random.randint(10, 60)  # random task duration
+    # Reward sparsity: varies per task block (trains patience/gamma nucleus)
+    # 1 = every step, 5 = every 5th step, etc.
+    sparse_options = [1, 1, 1, 1, 5, 10, 20]  # mostly dense, sometimes sparse
+    reward_interval = random.choice(sparse_options)
 
     # Hippocampus: compressed episodic memory
     hippocampus = None
@@ -1497,6 +1501,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
             op_switch_interval = random.randint(10, 60)
+            reward_interval = random.choice(sparse_options)
             if context_size > 0:
                 context_buffer.clear()  # new task = clear episodic memory
 
@@ -1575,6 +1580,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 predicted = extract_number(pred_text)
                 correct = (predicted == problem["answer"])
                 reward = graded_reward(predicted, problem["answer"])
+        # Sparse reward: withhold feedback on non-feedback steps
+        # The system still sees the problem and generates an answer,
+        # but doesn't get told if it was right. Trains patience (gamma nucleus).
+        if reward_interval > 1 and op_step_count % reward_interval != 0:
+            reward = 0.0  # no feedback this step
+
         all_rewards.append(reward)
 
         # Update context buffer: show the correct answer (feedback)
