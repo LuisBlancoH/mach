@@ -2450,12 +2450,210 @@ class ActivationHebbianRule(nn.Module):
         return gate * delta_down, gate * delta_up
 
 
+class LearnedPlasticityRule(nn.Module):
+    """
+    Brain-like learned plasticity rule with eligibility traces and RPE gating.
+
+    Brain analogy:
+    - Activity creates eligibility traces (CaMKII, PKC at synapses)
+    - Traces persist for seconds, decaying exponentially
+    - Dopamine RPE converts eligible traces → actual weight changes
+    - The plasticity PROGRAM (molecular machinery) is evolved (meta-learned)
+
+    Instead of: delta = eta * reward * (pre ⊗ post)  [too simple]
+    We do:      trace += pre_features ⊗ post_features  [what happened]
+                delta = PlasticityNet(trace, RPE, context)  [learned conversion]
+
+    The PlasticityNet is the "molecular machinery" — meta-learned to produce
+    useful weight change directions from eligibility traces and reward signals.
+    """
+
+    def __init__(self, d_model, hidden_dim=256, n_patches=4, n_rank=2, d_proj=32):
+        super().__init__()
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.n_patches = n_patches
+        self.n_rank = n_rank
+        self.d_proj = d_proj
+
+        # Shared compression: d_model -> d_proj (per patch)
+        self.compress = nn.ModuleList([
+            nn.Linear(d_model, d_proj, bias=False) for _ in range(n_patches)
+        ])
+
+        # Eligibility trace projections: compress activations into trace features
+        # These are the "receptor types" that determine what activity patterns get tagged
+        self.trace_pre_proj = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(d_proj, d_proj, bias=False) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+        self.trace_post_proj = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(d_proj, d_proj, bias=False) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+
+        # Learned plasticity network: converts (trace_summary, RPE, neuromod) → write coefficients
+        # This is the "molecular machinery" that evolution optimized
+        # Input: n_rank (trace magnitudes) + 1 (RPE) + 3 (eta/decay/expl) = n_rank + 4
+        plasticity_in = n_rank + 4
+        self.plasticity_net = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(plasticity_in, 16),
+                nn.Tanh(),
+                nn.Linear(16, n_rank),  # output: per-rank write coefficient
+            ) for _ in range(n_patches)
+        ])
+
+        # Direction projections: produce the actual weight update directions
+        # Per-rank, per-patch projections for delta_down (hidden_dim x d_model)
+        self.row_heads_down = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(d_proj, hidden_dim) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+        self.col_diags_down = nn.ParameterList([
+            nn.ParameterList([
+                nn.Parameter(torch.ones(d_model) * 0.01) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+
+        # Per-rank, per-patch projections for delta_up (d_model x hidden_dim)
+        self.row_diags_up = nn.ParameterList([
+            nn.ParameterList([
+                nn.Parameter(torch.ones(d_model) * 0.01) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+        self.col_heads_up = nn.ModuleList([
+            nn.ModuleList([
+                nn.Linear(d_proj, hidden_dim) for _ in range(n_rank)
+            ]) for _ in range(n_patches)
+        ])
+
+        # Small init
+        for patch_heads in self.row_heads_down:
+            for head in patch_heads:
+                nn.init.normal_(head.weight, std=0.01)
+                nn.init.zeros_(head.bias)
+        for patch_heads in self.col_heads_up:
+            for head in patch_heads:
+                nn.init.normal_(head.weight, std=0.01)
+                nn.init.zeros_(head.bias)
+
+        # Init plasticity net output layer to near-zero (start conservative)
+        for pnet in self.plasticity_net:
+            nn.init.zeros_(pnet[-1].weight)
+            nn.init.zeros_(pnet[-1].bias)
+
+        # Eligibility traces: per-patch, per-rank scalar magnitude
+        # These are buffers (not parameters) — they accumulate during episodes
+        self._traces = None  # initialized in reset_traces()
+
+    def reset_traces(self, device):
+        """Reset eligibility traces at episode start."""
+        self._traces = torch.zeros(self.n_patches, self.n_rank, device=device)
+
+    def update_trace(self, patch_idx, pre_act, post_act, trace_decay):
+        """
+        Update eligibility trace for a patch.
+
+        Like CaMKII at a synapse: when pre and post are co-active,
+        the synapse becomes "eligible" for modification. The trace
+        decays exponentially — recent activity is more eligible.
+        """
+        pre = pre_act.float()
+        while pre.dim() > 1:
+            pre = pre.mean(dim=0)
+        post = post_act.float()
+        while post.dim() > 1:
+            post = post.mean(dim=0)
+
+        pre_c = self.compress[patch_idx](pre)    # (d_proj,)
+        post_c = self.compress[patch_idx](post)  # (d_proj,)
+
+        for r in range(self.n_rank):
+            # Project through learned "receptor" projections
+            pre_feat = self.trace_pre_proj[patch_idx][r](pre_c)   # (d_proj,)
+            post_feat = self.trace_post_proj[patch_idx][r](post_c) # (d_proj,)
+            # Trace magnitude: dot product of projected features
+            trace_val = (pre_feat * post_feat).sum()
+            # Accumulate with decay (eligibility trace dynamics)
+            self._traces[patch_idx, r] = (
+                trace_decay * self._traces[patch_idx, r] + trace_val
+            )
+
+    def compute_update(self, patch_idx, pre_act, post_act, td_error,
+                       eta, decay, exploration,
+                       exploration_noise=0.0, training=False):
+        """
+        Convert eligibility traces → weight updates using learned plasticity program.
+
+        td_error: RPE (dopamine signal) — drives WHICH traces get converted
+        eta/decay/exploration: neuromodulator context
+        """
+        pre = pre_act.float()
+        while pre.dim() > 1:
+            pre = pre.mean(dim=0)
+        post = post_act.float()
+        while post.dim() > 1:
+            post = post.mean(dim=0)
+
+        pre_c = self.compress[patch_idx](pre)
+        post_c = self.compress[patch_idx](post)
+
+        pre_norm = pre / (pre.norm() + 1e-8)
+        post_norm = post / (post.norm() + 1e-8)
+
+        # Plasticity network input: trace magnitudes + RPE + neuromod context
+        trace_vals = self._traces[patch_idx]  # (n_rank,)
+        plasticity_input = torch.cat([
+            trace_vals,
+            td_error.unsqueeze(0),       # RPE (dopamine)
+            eta.unsqueeze(0),            # plasticity rate
+            decay.unsqueeze(0),          # retention
+            exploration.unsqueeze(0),    # exploration
+        ])
+
+        # Learned plasticity program: traces + context → write coefficients
+        coeffs = self.plasticity_net[patch_idx](plasticity_input)  # (n_rank,)
+        coeffs = torch.tanh(coeffs)
+
+        # Exploration noise on coefficients
+        if training and exploration_noise > 0:
+            coeffs = coeffs + torch.randn_like(coeffs) * exploration_noise
+
+        # Generate weight updates using directions (same as ActivationHebbianRule)
+        delta_down = torch.zeros(self.hidden_dim, self.d_model, device=pre.device)
+        delta_up = torch.zeros(self.d_model, self.hidden_dim, device=pre.device)
+
+        for r in range(self.n_rank):
+            # delta_down: learned row, activation-derived col
+            u_down = self.row_heads_down[patch_idx][r](pre_c)
+            v_down = self.col_diags_down[patch_idx][r] * pre_norm
+            u_down = u_down / (u_down.norm() + 1e-8)
+            v_down = v_down / (v_down.norm() + 1e-8)
+            delta_down = delta_down + coeffs[r] * torch.outer(u_down, v_down)
+
+            # delta_up: activation-derived row, learned col
+            u_up = self.row_diags_up[patch_idx][r] * post_norm
+            v_up = self.col_heads_up[patch_idx][r](post_c)
+            u_up = u_up / (u_up.norm() + 1e-8)
+            v_up = v_up / (v_up.norm() + 1e-8)
+            delta_up = delta_up + coeffs[r] * torch.outer(u_up, v_up)
+
+        return delta_down, delta_up
+
+
 class MACHActivationHebbian(nn.Module):
     """
-    Hebbian learning with activation-derived updates (no basis vectors).
+    Brain-like plasticity with eligibility traces and RPE-driven learning.
 
-    Same structure as MACHHebbian but uses ActivationHebbianRule instead
-    of BasisVectors + pre_projs + post_projs.
+    Key differences from simple Hebbian:
+    1. Eligibility traces: activity creates "pending" modifications
+    2. RPE gating: only unexpected outcomes drive plasticity (dopamine)
+    3. Learned plasticity program: small network converts traces → weight updates
+    4. Expected outcomes → no change (critic predicts well → td_error ≈ 0)
     """
 
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
@@ -2483,8 +2681,8 @@ class MACHActivationHebbian(nn.Module):
             DifferentiablePatch(d_model, hidden_dim) for _ in patch_layers
         ])
 
-        # Activation-derived Hebbian rule (replaces BasisVectors + projs)
-        self.hebb_rule = ActivationHebbianRule(
+        # Brain-like learned plasticity rule (replaces simple Hebbian outer products)
+        self.hebb_rule = LearnedPlasticityRule(
             d_model, hidden_dim, len(patch_layers), n_rank, d_proj
         )
 
@@ -2562,6 +2760,8 @@ class MACHActivationHebbian(nn.Module):
         self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
         self._pfc_state = torch.zeros(1, 32, device=self._critic_state.device)
+        # Reset eligibility traces
+        self.hebb_rule.reset_traces(self._critic_state.device)
 
     def consolidate(self, avg_reward=None, threshold=0.0):
         """Consolidate deltas into slow memory.
@@ -2621,21 +2821,22 @@ class MACHActivationHebbian(nn.Module):
         return torch.cat(summaries)
 
     def hebbian_step(self, reward, step_idx, n_steps, device):
-        """Compute activation-derived Hebbian updates with learned neuromodulation.
+        """Brain-like plasticity with eligibility traces and RPE gating.
 
-        Separate nuclei read shared GRU state, each producing one signal:
-        - value_head (VTA): reward prediction → TD error (dopamine)
-        - eta_head (dopamine circuit): plasticity rate
-        - decay_head (ACh circuit): memory retention
-        - expl_head (locus coeruleus): exploration noise
+        Two-phase process (like the brain):
+        1. TRACE PHASE: Activity from the forward pass updates eligibility traces
+           (like CaMKII tagging active synapses — "what just happened")
+        2. CONVERSION PHASE: RPE (dopamine) converts eligible traces → weight changes
+           via a learned plasticity program (like evolved molecular machinery)
+
+        Expected outcomes (td_error ≈ 0) → no plasticity change.
+        Surprising outcomes → strong plasticity, proportional to surprise magnitude.
         """
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
         # Reciprocal PFC ↔ basal ganglia communication (detached — signal, not gradient)
-        # Critic sees PFC task context, PFC sees critic reward context
         pfc_to_critic = self._pfc_state.squeeze(0).detach()    # (32,)
-        critic_to_pfc = self._critic_state.squeeze(0).detach() # (64,)
 
         # Basal ganglia: activations + PFC context → reward prediction
         critic_input = self.critic_proj(torch.cat([act_summary, pfc_to_critic])).unsqueeze(0)  # (1, 64)
@@ -2651,14 +2852,13 @@ class MACHActivationHebbian(nn.Module):
         self._expl_state = self.expl_gru(h_unsq, self._expl_state)
 
         # Tonic + phasic: hard floor (genetic constraint) + learned modulation
-        # Like tonic dopamine/NE/ACh — always-on baseline that can't be eliminated
         etas = 0.1 + 0.9 * torch.sigmoid(self.eta_out(self._eta_state.squeeze(0)))        # [0.1, 1.0]
         decays = 0.1 + 0.9 * torch.sigmoid(self.decay_out(self._decay_state.squeeze(0)))  # [0.1, 1.0]
-        expls = 0.1 + 0.4 * torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) + self.exploration_noise  # [0.1+noise, 0.5+noise]
+        expls = 0.1 + 0.4 * torch.sigmoid(self.expl_out(self._expl_state.squeeze(0))) + self.exploration_noise
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
-        # TD error = surprise = dopamine
+        # TD error = RPE = dopamine signal
         td_error = (reward_t - value).detach()
 
         # Update reward EMA (for logging only)
@@ -2669,21 +2869,40 @@ class MACHActivationHebbian(nn.Module):
         self._last_decays = decays.detach()
         self._last_td_error = td_error.item()
         self._last_expls = expls.detach()
-        self._last_exploration = expls.detach().mean().item()  # backward compat
+        self._last_exploration = expls.detach().mean().item()
 
         for patch_idx in range(self.n_patches):
             if patch_idx in self._pre_activations:
-                gate = (etas[patch_idx] * td_error * self.gate_scale).clamp(-1.0, 1.0)
+                # Phase 1: Update eligibility trace (tag active synapses)
+                # Trace decays with learned retention — recent activity more eligible
+                self.hebb_rule.update_trace(
+                    patch_idx,
+                    self._pre_activations[patch_idx],
+                    self._post_activations[patch_idx],
+                    trace_decay=decays[patch_idx].detach(),
+                )
+
+                # Phase 2: RPE converts traces → weight changes via learned program
+                # The plasticity network decides HOW to convert traces given the context
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx],
                     self._post_activations[patch_idx],
-                    gate,
+                    td_error=td_error,
+                    eta=etas[patch_idx],
+                    decay=decays[patch_idx],
+                    exploration=expls[patch_idx],
                     exploration_noise=expls[patch_idx],
                     training=self.training,
                 )
-                self.patches[patch_idx].accumulate_write("down", delta_down, decay=decays[patch_idx])
-                self.patches[patch_idx].accumulate_write("up", delta_up, decay=decays[patch_idx])
+                # Scale by eta * gate_scale (overall plasticity rate)
+                scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0)
+                self.patches[patch_idx].accumulate_write(
+                    "down", scale * delta_down, decay=decays[patch_idx]
+                )
+                self.patches[patch_idx].accumulate_write(
+                    "up", scale * delta_up, decay=decays[patch_idx]
+                )
 
         return value, reward_t
 

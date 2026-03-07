@@ -1117,10 +1117,11 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             ).strip()
             if problem.get("difficulty") == "token_map":
                 correct = (pred_text == problem["answer"])
+                reward = 1.0 if correct else -1.0
             else:
                 predicted = extract_number(pred_text)
                 correct = (predicted == problem["answer"])
-            reward = 1.0 if correct else -1.0
+                reward = graded_reward(predicted, problem["answer"])
         rewards.append(reward)
 
         # 3. Hebbian step: critic → TD error → local weight updates
