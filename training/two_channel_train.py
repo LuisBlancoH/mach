@@ -1603,6 +1603,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 for p_traces in mach.hebb_rule._traces:
                     for r in range(len(p_traces)):
                         p_traces[r] = p_traces[r].detach()
+            # Detach stored activations (undetached obs path)
+            for key in list(mach._pre_activations.keys()):
+                mach._pre_activations[key] = mach._pre_activations[key].detach()
+            for key in list(mach._post_activations.keys()):
+                mach._post_activations[key] = mach._post_activations[key].detach()
 
             # Reset window accumulators
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
