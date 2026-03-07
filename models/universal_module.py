@@ -13,6 +13,13 @@ from models.cerebellum import Cerebellum
 from models.error_observation import ErrorProjection
 
 
+def _clamp_grad(grad):
+    """Clamp gradients at the Qwen boundary to prevent NaN from
+    bfloat16 gradient explosion across 36 layers. Preserves direction,
+    limits magnitude."""
+    return grad.clamp(-1.0, 1.0)
+
+
 class DifferentiablePatch(nn.Module):
     """
     Cortical patch with differentiable accumulated writes.
@@ -2830,18 +2837,16 @@ class MACHActivationHebbian(nn.Module):
     def get_activation_summary(self):
         """Summarize captured activations for critic input.
 
-        Activations are detached before compress: gradient flows through
-        compress weights (they learn to extract useful features) but NOT
-        back through Qwen (that path explodes to NaN due to bfloat16
-        amplification across 36 layers). Compress learns from critic loss
-        on its output, not from backprop through Qwen.
+        Gradient flows through compress AND through hook-clamped activations.
+        The _clamp_grad hooks on patch outputs prevent NaN from bfloat16
+        explosion across 36 Qwen layers. This lets compress, context_gates,
+        nuclei, and plasticity_net all receive gradient from the CE loss path.
         """
         summaries = []
         for i in range(self.n_patches):
             pre = self._pre_activations.get(i)
             if pre is not None:
-                # Detach: don't backprop through Qwen
-                compressed = self.hebb_rule.compress[i](pre.detach().float())
+                compressed = self.hebb_rule.compress[i](pre.float())
                 while compressed.dim() > 1:
                     compressed = compressed.mean(dim=0)
                 summaries.append(compressed)
@@ -2906,46 +2911,42 @@ class MACHActivationHebbian(nn.Module):
         self._last_exploration = expls.detach().mean().item()
 
         for patch_idx in range(self.n_patches):
-            # Neuromod values for writes: detach from CE loss path.
-            # Nuclei learn from critic loss (reward prediction), not from
-            # CE loss backpropping through Qwen — that path goes NaN.
-            # Brain-like: VTA/LC learn from reward signals, not cortical errors.
-            scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0).detach()
-            write_decay = decays[patch_idx].detach()
+            # Gradient flows through scale/decay to nuclei GRUs.
+            # NaN prevention is handled by _clamp_grad hooks at Qwen boundary.
+            scale = (etas[patch_idx] * self.gate_scale).clamp(0, 1.0)
+            write_decay = decays[patch_idx]
 
             # --- Residual patch update ---
             if patch_idx in self._pre_activations:
                 # Phase 1: Update eligibility trace (tag active synapses)
+                # Traces are detached (biological: CaMKII doesn't backprop)
                 self.hebb_rule.update_trace(
                     patch_idx,
                     self._pre_activations[patch_idx].detach(),
                     self._post_activations[patch_idx].detach(),
-                    trace_decay=write_decay,
+                    trace_decay=write_decay.detach(),
                 )
 
                 # Phase 2: RPE converts traces → weight changes
-                # All inputs detached: plasticity_net learns from critic loss
-                # (via write_magnitude added to critic path below), NOT from
-                # CE loss through Qwen (that path explodes to NaN).
-                # Brain-like: molecular machinery shaped by reward (evolution),
-                # not by cortical error backprop.
+                # Activations detached (traces already captured them).
+                # But scale/decay/eta keep gradient → nuclei learn what to modulate.
                 delta_down, delta_up = self.hebb_rule.compute_update(
                     patch_idx,
                     self._pre_activations[patch_idx].detach(),
                     self._post_activations[patch_idx].detach(),
                     td_error=td_error,
-                    eta=etas[patch_idx].detach(),
-                    decay=decays[patch_idx].detach(),
-                    exploration=expls[patch_idx].detach(),
+                    eta=etas[patch_idx],
+                    decay=decays[patch_idx],
+                    exploration=expls[patch_idx],
                     exploration_noise=expls[patch_idx].detach(),
                     training=self.training,
                 )
-                # Detach writes: no gradient from CE loss through patch deltas
+                # Writes keep gradient through scale and plasticity_net
                 self.patches[patch_idx].accumulate_write(
-                    "down", (scale * delta_down).detach(), decay=write_decay
+                    "down", scale * delta_down, decay=write_decay
                 )
                 self.patches[patch_idx].accumulate_write(
-                    "up", (scale * delta_up).detach(), decay=write_decay
+                    "up", scale * delta_up, decay=write_decay
                 )
 
             # --- Attention patch update ---
@@ -2954,7 +2955,7 @@ class MACHActivationHebbian(nn.Module):
                     patch_idx,
                     self._attn_pre_activations[patch_idx].detach(),
                     self._attn_post_activations[patch_idx].detach(),
-                    trace_decay=write_decay,
+                    trace_decay=write_decay.detach(),
                 )
 
                 delta_down_a, delta_up_a = self.attn_hebb_rule.compute_update(
@@ -2962,17 +2963,17 @@ class MACHActivationHebbian(nn.Module):
                     self._attn_pre_activations[patch_idx].detach(),
                     self._attn_post_activations[patch_idx].detach(),
                     td_error=td_error,
-                    eta=etas[patch_idx].detach(),
-                    decay=decays[patch_idx].detach(),
-                    exploration=expls[patch_idx].detach(),
+                    eta=etas[patch_idx],
+                    decay=decays[patch_idx],
+                    exploration=expls[patch_idx],
                     exploration_noise=expls[patch_idx].detach(),
                     training=self.training,
                 )
                 self.attn_patches[patch_idx].accumulate_write(
-                    "down", (scale * delta_down_a).detach(), decay=write_decay
+                    "down", scale * delta_down_a, decay=write_decay
                 )
                 self.attn_patches[patch_idx].accumulate_write(
-                    "up", (scale * delta_up_a).detach(), decay=write_decay
+                    "up", scale * delta_up_a, decay=write_decay
                 )
 
         return value, reward_t
@@ -3006,6 +3007,11 @@ class ActivationHebbianPatchedModel(nn.Module):
                     correction = attn_patch(h_in.float())
                     attn_out_new = attn_out + correction.to(attn_out.dtype)
 
+                    # Clamp gradient at Qwen boundary: prevents NaN from
+                    # bfloat16 gradient explosion across 36 layers
+                    if attn_out_new.requires_grad:
+                        attn_out_new.register_hook(_clamp_grad)
+
                     self.mach._attn_post_activations[patch_idx] = attn_out_new
 
                     return (attn_out_new,) + output[1:]
@@ -3026,18 +3032,20 @@ class ActivationHebbianPatchedModel(nn.Module):
                     else:
                         h = output
 
-                    # Undetached: gradient flows through compress → critic/PFC
                     self.mach._pre_activations[patch_idx] = h
 
                     patch_out = patch(h.float())
                     # PFC context gate: task-dependent selection of patch dimensions
-                    # Detached: gates are fixed for this forward pass. PFC/context_gates
-                    # learn from critic loss, not CE loss through Qwen (that goes NaN).
                     ctx_gate = self.mach._context_gate_values.get(patch_idx)
                     if ctx_gate is not None:
-                        patch_out = patch_out * ctx_gate.detach().to(patch_out.dtype)
+                        patch_out = patch_out * ctx_gate.to(patch_out.dtype)
                     gain = patch.get_gain()
                     h_new = h * (1 + gain).to(h.dtype) + patch_out.to(h.dtype)
+
+                    # Clamp gradient at Qwen boundary: prevents NaN from
+                    # bfloat16 gradient explosion across 36 layers
+                    if h_new.requires_grad:
+                        h_new.register_hook(_clamp_grad)
 
                     self.mach._post_activations[patch_idx] = h_new
 
