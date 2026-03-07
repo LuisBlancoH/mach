@@ -2839,8 +2839,10 @@ class MACHActivationHebbian(nn.Module):
         act_summary = self.get_activation_summary()
         act_summary = act_summary / (act_summary.norm() + 1e-8)
 
-        # Reciprocal PFC ↔ basal ganglia communication (detached — signal, not gradient)
-        pfc_to_critic = self._pfc_state.squeeze(0).detach()    # (32,)
+        # PFC → critic: undetached (corticostriatal projections)
+        # PFC learns to represent task features that help critic predict reward
+        # Critic → PFC remains detached (BG→PFC is gating signal, not gradient)
+        pfc_to_critic = self._pfc_state.squeeze(0)             # (32,) — gradient flows
 
         # Basal ganglia: activations + PFC context → reward prediction
         critic_input = self.critic_proj(torch.cat([act_summary, pfc_to_critic])).unsqueeze(0)  # (1, 64)
