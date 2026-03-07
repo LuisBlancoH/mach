@@ -2579,8 +2579,9 @@ class LearnedPlasticityRule(nn.Module):
             # Trace magnitude: dot product of projected features
             trace_val = (pre_feat * post_feat).sum()
             # Accumulate with decay (eligibility trace dynamics)
+            # Detach old trace — gradient flows through current step's contribution only
             self._traces[patch_idx, r] = (
-                trace_decay * self._traces[patch_idx, r] + trace_val
+                trace_decay * self._traces[patch_idx, r].detach() + trace_val
             )
 
     def compute_update(self, patch_idx, pre_act, post_act, td_error,
