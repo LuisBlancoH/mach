@@ -142,9 +142,10 @@ class Hippocampus(nn.Module):
         if self._keys:
             sims = self._cosine_similarities(key_np)
             if sims.max() > 0.9:  # fixed — pattern_sep learns separation
-                # Reinforce existing memory via reconsolidation
+                # Reinforce existing memory with saturation
                 idx = int(sims.argmax())
-                self._strengths[idx] += strength
+                headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+                self._strengths[idx] += strength * headroom
                 return False
 
         # Extract compressed state
@@ -232,8 +233,11 @@ class Hippocampus(nn.Module):
             alpha_t = self.reinstatement_gate(gate_input).squeeze() * sim_t
             alpha_f = alpha_t.item()  # float copy for non-differentiable ops
 
-            # Retrieval strengthens memory (both approach and avoidance are useful)
-            self._strengths[idx] += abs(alpha_f)
+            # Retrieval strengthens memory with saturation (LTP ceiling)
+            # Diminishing returns: strong memories gain less from retrieval
+            # Like biological synapses — LTP saturates at a maximum
+            headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+            self._strengths[idx] += abs(alpha_f) * headroom
 
             if abs(alpha_f) < 1e-4:
                 continue
@@ -273,7 +277,12 @@ class Hippocampus(nn.Module):
         scale = self._recon_scale
         for idx in self._last_retrieved_indices:
             if idx < len(self._strengths):
-                self._strengths[idx] += td_error * scale
+                update = td_error * scale
+                # Saturation: positive updates diminish as strength approaches ceiling
+                if update > 0:
+                    headroom = max(0.0, 10.0 - self._strengths[idx]) / 10.0
+                    update *= headroom
+                self._strengths[idx] += update
                 # Clamp: strength can't go negative (memory dies at 0)
                 if self._strengths[idx] < 0:
                     self._strengths[idx] = 0.0
