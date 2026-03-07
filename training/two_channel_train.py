@@ -1423,7 +1423,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           truncation_window=20, checkpoint_path=None,
                           save_path=None, curriculum=None,
                           context_size=0, thinking_tokens=0,
-                          memory_path=None):
+                          memory_path=None, dense_only=False):
     """
     Continuous Hebbian training: no episodes, no resets.
 
@@ -1470,7 +1470,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     op_switch_interval = random.randint(10, 60)  # random task duration
     # Reward sparsity: varies per task block (trains patience/gamma nucleus)
     # 1 = every step, 5 = every 5th step, etc.
-    sparse_options = [1, 1, 1, 1, 5, 10, 20]  # mostly dense, sometimes sparse
+    if dense_only:
+        sparse_options = [1]
+    else:
+        sparse_options = [1, 1, 1, 1, 5, 10, 20]  # mostly dense, sometimes sparse
     reward_interval = random.choice(sparse_options)
 
     # Hippocampus: compressed episodic memory

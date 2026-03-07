@@ -172,6 +172,8 @@ def main():
                         help="Max thinking tokens before answering (0=off, 16-32=typical)")
     parser.add_argument("--memory-path", type=str, default=None,
                         help="Path for persistent hippocampal memory (e.g. memory/episodic.json)")
+    parser.add_argument("--dense-only", action="store_true",
+                        help="Disable sparse reward blocks (always immediate reward)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -531,6 +533,7 @@ def main():
                 context_size=args.context_size,
                 thinking_tokens=args.thinking_tokens,
                 memory_path=args.memory_path,
+                dense_only=args.dense_only,
             )
         else:
             meta_train_hebbian(
