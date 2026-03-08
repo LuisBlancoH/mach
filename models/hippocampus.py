@@ -151,7 +151,12 @@ class Hippocampus(nn.Module):
         else:
             pfc = torch.zeros(self.pfc_dim, device=activation_summary.device)
         combined = torch.cat([activation_summary, pfc])
-        return self.key_proj(combined)
+        key = self.key_proj(combined)
+        # Clamp gradient: key_proj → cosine_sim → alpha → PFC → GRU chain
+        # amplifies gradient by ~1000x. Same approach as Qwen boundary clamping.
+        if key.requires_grad:
+            key.register_hook(lambda g: g.clamp(-1.0, 1.0))
+        return key
 
     def _find_best(self, query_key, pfc_state, device):
         """Pattern completion: find most relevant episode in the global pool.

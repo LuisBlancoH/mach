@@ -2089,26 +2089,8 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
         diag[f"grad_norm/{component}"] = avg_norm
         diag[f"grad_max/{component}"] = max_norm
 
-    # Hippocampus gradient diagnostics
+    # Hippocampus stats (gradient norms are captured in _grad_accum, not here)
     if hippocampus is not None:
-        hipp_grad_norms = {}
-        hipp_no_grad = []
-        for name, param in hippocampus.named_parameters():
-            component = name.split('.')[0]  # e.g. key_proj, read_gate, episode_scorer, read_to_pfc
-            if param.grad is not None and param.grad.abs().sum() > 0:
-                norm = param.grad.norm().item()
-                if component not in hipp_grad_norms:
-                    hipp_grad_norms[component] = []
-                hipp_grad_norms[component].append(norm)
-            else:
-                hipp_no_grad.append(name)
-
-        for component, norms in hipp_grad_norms.items():
-            diag[f"hipp_grad/{component}"] = sum(norms) / len(norms)
-            diag[f"hipp_grad_max/{component}"] = max(norms)
-
-        if hipp_no_grad:
-            print(f"  Hippocampus params with NO gradient: {hipp_no_grad}")
 
         # Hippocampus weight norms (are parameters growing/changing?)
         for name, param in hippocampus.named_parameters():
