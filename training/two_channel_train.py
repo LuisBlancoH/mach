@@ -1492,7 +1492,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if p.requires_grad:
                 optimizer.add_param_group({'params': [p], 'lr': lr})
         n_hipp_params = sum(p.numel() for p in hippocampus.parameters())
-        print(f"Hippocampus: {len(hippocampus)} stored memories, key_dim={key_dim}, params={n_hipp_params:,}")
+        print(f"Hippocampus: {hippocampus}, params={n_hipp_params:,}")
 
     # Context buffer: rolling history of recent problems (short-term)
     context_buffer = []  # list of "a ? b = answer\n" strings
@@ -1727,7 +1727,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             step_timer = time.time()
             hipp_str = ""
             if hippocampus is not None:
-                hipp_str = f" | hipp: {len(hippocampus)}mem α={hipp_alpha:.3f}"
+                hipp_str = f" | hipp: {len(hippocampus)}/{hippocampus.n_slots} α={hipp_alpha:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
@@ -1797,16 +1797,14 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 torch.save(mach.state_dict(), save_path)
                 print(f"  Checkpoint saved to {save_path}")
 
-            # Hippocampus: decay + save (sleep replay TBD)
-            if hippocampus is not None and len(hippocampus) > 0:
+            # Hippocampus: decay + save
+            if hippocampus is not None:
                 hippocampus.decay_all()
                 hippocampus.save()
-                avg_str = sum(hippocampus._strengths) / len(hippocampus._strengths)
-                max_str = max(hippocampus._strengths)
-                print(f"  Hippocampus: {len(hippocampus)} memories, "
-                      f"avg_strength={avg_str:.3f}, max_strength={max_str:.3f}, "
-                      f"decay={hippocampus._decay_rate:.4f}, recon_scale={hippocampus._recon_scale:.2f}, "
-                      f"ceiling={hippocampus.strength_ceiling:.2f}")
+                avg_usage = hippocampus.usage.mean().item()
+                max_usage = hippocampus.usage.max().item()
+                print(f"  Hippocampus: {len(hippocampus)}/{hippocampus.n_slots} slots, "
+                      f"avg_usage={avg_usage:.3f}, max_usage={max_usage:.3f}")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,
