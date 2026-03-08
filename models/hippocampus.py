@@ -168,7 +168,7 @@ class Hippocampus(nn.Module):
         if n_eps == 0:
             return None, 0.0, -1
 
-        slot_eps = self.episodes[slot_idx, :n_eps]  # (n_eps, d_mem)
+        slot_eps = self.episodes[slot_idx, :n_eps].clone()  # (n_eps, d_mem)
         # Compare PFC portion of episodes to current PFC
         pfc_flat = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
         stored_pfcs = slot_eps[:, :self.pfc_dim]  # (n_eps, pfc_dim)
