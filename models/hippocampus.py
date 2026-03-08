@@ -147,15 +147,26 @@ class Hippocampus(nn.Module):
         return self.pattern_sep(combined)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """Encode current state into memory. Strength proportional to surprise.
+        """Encode current state into memory gated by salience.
 
-        No threshold — everything gets stored. Weak memories decay away naturally.
-        The hippocampus stores everything; consolidation (decay + eviction) handles
-        cleanup. This is brain-faithful: hippocampus doesn't filter, it encodes.
+        Like the real hippocampus: encoding is modulated by arousal/surprise.
+        Only surprising events (|TD error| above running baseline) get stored.
+        The threshold adapts — it's the running average of |TD error|, so the
+        system stores the TOP surprises, not everything.
         """
-        strength = abs(td_error)  # initial strength = how surprising
+        salience = abs(td_error)
+        # Adaptive salience gate: store only above-average surprises
+        # EMA tracks baseline surprise; above = noteworthy = store
+        if not hasattr(self, '_salience_ema'):
+            self._salience_ema = salience
+        else:
+            self._salience_ema = 0.99 * self._salience_ema + 0.01 * salience
+        if salience < self._salience_ema:
+            return False  # not surprising enough to encode
+
+        strength = salience
         if strength < 1e-6:
-            strength = 1e-6  # floor so memory exists
+            strength = 1e-6
 
         with torch.no_grad():
             pfc = mach._pfc_state.detach() if hasattr(mach, '_pfc_state') else None
