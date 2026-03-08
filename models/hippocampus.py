@@ -1,17 +1,18 @@
 """
-Hippocampus: differentiable episodic memory.
+Hippocampus: discrete slot memory with learned prototypes.
 
-A DNC-inspired memory module where all operations are soft and differentiable:
-- Soft writes with learned write strength (no store/don't-store threshold)
-- Soft reads via content-based attention (no top-k, no similarity threshold)
-- Learned forgetting (no hardcoded decay rate)
-- All operations remain in the computational graph → gradients teach the
-  system what to remember, retrieve, and forget.
+VQ-VAE inspired: a small codebook of learned prototype keys.
+Each slot learns to represent one "mode" of operation.
+Matching is discrete (argmax) but gradients flow via straight-through.
 
-Bitter lesson: no hardcoded thresholds. Everything is learned.
+No hardcoded thresholds. The system learns:
+- How many effective slots to use (prototypes specialize or merge)
+- What each slot represents (via prototype key gradient)
+- What to store per slot (PFC state + neuromod values)
+- How strongly to reinstate (read gate with approach/avoidance)
 
-Memory layout: (n_slots, d_mem) matrix on GPU.
-  n_slots=64, d_mem=64 → 4096 floats = 16KB. Negligible.
+Like thalamic nuclei: a small number of distinct modes the system
+switches between, each with associated cortical/neuromod settings.
 
 Interface is kept compatible with training/eval loops.
 """
@@ -23,36 +24,36 @@ import torch.nn.functional as F
 
 
 class Hippocampus(nn.Module):
-    """Differentiable episodic memory.
+    """Discrete slot memory with learned prototypes.
 
-    Fixed-size memory matrix with soft read/write/forget.
-    All operations are differentiable — no discrete decisions.
+    N_SLOTS learned prototype keys. Incoming state matches to the best
+    prototype (argmax). That slot's contents are reinstated.
+    Straight-through estimator: forward=argmax, backward=softmax.
     """
 
-    def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=64,
+    def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=16,
                  save_path=None):
         super().__init__()
         self.key_dim = key_dim       # activation summary dim (128)
         self.pfc_dim = pfc_dim       # PFC state dim (32)
         self.n_patches = n_patches
-        self.n_slots = max_memories  # renamed: fixed slots, not max
-        self.d_mem = pfc_dim + n_patches * 3  # what we store: PFC + neuromod
+        self.n_slots = max_memories  # number of discrete slots
+        self.d_mem = pfc_dim + n_patches * 3  # PFC + neuromod per slot
         self.save_path = save_path
 
-        # --- Memory matrix (buffer, not parameter — written by soft ops) ---
-        self.register_buffer('memory', torch.zeros(self.n_slots, self.d_mem))
-        self.register_buffer('usage', torch.zeros(self.n_slots))  # how used each slot is
+        # --- Learned prototype keys (the codebook) ---
+        # These are nn.Parameters — they learn via straight-through gradient
+        # Each prototype learns to represent one "type" of situation
+        self.prototypes = nn.Parameter(torch.randn(self.n_slots, key_dim) * 0.1)
 
         # --- Key projection with pattern separation (Dentate Gyrus) ---
         # Two-layer ReLU: sparse activation orthogonalizes similar inputs
-        # This IS the DG — similar add/sub/mul get distinct sparse codes
         input_dim = key_dim + pfc_dim
         self.key_proj = nn.Sequential(
             nn.Linear(input_dim, key_dim * 2),
-            nn.ReLU(),  # sparsity = pattern separation
+            nn.ReLU(),
             nn.Linear(key_dim * 2, key_dim),
         )
-        # Init: activation part near-identity, PFC part near-zero
         with torch.no_grad():
             nn.init.zeros_(self.key_proj[0].weight)
             self.key_proj[0].weight[:key_dim, :key_dim].copy_(torch.eye(key_dim))
@@ -61,83 +62,48 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.key_proj[2].weight[:, key_dim:])
             nn.init.zeros_(self.key_proj[2].bias)
 
-        # --- Stored keys (buffer, written alongside memory) ---
-        # Init keys with random orthogonal vectors to break symmetry
-        # Without this, all-zero keys → uniform attention → uniform writes → all slots identical
-        random_keys = torch.randn(self.n_slots, key_dim)
-        random_keys = F.normalize(random_keys, dim=-1)
-        self.register_buffer('keys', random_keys)
+        # --- Slot contents (buffers — written by discrete ops) ---
+        self.register_buffer('memory', torch.zeros(self.n_slots, self.d_mem))
+        self.register_buffer('write_count', torch.zeros(self.n_slots))
 
-        # --- Write head ---
-        # Input: PFC state + td_error + reward → write_strength + erase_strength
-        write_input_dim = pfc_dim + 2  # pfc + td_error + reward
-        self.write_gate = nn.Sequential(
-            nn.Linear(write_input_dim, 32),
+        # --- Read gate: controls reinstatement strength ---
+        # Input: match_similarity + td_error + reward_ema
+        # Output: [-1, 1] — approach/avoidance
+        self.read_gate = nn.Sequential(
+            nn.Linear(3, 16),
             nn.Tanh(),
-            nn.Linear(32, 2),  # [write_strength, erase_strength]
+            nn.Linear(16, 1),
+            nn.Tanh(),
         )
-        # Init: small writes, minimal erasure
         with torch.no_grad():
-            self.write_gate[-1].bias.copy_(torch.tensor([-2.0, -3.0]))
+            self.read_gate[-2].bias.fill_(0.1)  # mild positive init
 
-        # Value projection: PFC + neuromod → what to write
-        self.write_value = nn.Linear(self.d_mem, self.d_mem)
-        with torch.no_grad():
-            nn.init.eye_(self.write_value.weight)
-            nn.init.zeros_(self.write_value.bias)
-
-        # --- Read head ---
-        # Reinstatement: read output → PFC modification
+        # --- Reinstatement projections ---
         self.read_to_pfc = nn.Linear(self.d_mem, pfc_dim)
         with torch.no_grad():
-            # Init: first pfc_dim dims map to PFC (near-identity), rest near-zero
             nn.init.zeros_(self.read_to_pfc.weight)
             self.read_to_pfc.weight[:pfc_dim, :pfc_dim].copy_(
                 torch.eye(pfc_dim) * 0.1
             )
             nn.init.zeros_(self.read_to_pfc.bias)
 
-        # Read strength gate: controls how much the read output affects PFC
-        self.read_gate = nn.Sequential(
-            nn.Linear(pfc_dim + 2, 16),  # pfc + td_error + reward_ema
-            nn.Tanh(),
-            nn.Linear(16, 1),
-            nn.Tanh(),  # [-1, 1]: positive=approach, negative=avoidance
-        )
-        with torch.no_grad():
-            self.read_gate[-2].bias.fill_(0.3)  # mild positive init
-
-        # --- Forget gate: learned per-slot decay ---
-        # Input: usage → retain probability
-        self.forget_gate = nn.Sequential(
-            nn.Linear(1, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1),
-            nn.Sigmoid(),
-        )
-        # Init: high retention (~0.99)
-        with torch.no_grad():
-            self.forget_gate[0].weight.fill_(1.0)
-            self.forget_gate[0].bias.fill_(3.0)
-            self.forget_gate[2].weight.fill_(1.0)
-            self.forget_gate[2].bias.fill_(0.0)
-
-        # Neuromod bias output: read → neuromod bias for Hebbian system
-        neuromod_dim = n_patches * 3  # eta + decay + expl per patch
+        neuromod_dim = n_patches * 3
         self.read_to_neuromod = nn.Linear(self.d_mem, neuromod_dim)
         with torch.no_grad():
             nn.init.zeros_(self.read_to_neuromod.weight)
-            # Extract neuromod portion of memory (after pfc_dim)
             self.read_to_neuromod.weight[:neuromod_dim, pfc_dim:pfc_dim + neuromod_dim].copy_(
                 torch.eye(neuromod_dim) * 0.1
             )
             nn.init.zeros_(self.read_to_neuromod.bias)
 
-        # Track reward EMA for read gate input (running stat, not a threshold)
         self._reward_ema = 0.0
+        self._last_slot = -1  # for diagnostics
+
+        if save_path and os.path.exists(save_path):
+            self._load(save_path)
 
     def _make_key(self, activation_summary, pfc_state):
-        """Project activation + PFC into key space."""
+        """Project activation + PFC into key space (pattern separation)."""
         if pfc_state is not None:
             pfc = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
         else:
@@ -145,70 +111,66 @@ class Hippocampus(nn.Module):
         combined = torch.cat([activation_summary, pfc])
         return self.key_proj(combined)
 
-    def _content_attention(self, key, keys_snapshot=None, usage_snapshot=None):
-        """Soft content-based attention over memory slots.
+    def _match(self, key):
+        """Find best matching prototype. Returns (slot_idx, similarities).
 
-        Returns: (n_slots,) attention weights summing to 1.
-        Uses snapshots if provided to avoid referencing live buffers.
+        Straight-through: forward uses argmax (discrete), backward uses
+        softmax gradient (continuous). This lets prototype keys learn
+        via gradient despite the discrete selection.
         """
-        keys = keys_snapshot if keys_snapshot is not None else self.keys
-        usage = usage_snapshot if usage_snapshot is not None else self.usage
+        key_norm = F.normalize(key.unsqueeze(0), dim=-1)
+        proto_norm = F.normalize(self.prototypes, dim=-1)
+        sims = (proto_norm @ key_norm.squeeze(0))  # (n_slots,)
 
-        key_norm = F.normalize(key.unsqueeze(0), dim=-1)          # (1, key_dim)
-        keys_norm = F.normalize(keys, dim=-1)                     # (n_slots, key_dim)
-        sims = (keys_norm @ key_norm.squeeze(0))                  # (n_slots,)
+        # Straight-through: argmax forward, softmax backward
+        soft = F.softmax(sims * 10.0, dim=0)       # soft for gradient
+        hard = torch.zeros_like(soft)
+        hard[sims.argmax()] = 1.0                   # hard for forward
+        one_hot = hard - soft.detach() + soft       # straight-through trick
 
-        # Softmax on raw similarity — usage doesn't gate attention
-        # Random key init provides differentiation from the start
-        return F.softmax(sims * 10.0, dim=0)
+        return sims.argmax().item(), sims, one_hot
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
-        """Soft read from memory → reinstate into PFC.
+        """Match current state to best prototype, reinstate that slot.
 
-        Fully differentiable. No discrete retrieval decisions.
-        Returns max attention weight (for diagnostics).
+        Discrete retrieval (one slot) with straight-through gradient.
+        Returns reinstatement alpha for diagnostics.
         """
         if device is None:
             device = activation_summary.device
-
-        # Ensure memory is on the right device
         if self.memory.device != device:
             self.to(device)
 
         pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
 
-        # Snapshot buffers so store() can modify them without breaking autograd
-        mem_snap = self.memory.clone()
-        keys_snap = self.keys.clone()
-        usage_snap = self.usage.clone()
+        # Pattern separation + matching
+        key = self._make_key(activation_summary, pfc)
+        slot_idx, sims, one_hot = self._match(key)
+        self._last_slot = slot_idx
 
-        # Content-based attention (uses snapshots)
-        key = self._make_key(activation_summary, pfc)  # gradient flows through key_proj
-        attn = self._content_attention(key, keys_snap, usage_snap)  # (n_slots,)
+        # Read from matched slot (straight-through one-hot)
+        read_out = one_hot @ self.memory  # (d_mem,) — gradient flows through one_hot
 
-        # Soft read: weighted sum of memory contents
-        read_out = attn @ mem_snap                      # (d_mem,)
-
-        # Read gate: learned blend strength with approach/avoidance
-        pfc_flat = pfc.squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
-        gate_input = torch.cat([
-            pfc_flat,
-            torch.tensor([abs(current_td_error)], device=device, dtype=torch.float32),
-            torch.tensor([self._reward_ema], device=device, dtype=torch.float32),
+        # Read gate: approach/avoidance
+        best_sim = sims[slot_idx]
+        gate_input = torch.stack([
+            best_sim,
+            torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
+            torch.tensor(self._reward_ema, device=device, dtype=torch.float32),
         ])
-        alpha = self.read_gate(gate_input).squeeze()  # scalar in [-1, 1]
+        alpha = self.read_gate(gate_input).squeeze()
 
-        # Reinstate into PFC
-        pfc_delta = self.read_to_pfc(read_out)  # (pfc_dim,)
+        # Reinstate PFC
+        pfc_delta = self.read_to_pfc(read_out)
         if pfc is not None:
             mach._pfc_state = mach._pfc_state + alpha * pfc_delta.unsqueeze(0)
 
-        # Neuromod bias from memory
-        neuromod_raw = self.read_to_neuromod(read_out)  # (n_patches * 3,)
+        # Neuromod bias
         alpha_f = alpha.item()
         if abs(alpha_f) > 1e-4 and hasattr(mach, '_eta_state'):
-            nm = neuromod_raw.view(3, self.n_patches)  # (3, n_patches)
+            neuromod_raw = self.read_to_neuromod(read_out)
+            nm = neuromod_raw.view(3, self.n_patches)
             mach._neuromod_bias = {
                 'eta': nm[0].clamp(0.1, 1.0),
                 'decay': nm[1].clamp(0.1, 1.0),
@@ -216,21 +178,14 @@ class Hippocampus(nn.Module):
                 'alpha': alpha_f,
             }
 
-        # Store attention stats for diagnostics
-        self._last_max_attn = attn.max().item()
         return abs(alpha_f)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """Soft write to memory.
+        """Write current state to the best-matching slot.
 
-        Every step writes — the write gate controls HOW MUCH, not WHETHER.
-        No threshold. The system learns to write strongly for important events
-        and weakly (≈ no-op) for mundane ones.
-
-        Gradient flows through the READ path (retrieve_and_reinstate).
-        Writes are detached to avoid in-place modification conflicts with
-        the read graph. The write gate still learns via the read path:
-        what gets written determines what can be read next step.
+        Discrete write: only the matched slot is updated.
+        Uses exponential moving average so the slot content tracks
+        the running state for this "type" of situation.
         """
         device = activation_summary.device
         if self.memory.device != device:
@@ -242,7 +197,10 @@ class Hippocampus(nn.Module):
             pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
             pfc_flat = pfc.squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
 
-            # Compose memory value: PFC state + neuromod values
+            key = self._make_key(activation_summary, pfc_flat if pfc is None else pfc)
+            slot_idx, _, _ = self._match(key)
+
+            # Compose value: PFC + neuromod
             etas = torch.zeros(self.n_patches, device=device)
             decays = torch.zeros(self.n_patches, device=device)
             expls = torch.zeros(self.n_patches, device=device)
@@ -250,72 +208,30 @@ class Hippocampus(nn.Module):
                 etas = mach._last_etas
                 decays = mach._last_decays
                 expls = mach._last_expls
-            raw_value = torch.cat([pfc_flat, etas, decays, expls])
-            value = self.write_value(raw_value)
+            value = torch.cat([pfc_flat, etas, decays, expls])
 
-            # Write key
-            key = self._make_key(activation_summary, pfc_flat if pfc is None else pfc)
-
-            # Content-based write addressing + allocation
-            content_attn = self._content_attention(key)
-            alloc_attn = F.softmax(-self.usage * 10.0, dim=0)
-            write_attn = 0.5 * content_attn + 0.5 * alloc_attn
-
-            # Write gate: learned strength based on context
-            gate_input = torch.cat([
-                pfc_flat,
-                torch.tensor([td_error], device=device, dtype=torch.float32),
-                torch.tensor([reward], device=device, dtype=torch.float32),
-            ])
-            gates = self.write_gate(gate_input)
-            write_strength = torch.sigmoid(gates[0])
-            erase_strength = torch.sigmoid(gates[1])
-
-            # Erase then write (DNC-style)
-            erase = write_attn.unsqueeze(1) * erase_strength
-            self.memory.copy_(
-                self.memory * (1 - erase) +
-                write_attn.unsqueeze(1) * write_strength * value.unsqueeze(0)
-            )
-
-            # Update keys
-            ws = (write_attn * write_strength).unsqueeze(1)
-            self.keys.copy_(
-                self.keys * (1 - ws) + ws * key.unsqueeze(0)
-            )
-
-            # Update usage
-            self.usage.copy_(
-                self.usage * (1 - erase.squeeze(1)) + write_attn * write_strength
-            )
+            # EMA update: slot tracks running average for this mode
+            count = self.write_count[slot_idx]
+            # Momentum: starts at 1.0 (first write overwrites), decays to 0.1
+            momentum = max(0.1, 1.0 / (1.0 + count.item()))
+            self.memory[slot_idx] = (1 - momentum) * self.memory[slot_idx] + momentum * value
+            self.write_count[slot_idx] += 1
 
         return True
 
     def set_neuromod(self, gamma, avg_decay):
-        """Accept neuromod signals. Kept for interface compatibility.
-        In the differentiable version, forgetting is learned, not externally set.
-        """
-        pass  # forgetting is handled by learned forget_gate in decay_all()
+        """Interface compatibility. No-op for discrete slots."""
+        pass
 
     def reconsolidate(self, td_error):
-        """No-op in differentiable version.
-        Reconsolidation happens implicitly through soft writes —
-        re-attending similar memories during write updates them.
-        """
+        """Interface compatibility. No-op — slots are updated via EMA in store()."""
         pass
 
     def decay_all(self):
-        """Learned forgetting. Called periodically (e.g. at checkpoints).
-
-        Forget gate sees per-slot usage and decides retention.
-        Fully differentiable (but called under no_grad since it's maintenance).
+        """No-op. Discrete slots don't decay — they're overwritten by EMA.
+        Unused slots naturally get stale but that's fine.
         """
-        with torch.no_grad():
-            # Forget gate: usage → retain probability per slot
-            retain = self.forget_gate(self.usage.unsqueeze(1)).squeeze(1)  # (n_slots,)
-            self.memory *= retain.unsqueeze(1)
-            self.keys *= retain.unsqueeze(1)
-            self.usage *= retain
+        pass
 
     def save(self, path=None):
         """Persist memory state to disk."""
@@ -325,21 +241,20 @@ class Hippocampus(nn.Module):
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save({
             'memory': self.memory.cpu(),
-            'keys': self.keys.cpu(),
-            'usage': self.usage.cpu(),
+            'write_count': self.write_count.cpu(),
         }, path)
 
     def _load(self, path):
         if not os.path.exists(path):
             return
         data = torch.load(path, map_location='cpu', weights_only=True)
-        self.memory.copy_(data['memory'])
-        self.keys.copy_(data['keys'])
-        self.usage.copy_(data['usage'])
+        if data['memory'].shape == self.memory.shape:
+            self.memory.copy_(data['memory'])
+            self.write_count.copy_(data['write_count'])
 
     def __len__(self):
-        """Number of meaningfully used slots (usage > 0.01)."""
-        return int((self.usage > 0.01).sum().item())
+        """Number of slots that have been written to."""
+        return int((self.write_count > 0).sum().item())
 
     def __repr__(self):
         return f"Hippocampus({len(self)}/{self.n_slots} slots, d_mem={self.d_mem})"

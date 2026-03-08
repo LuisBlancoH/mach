@@ -1727,7 +1727,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             step_timer = time.time()
             hipp_str = ""
             if hippocampus is not None:
-                hipp_str = f" | hipp: {len(hippocampus)}/{hippocampus.n_slots} α={hipp_alpha:.3f}"
+                slot = hippocampus._last_slot if hasattr(hippocampus, '_last_slot') else -1
+                hipp_str = f" | hipp: s{slot} α={hipp_alpha:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
@@ -1801,10 +1802,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hippocampus is not None:
                 hippocampus.decay_all()
                 hippocampus.save()
-                avg_usage = hippocampus.usage.mean().item()
-                max_usage = hippocampus.usage.max().item()
-                print(f"  Hippocampus: {len(hippocampus)}/{hippocampus.n_slots} slots, "
-                      f"avg_usage={avg_usage:.3f}, max_usage={max_usage:.3f}")
+                wc = hippocampus.write_count
+                active = (wc > 0).sum().item()
+                top_slots = wc.topk(min(5, len(wc))).values.tolist()
+                print(f"  Hippocampus: {active}/{hippocampus.n_slots} active slots, "
+                      f"top writes={[f'{w:.0f}' for w in top_slots]}")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,
