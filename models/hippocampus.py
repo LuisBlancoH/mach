@@ -150,7 +150,8 @@ class Hippocampus(nn.Module):
         self._last_slot = slot_idx
 
         # Read from matched slot (straight-through one-hot)
-        read_out = one_hot @ self.memory  # (d_mem,) — gradient flows through one_hot
+        # Clone memory so store()'s in-place writes don't break autograd
+        read_out = one_hot @ self.memory.clone()  # gradient flows through one_hot
 
         # Read gate: approach/avoidance
         best_sim = sims[slot_idx]
