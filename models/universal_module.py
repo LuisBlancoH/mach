@@ -2654,6 +2654,54 @@ class LearnedPlasticityRule(nn.Module):
 
         return delta_down, delta_up
 
+    def replay_update(self, patch_idx, pre_compressed, post_compressed,
+                      td_error, eta, decay):
+        """Compute Hebbian update from pre-compressed activations (for NREM replay).
+
+        Like compute_update but skips the compress step and diagonal scaling
+        (which requires full d_model activations we don't store).
+        Uses only the learned head projections — the main learning signal.
+        """
+        pre_c = pre_compressed
+        post_c = post_compressed
+
+        # Use existing traces if available, otherwise create zero traces
+        if self._traces is not None:
+            trace_vals = torch.stack(self._traces[patch_idx])
+        else:
+            trace_vals = torch.zeros(self.n_rank, device=pre_c.device)
+
+        plasticity_input = torch.cat([
+            trace_vals,
+            td_error.unsqueeze(0),
+            eta.unsqueeze(0),
+            decay.unsqueeze(0),
+            torch.tensor([0.2], device=pre_c.device),  # default exploration
+        ])
+
+        coeffs = self.plasticity_net[patch_idx](plasticity_input)
+        coeffs = torch.tanh(coeffs)
+
+        delta_down = torch.zeros(self.hidden_dim, self.d_model, device=pre_c.device)
+        delta_up = torch.zeros(self.d_model, self.hidden_dim, device=pre_c.device)
+
+        for r in range(self.n_rank):
+            # Head-projected directions only (no diagonal — we don't have full activations)
+            u_down = self.row_heads_down[patch_idx][r](pre_c)
+            u_down = u_down / (u_down.norm() + 1e-8)
+            # Use col_diags as a fixed direction (not scaled by activation)
+            v_down = self.col_diags_down[patch_idx][r]
+            v_down = v_down / (v_down.norm() + 1e-8)
+            delta_down = delta_down + coeffs[r] * torch.outer(u_down, v_down)
+
+            u_up = self.row_diags_up[patch_idx][r]
+            u_up = u_up / (u_up.norm() + 1e-8)
+            v_up = self.col_heads_up[patch_idx][r](post_c)
+            v_up = v_up / (v_up.norm() + 1e-8)
+            delta_up = delta_up + coeffs[r] * torch.outer(u_up, v_up)
+
+        return delta_down, delta_up
+
 
 class MACHActivationHebbian(nn.Module):
     """

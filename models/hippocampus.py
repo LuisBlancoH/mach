@@ -1,5 +1,5 @@
 """
-Hippocampus: VQ mode selection + per-slot episodic memory.
+Hippocampus: VQ mode selection + per-slot episodic memory + replay.
 
 VQ Codebook (thalamus/basal ganglia):
   16 learned prototype keys. Discrete matching via straight-through.
@@ -8,7 +8,15 @@ VQ Codebook (thalamus/basal ganglia):
 Per-slot episodic buffer (hippocampus proper):
   Each slot has a buffer of 8 experiences with TD-aware eviction.
   Stores raw (PFC, neuromod, TD error, timestamp) snapshots.
+  Also stores compressed per-layer activations for NREM replay.
   On retrieval: learned scorer combines similarity, salience, recency.
+
+Replay (memory consolidation):
+  NREM replay: reactivate stored compressed activations → drive Hebbian
+    updates without running Qwen. Like sharp-wave ripples during sleep.
+    Prioritized by |TD error| — surprising memories replayed more.
+  REM replay (dreaming): run Qwen forward with generated prompts while
+    replayed PFC/neuromod influence patches. For generalization testing.
 
 This mirrors the brain:
   - Prefrontal/thalamic context gates hippocampal retrieval
@@ -16,6 +24,8 @@ This mirrors the brain:
   - Dopamine (TD error) modulates memory salience
   - Surprising memories persist, mundane ones get overwritten
   - Temporal context: recency signal via timestamps
+  - NREM: compressed replay → cortical consolidation
+  - REM: generative replay → novel recombinations
   - Cortex does the slow learning (Hebbian patches handle this)
 
 No hardcoded thresholds. Retrieval priority is learned, not formula'd.
@@ -38,14 +48,17 @@ class Hippocampus(nn.Module):
     """
 
     def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=16,
-                 save_path=None):
+                 d_proj=32, save_path=None):
         super().__init__()
         self.key_dim = key_dim
         self.pfc_dim = pfc_dim
         self.n_patches = n_patches
         self.n_slots = max_memories
         self.episodes_per_slot = 8
+        self.d_proj = d_proj
         self.d_mem = pfc_dim + n_patches * 3  # PFC + neuromod per entry
+        # Per-layer compressed activations: pre + post per patch
+        self.d_act = d_proj * n_patches * 2  # pre(d_proj) + post(d_proj) per layer
         self.save_path = save_path
 
         # === VQ Codebook (mode selection) ===
@@ -86,6 +99,10 @@ class Hippocampus(nn.Module):
         # Per-episode timestamp (global step when stored)
         self.register_buffer('ep_timestamps',
             torch.zeros(self.n_slots, self.episodes_per_slot))
+        # Per-episode compressed activations for NREM replay
+        # Layout: [pre_0, post_0, pre_1, post_1, ...] each d_proj
+        self.register_buffer('ep_activations',
+            torch.zeros(self.n_slots, self.episodes_per_slot, self.d_act))
         self._global_step = 0
 
         # === Read head ===
@@ -307,9 +324,205 @@ class Hippocampus(nn.Module):
             self.episodes[slot_idx, write_idx] = value
             self.ep_td_errors[slot_idx, write_idx] = td_error
             self.ep_timestamps[slot_idx, write_idx] = self._global_step
+
+            # Store compressed activations for NREM replay
+            act_parts = []
+            for i in range(self.n_patches):
+                pre = mach._pre_activations.get(i)
+                post = mach._post_activations.get(i)
+                if pre is not None and post is not None and hasattr(mach, 'hebb_rule'):
+                    pre_f = pre.float()
+                    while pre_f.dim() > 1:
+                        pre_f = pre_f.mean(dim=0)
+                    post_f = post.float()
+                    while post_f.dim() > 1:
+                        post_f = post_f.mean(dim=0)
+                    pre_c = mach.hebb_rule.compress[i](pre_f)   # (d_proj,)
+                    post_c = mach.hebb_rule.compress[i](post_f)  # (d_proj,)
+                    act_parts.extend([pre_c, post_c])
+                else:
+                    act_parts.extend([
+                        torch.zeros(self.d_proj, device=device),
+                        torch.zeros(self.d_proj, device=device),
+                    ])
+            self.ep_activations[slot_idx, write_idx] = torch.cat(act_parts)
+
             self.ep_count[slot_idx] += 1
 
         return True
+
+    def replay_nrem(self, mach, n_replays=4, device=None):
+        """NREM replay: reactivate stored activations → drive Hebbian updates.
+
+        Like sharp-wave ripples during deep sleep:
+        1. Sample episodes prioritized by |TD error| (surprising = more replayed)
+        2. Reinstate PFC + neuromod from episode
+        3. Feed stored compressed activations to Hebbian rule
+        4. Patches learn from memory — no Qwen forward pass needed
+
+        Returns number of episodes actually replayed.
+        """
+        if device is None:
+            device = self.episodes.device
+
+        # Collect all stored episodes across all slots
+        all_episodes = []
+        for slot_idx in range(self.n_slots):
+            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
+            for ep_idx in range(n_eps):
+                all_episodes.append((slot_idx, ep_idx))
+
+        if not all_episodes:
+            return 0
+
+        # Prioritized sampling: probability ∝ |TD error|
+        td_abs = torch.tensor([
+            abs(self.ep_td_errors[s, e].item())
+            for s, e in all_episodes
+        ], device=device)
+        td_abs = td_abs.clamp(min=1e-6)
+        probs = td_abs / td_abs.sum()
+
+        n_replays = min(n_replays, len(all_episodes))
+        indices = torch.multinomial(probs, n_replays, replacement=False)
+
+        replayed = 0
+        for idx in indices:
+            slot_idx, ep_idx = all_episodes[idx.item()]
+            ep_content = self.episodes[slot_idx, ep_idx]
+            ep_td = self.ep_td_errors[slot_idx, ep_idx].item()
+            ep_acts = self.ep_activations[slot_idx, ep_idx]
+
+            # Skip episodes with no stored activations
+            if ep_acts.abs().sum() < 1e-8:
+                continue
+
+            # Reinstate PFC state
+            pfc_stored = ep_content[:self.pfc_dim]
+            if hasattr(mach, '_pfc_state'):
+                mach._pfc_state = pfc_stored.unsqueeze(0).clone()
+
+            # Reinstate neuromod from episode
+            neuromod_stored = ep_content[self.pfc_dim:]
+            if hasattr(mach, '_last_etas') and neuromod_stored.shape[0] >= self.n_patches * 3:
+                etas = neuromod_stored[:self.n_patches].clamp(0.1, 1.0)
+                decays = neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0)
+                expls = neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5)
+            else:
+                etas = torch.full((self.n_patches,), 0.5, device=device)
+                decays = torch.full((self.n_patches,), 0.5, device=device)
+                expls = torch.full((self.n_patches,), 0.2, device=device)
+
+            # Replay: feed stored compressed activations to Hebbian rule
+            td_error_t = torch.tensor(ep_td, device=device, dtype=torch.float32)
+
+            for patch_idx in range(self.n_patches):
+                if not hasattr(mach, 'hebb_rule'):
+                    break
+                offset = patch_idx * self.d_proj * 2
+                pre_c = ep_acts[offset:offset + self.d_proj]
+                post_c = ep_acts[offset + self.d_proj:offset + self.d_proj * 2]
+
+                if pre_c.abs().sum() < 1e-8:
+                    continue
+
+                # Drive Hebbian update with stored compressed activations
+                # Uses replay_update which accepts pre-compressed inputs
+                delta_down, delta_up = mach.hebb_rule.replay_update(
+                    patch_idx, pre_c, post_c,
+                    td_error=td_error_t,
+                    eta=etas[patch_idx],
+                    decay=decays[patch_idx],
+                )
+                scale = (etas[patch_idx] * mach.gate_scale).clamp(0, 1.0)
+                mach.patches[patch_idx].accumulate_write(
+                    "down", scale * delta_down, decay=decays[patch_idx]
+                )
+                mach.patches[patch_idx].accumulate_write(
+                    "up", scale * delta_up, decay=decays[patch_idx]
+                )
+
+            replayed += 1
+
+        return replayed
+
+    def replay_rem(self, mach, patched_model, tokenizer, n_dreams=2, device=None):
+        """REM replay (dreaming): run Qwen forward with replayed context.
+
+        Like REM sleep — full generative replay:
+        1. Sample salient episodes
+        2. Reinstate PFC + neuromod from episode
+        3. Generate a simple arithmetic prompt (novel combination)
+        4. Run full Qwen forward → patches fire → normal Hebbian update
+
+        This enables generalization: patches learn from novel input combinations
+        while guided by stored memory states. Not wired into training loop —
+        call manually for experimentation.
+
+        Returns list of (prompt, replay_td_error) for each dream.
+        """
+        if device is None:
+            device = self.episodes.device
+
+        from data.arithmetic import generate_few_shot_episode
+
+        # Collect salient episodes
+        all_episodes = []
+        for slot_idx in range(self.n_slots):
+            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
+            for ep_idx in range(n_eps):
+                all_episodes.append((slot_idx, ep_idx))
+
+        if not all_episodes:
+            return []
+
+        td_abs = torch.tensor([
+            abs(self.ep_td_errors[s, e].item())
+            for s, e in all_episodes
+        ], device=device)
+        td_abs = td_abs.clamp(min=1e-6)
+        probs = td_abs / td_abs.sum()
+
+        n_dreams = min(n_dreams, len(all_episodes))
+        indices = torch.multinomial(probs, n_dreams, replacement=False)
+
+        dreams = []
+        for idx in indices:
+            slot_idx, ep_idx = all_episodes[idx.item()]
+            ep_content = self.episodes[slot_idx, ep_idx]
+            ep_td = self.ep_td_errors[slot_idx, ep_idx].item()
+
+            # Reinstate PFC + neuromod
+            pfc_stored = ep_content[:self.pfc_dim]
+            if hasattr(mach, '_pfc_state'):
+                mach._pfc_state = pfc_stored.unsqueeze(0).clone()
+
+            neuromod_stored = ep_content[self.pfc_dim:]
+            if hasattr(mach, '_neuromod_bias') and neuromod_stored.shape[0] >= self.n_patches * 3:
+                mach._neuromod_bias = {
+                    'eta': neuromod_stored[:self.n_patches].clamp(0.1, 1.0),
+                    'decay': neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0),
+                    'expl': neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5),
+                    'alpha': 0.5,
+                }
+
+            # Generate a novel prompt (dream content)
+            import random
+            ops = ['add', 'sub', 'mul', 'div', 'mod', 'gcd', 'abs_diff']
+            dream_op = random.choice(ops)
+            problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
+            prompt = problems[0]['text']
+
+            # Run full forward pass through Qwen with patched model
+            inputs = tokenizer(prompt, return_tensors='pt').to(device)
+            with torch.no_grad():
+                outputs = patched_model(**inputs)
+
+            # Normal Hebbian step fires on the dream activations
+            # (caller handles this — we just set up the state)
+            dreams.append((prompt, ep_td, dream_op))
+
+        return dreams
 
     def set_neuromod(self, gamma, avg_decay):
         """Interface compatibility. No EMA to drive."""
@@ -335,6 +548,7 @@ class Hippocampus(nn.Module):
             'ep_count': self.ep_count.cpu(),
             'ep_td_errors': self.ep_td_errors.cpu(),
             'ep_timestamps': self.ep_timestamps.cpu(),
+            'ep_activations': self.ep_activations.cpu(),
             'global_step': self._global_step,
         }, path)
 
@@ -352,6 +566,8 @@ class Hippocampus(nn.Module):
                 self.ep_td_errors.copy_(data['ep_rewards'])  # legacy compat
             if 'ep_timestamps' in data:
                 self.ep_timestamps.copy_(data['ep_timestamps'])
+            if 'ep_activations' in data and data['ep_activations'].shape == self.ep_activations.shape:
+                self.ep_activations.copy_(data['ep_activations'])
             if 'global_step' in data:
                 self._global_step = data['global_step']
 

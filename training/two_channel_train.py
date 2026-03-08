@@ -1504,6 +1504,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Switch operation randomly (like encountering different tasks)
         op_step_count += 1
         if op_step_count >= op_switch_interval:
+            # NREM replay: consolidate memories between task switches
+            # Like sleeping between days — replay salient episodes to drive
+            # Hebbian learning from stored activations
+            if hippocampus is not None and len(hippocampus) > 0:
+                n_replayed = hippocampus.replay_nrem(mach, n_replays=4, device=device)
+
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
             op_switch_interval = random.randint(10, 60)
