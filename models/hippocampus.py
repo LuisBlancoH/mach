@@ -95,10 +95,11 @@ class Hippocampus(nn.Module):
             nn.Linear(4, 1),
             nn.Sigmoid(),
         )
-        # Init: merge when sim > ~0.8 (sigmoid crosses 0.5 at input ≈ 0.8)
+        # Init: merge when sim > ~0.9 (sigmoid crosses 0.5 at input ≈ 0.9)
+        # Arithmetic ops have similar activations — need high bar to keep distinct
         with torch.no_grad():
             self.merge_gate[0].weight.fill_(10.0)  # sharpen
-            self.merge_gate[0].bias.fill_(-8.0)     # shift to cross at ~0.8
+            self.merge_gate[0].bias.fill_(-9.0)     # shift to cross at ~0.9
             self.merge_gate[2].weight.fill_(1.0)
             self.merge_gate[2].bias.fill_(0.0)
 
