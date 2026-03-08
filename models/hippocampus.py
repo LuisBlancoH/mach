@@ -141,21 +141,24 @@ class Hippocampus(nn.Module):
         combined = torch.cat([activation_summary, pfc])
         return self.key_proj(combined)
 
-    def _content_attention(self, key):
+    def _content_attention(self, key, keys_snapshot=None, usage_snapshot=None):
         """Soft content-based attention over memory slots.
 
         Returns: (n_slots,) attention weights summing to 1.
+        Uses snapshots if provided to avoid referencing live buffers.
         """
-        # Cosine similarity between query key and stored keys
+        keys = keys_snapshot if keys_snapshot is not None else self.keys
+        usage = usage_snapshot if usage_snapshot is not None else self.usage
+
         key_norm = F.normalize(key.unsqueeze(0), dim=-1)          # (1, key_dim)
-        keys_norm = F.normalize(self.keys, dim=-1)                # (n_slots, key_dim)
+        keys_norm = F.normalize(keys, dim=-1)                     # (n_slots, key_dim)
         sims = (keys_norm @ key_norm.squeeze(0))                  # (n_slots,)
 
         # Weight by usage (empty slots have usage ~0, so low attention)
-        weighted = sims * self.usage
+        weighted = sims * usage
 
-        # Softmax → attention weights (temperature=1, learned implicitly via key_proj)
-        return F.softmax(weighted * 10.0, dim=0)  # sharpening factor
+        # Softmax → attention weights
+        return F.softmax(weighted * 10.0, dim=0)
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
@@ -173,12 +176,17 @@ class Hippocampus(nn.Module):
 
         pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
 
-        # Content-based attention
-        key = self._make_key(activation_summary, pfc)  # gradient flows
-        attn = self._content_attention(key)             # (n_slots,)
+        # Snapshot buffers so store() can modify them without breaking autograd
+        mem_snap = self.memory.clone()
+        keys_snap = self.keys.clone()
+        usage_snap = self.usage.clone()
+
+        # Content-based attention (uses snapshots)
+        key = self._make_key(activation_summary, pfc)  # gradient flows through key_proj
+        attn = self._content_attention(key, keys_snap, usage_snap)  # (n_slots,)
 
         # Soft read: weighted sum of memory contents
-        read_out = attn @ self.memory                   # (d_mem,)
+        read_out = attn @ mem_snap                      # (d_mem,)
 
         # Read gate: learned blend strength with approach/avoidance
         pfc_flat = pfc.squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
