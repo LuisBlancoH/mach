@@ -1803,12 +1803,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hippocampus is not None:
                 hippocampus.decay_all()
                 hippocampus.save()
-                wc = hippocampus.write_count
-                active = (wc > 0).sum().item()
                 n_eps = hippocampus.total_episodes()
-                top_slots = wc.topk(min(5, len(wc))).values.tolist()
-                print(f"  Hippocampus: {active}/{hippocampus.n_slots} slots, {n_eps} episodes, "
-                      f"top writes={[f'{w:.0f}' for w in top_slots]}")
+                ec = hippocampus.ep_count.clamp(max=hippocampus.episodes_per_slot)
+                per_slot = [f"s{i}:{ec[i].item():.0f}" for i in range(hippocampus.n_slots) if ec[i] > 0]
+                temp = hippocampus.log_temperature.exp().item()
+                print(f"  Hippocampus: {len(hippocampus)}/{hippocampus.n_slots} slots, "
+                      f"{n_eps} episodes, temp={temp:.1f}, [{' '.join(per_slot)}]")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,

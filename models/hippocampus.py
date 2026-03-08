@@ -1,21 +1,21 @@
 """
-Hippocampus: two-tier memory with learned mode prototypes + episodic buffers.
+Hippocampus: VQ mode selection + per-slot episodic memory.
 
-Tier 1 — VQ Codebook (basal ganglia / thalamus):
-  16 learned prototype keys. Discrete matching via straight-through estimator.
-  Each prototype learns to represent one "mode" (like thalamic nuclei).
-  The EMA slot content tracks the running average for that mode.
+VQ Codebook (thalamus/basal ganglia):
+  16 learned prototype keys. Discrete matching via straight-through.
+  Each prototype learns to represent one "mode" of operation.
 
-Tier 2 — Per-slot episodic buffer (hippocampus proper):
+Per-slot episodic buffer (hippocampus proper):
   Each slot has a ring buffer of the last 8 specific experiences.
   Stores raw (PFC, neuromod, reward) snapshots — real episodic memory.
   On retrieval: within the matched slot, find the episode with the
-  most similar PFC state (argmax over 8, not 500).
+  most similar PFC state (argmax over 8).
 
 This mirrors the brain:
   - Prefrontal/thalamic context gates hippocampal retrieval
-  - You don't search ALL memories — context narrows the search space
-  - Complementary learning: fast episodic (buffer) + slow cortical (EMA)
+  - Hippocampus stores specific episodes, not averages
+  - Cortex does the slow learning (Hebbian patches handle this)
+  - No EMA — that's what the patches are for
 
 No hardcoded thresholds. No storage gates. No similarity thresholds.
 
@@ -29,10 +29,11 @@ import torch.nn.functional as F
 
 
 class Hippocampus(nn.Module):
-    """Two-tier memory: VQ codebook (mode switching) + episodic buffers.
+    """VQ mode selection + per-slot episodic buffers.
 
-    Tier 1: N_SLOTS learned prototypes select a mode (straight-through).
-    Tier 2: per-slot ring buffer of recent episodes for specific recall.
+    VQ codebook selects a mode (straight-through gradient).
+    Per-slot ring buffer provides specific episodic recall.
+    Cortex (Hebbian patches) handles slow learning — no EMA needed.
     """
 
     def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=16,
@@ -46,18 +47,13 @@ class Hippocampus(nn.Module):
         self.d_mem = pfc_dim + n_patches * 3  # PFC + neuromod per entry
         self.save_path = save_path
 
-        # === Tier 1: VQ Codebook ===
+        # === VQ Codebook (mode selection) ===
 
         # Learned prototype keys
         self.prototypes = nn.Parameter(torch.randn(self.n_slots, key_dim) * 0.1)
 
         # Learned softmax temperature for matching sharpness
-        # log-space so it's always positive; init at ln(10) ≈ 2.3
-        self.log_temperature = nn.Parameter(torch.tensor(2.302585))
-
-        # EMA momentum driven by neuromod (set externally each step)
-        # Default: moderate momentum. Decay nucleus overrides via set_neuromod().
-        self._ema_momentum = 0.1
+        self.log_temperature = nn.Parameter(torch.tensor(2.302585))  # init ~10
 
         # Key projection with pattern separation (Dentate Gyrus)
         input_dim = key_dim + pfc_dim
@@ -74,30 +70,23 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.key_proj[2].weight[:, key_dim:])
             nn.init.zeros_(self.key_proj[2].bias)
 
-        # EMA slot contents (slow / cortical)
-        self.register_buffer('memory', torch.zeros(self.n_slots, self.d_mem))
-        self.register_buffer('write_count', torch.zeros(self.n_slots))
-
-        # === Tier 2: Per-slot episodic buffers ===
+        # === Per-slot episodic buffers ===
 
         # Ring buffer: (n_slots, episodes_per_slot, d_mem)
         self.register_buffer('episodes',
             torch.zeros(self.n_slots, self.episodes_per_slot, self.d_mem))
-        # Per-slot write head position (circular index)
         self.register_buffer('ep_head',
             torch.zeros(self.n_slots, dtype=torch.long))
-        # Per-slot episode count (for knowing if buffer is full)
         self.register_buffer('ep_count',
             torch.zeros(self.n_slots, dtype=torch.long))
-        # Per-episode reward (for valence-weighted retrieval)
         self.register_buffer('ep_rewards',
             torch.zeros(self.n_slots, self.episodes_per_slot))
 
         # === Read head ===
 
-        # Read gate: controls reinstatement strength
+        # Read gate: approach/avoidance
         # Input: match_similarity + td_error + reward_ema
-        # Output: [-1, 1] — approach/avoidance
+        # Output: [-1, 1]
         self.read_gate = nn.Sequential(
             nn.Linear(3, 16),
             nn.Tanh(),
@@ -124,18 +113,6 @@ class Hippocampus(nn.Module):
                 torch.eye(neuromod_dim) * 0.1
             )
             nn.init.zeros_(self.read_to_neuromod.bias)
-
-        # Learned blend between EMA (tier 1) and best episode (tier 2)
-        # Input: ema_sim + episode_sim + td_error
-        # Output: [0, 1] — 0 = use EMA only, 1 = use episode only
-        self.blend_gate = nn.Sequential(
-            nn.Linear(3, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1),
-            nn.Sigmoid(),
-        )
-        with torch.no_grad():
-            self.blend_gate[-2].bias.fill_(0.0)  # start at 0.5 blend
 
         self._reward_ema = 0.0
         self._last_slot = -1
@@ -170,15 +147,13 @@ class Hippocampus(nn.Module):
     def _best_episode(self, slot_idx, pfc_state, device):
         """Find most relevant episode within a slot by PFC similarity.
 
-        No threshold — just argmax over the buffer. Always returns something.
-        Returns (episode_content, similarity, episode_index).
+        Argmax over the buffer. Always returns something if buffer non-empty.
         """
         n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
         if n_eps == 0:
             return None, 0.0, -1
 
         slot_eps = self.episodes[slot_idx, :n_eps].clone()  # (n_eps, d_mem)
-        # Compare PFC portion of episodes to current PFC
         pfc_flat = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
         stored_pfcs = slot_eps[:, :self.pfc_dim]  # (n_eps, pfc_dim)
 
@@ -191,43 +166,28 @@ class Hippocampus(nn.Module):
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
-        """Two-tier retrieval:
-        1. VQ match → select slot (mode)
-        2. Within slot: blend EMA (slow) + best episode (fast)
-        3. Reinstate into PFC + neuromod
+        """VQ match → select slot → retrieve best episode → reinstate.
 
         Returns reinstatement alpha for diagnostics.
         """
         if device is None:
             device = activation_summary.device
-        if self.memory.device != device:
+        if self.episodes.device != device:
             self.to(device)
 
         pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
 
-        # Tier 1: VQ matching
+        # VQ matching
         key = self._make_key(activation_summary, pfc)
         slot_idx, sims, one_hot = self._match(key)
         self._last_slot = slot_idx
 
-        # Tier 1 read: EMA content (straight-through)
-        ema_out = one_hot @ self.memory.clone()  # (d_mem,)
-
-        # Tier 2 read: best episode within slot
+        # Episodic retrieval within matched slot
         ep_content, ep_sim, ep_idx = self._best_episode(slot_idx, pfc, device)
         self._last_ep_idx = ep_idx
 
-        # Blend EMA + episode (learned gate)
-        if ep_content is not None:
-            blend_input = torch.stack([
-                sims[slot_idx],
-                torch.tensor(ep_sim, device=device, dtype=torch.float32),
-                torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
-            ])
-            ep_weight = self.blend_gate(blend_input).squeeze()  # [0, 1]
-            read_out = (1 - ep_weight) * ema_out + ep_weight * ep_content
-        else:
-            read_out = ema_out
+        if ep_content is None:
+            return 0.0  # no episodes stored yet
 
         # Read gate: approach/avoidance
         best_sim = sims[slot_idx]
@@ -238,15 +198,15 @@ class Hippocampus(nn.Module):
         ])
         alpha = self.read_gate(gate_input).squeeze()
 
-        # Reinstate PFC
-        pfc_delta = self.read_to_pfc(read_out)
+        # Reinstate PFC from episode
+        pfc_delta = self.read_to_pfc(ep_content)
         if pfc is not None:
             mach._pfc_state = mach._pfc_state + alpha * pfc_delta.unsqueeze(0)
 
-        # Neuromod bias
+        # Neuromod bias from episode
         alpha_f = alpha.item()
         if abs(alpha_f) > 1e-4 and hasattr(mach, '_eta_state'):
-            neuromod_raw = self.read_to_neuromod(read_out)
+            neuromod_raw = self.read_to_neuromod(ep_content)
             nm = neuromod_raw.view(3, self.n_patches)
             mach._neuromod_bias = {
                 'eta': nm[0].clamp(0.1, 1.0),
@@ -258,12 +218,12 @@ class Hippocampus(nn.Module):
         return abs(alpha_f)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """Two-tier write:
-        1. Update EMA slot (slow cortical learning)
-        2. Append to episodic ring buffer (fast hippocampal encoding)
+        """VQ match → append to matched slot's ring buffer.
+
+        Always stores. No threshold. Ring buffer handles capacity.
         """
         device = activation_summary.device
-        if self.memory.device != device:
+        if self.episodes.device != device:
             self.to(device)
 
         self._reward_ema = 0.99 * self._reward_ema + 0.01 * reward
@@ -285,14 +245,7 @@ class Hippocampus(nn.Module):
                 expls = mach._last_expls
             value = torch.cat([pfc_flat, etas, decays, expls])
 
-            # Tier 1: EMA update (slow)
-            # First write overwrites; after that, momentum from neuromod
-            count = self.write_count[slot_idx]
-            momentum = 1.0 if count.item() == 0 else self._ema_momentum
-            self.memory[slot_idx] = (1 - momentum) * self.memory[slot_idx] + momentum * value
-            self.write_count[slot_idx] += 1
-
-            # Tier 2: episodic ring buffer (fast, always stores)
+            # Append to ring buffer
             head = self.ep_head[slot_idx].item()
             self.episodes[slot_idx, head] = value
             self.ep_rewards[slot_idx, head] = reward
@@ -302,20 +255,15 @@ class Hippocampus(nn.Module):
         return True
 
     def set_neuromod(self, gamma, avg_decay):
-        """Neuromod drives EMA momentum for slot updates.
-
-        High decay (stable patches) → low momentum (stable memory, slow update)
-        Low decay (volatile patches) → high momentum (fast adaptation)
-        avg_decay ∈ [0.1, 1.0] → momentum ∈ [0.5, 0.05]
-        """
-        self._ema_momentum = 0.5 - 0.45 * avg_decay
+        """Interface compatibility. No EMA to drive."""
+        pass
 
     def reconsolidate(self, td_error):
         """Interface compatibility."""
         pass
 
     def decay_all(self):
-        """No-op. EMA slots are overwritten, episodes cycle via ring buffer."""
+        """No-op. Ring buffer cycles naturally."""
         pass
 
     def save(self, path=None):
@@ -325,8 +273,6 @@ class Hippocampus(nn.Module):
             return
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save({
-            'memory': self.memory.cpu(),
-            'write_count': self.write_count.cpu(),
             'episodes': self.episodes.cpu(),
             'ep_head': self.ep_head.cpu(),
             'ep_count': self.ep_count.cpu(),
@@ -337,17 +283,15 @@ class Hippocampus(nn.Module):
         if not os.path.exists(path):
             return
         data = torch.load(path, map_location='cpu', weights_only=True)
-        if data['memory'].shape == self.memory.shape:
-            self.memory.copy_(data['memory'])
-            self.write_count.copy_(data['write_count'])
+        if 'episodes' in data and data['episodes'].shape == self.episodes.shape:
             self.episodes.copy_(data['episodes'])
             self.ep_head.copy_(data['ep_head'])
             self.ep_count.copy_(data['ep_count'])
             self.ep_rewards.copy_(data['ep_rewards'])
 
     def __len__(self):
-        """Number of slots that have been written to."""
-        return int((self.write_count > 0).sum().item())
+        """Number of slots with at least one episode."""
+        return int((self.ep_count > 0).sum().item())
 
     def total_episodes(self):
         """Total episodes stored across all slots."""
