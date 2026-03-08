@@ -51,6 +51,14 @@ class Hippocampus(nn.Module):
         # Learned prototype keys
         self.prototypes = nn.Parameter(torch.randn(self.n_slots, key_dim) * 0.1)
 
+        # Learned softmax temperature for matching sharpness
+        # log-space so it's always positive; init at ln(10) ≈ 2.3
+        self.log_temperature = nn.Parameter(torch.tensor(2.302585))
+
+        # EMA momentum driven by neuromod (set externally each step)
+        # Default: moderate momentum. Decay nucleus overrides via set_neuromod().
+        self._ema_momentum = 0.1
+
         # Key projection with pattern separation (Dentate Gyrus)
         input_dim = key_dim + pfc_dim
         self.key_proj = nn.Sequential(
@@ -151,7 +159,8 @@ class Hippocampus(nn.Module):
         proto_norm = F.normalize(self.prototypes, dim=-1)
         sims = (proto_norm @ key_norm.squeeze(0))  # (n_slots,)
 
-        soft = F.softmax(sims * 10.0, dim=0)
+        temperature = self.log_temperature.exp()
+        soft = F.softmax(sims * temperature, dim=0)
         hard = torch.zeros_like(soft)
         hard[sims.argmax()] = 1.0
         one_hot = hard - soft.detach() + soft
@@ -277,8 +286,9 @@ class Hippocampus(nn.Module):
             value = torch.cat([pfc_flat, etas, decays, expls])
 
             # Tier 1: EMA update (slow)
+            # First write overwrites; after that, momentum from neuromod
             count = self.write_count[slot_idx]
-            momentum = max(0.1, 1.0 / (1.0 + count.item()))
+            momentum = 1.0 if count.item() == 0 else self._ema_momentum
             self.memory[slot_idx] = (1 - momentum) * self.memory[slot_idx] + momentum * value
             self.write_count[slot_idx] += 1
 
@@ -292,8 +302,13 @@ class Hippocampus(nn.Module):
         return True
 
     def set_neuromod(self, gamma, avg_decay):
-        """Interface compatibility."""
-        pass
+        """Neuromod drives EMA momentum for slot updates.
+
+        High decay (stable patches) → low momentum (stable memory, slow update)
+        Low decay (volatile patches) → high momentum (fast adaptation)
+        avg_decay ∈ [0.1, 1.0] → momentum ∈ [0.5, 0.05]
+        """
+        self._ema_momentum = 0.5 - 0.45 * avg_decay
 
     def reconsolidate(self, td_error):
         """Interface compatibility."""
