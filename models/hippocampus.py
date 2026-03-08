@@ -62,7 +62,11 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.key_proj[2].bias)
 
         # --- Stored keys (buffer, written alongside memory) ---
-        self.register_buffer('keys', torch.zeros(self.n_slots, key_dim))
+        # Init keys with random orthogonal vectors to break symmetry
+        # Without this, all-zero keys → uniform attention → uniform writes → all slots identical
+        random_keys = torch.randn(self.n_slots, key_dim)
+        random_keys = F.normalize(random_keys, dim=-1)
+        self.register_buffer('keys', random_keys)
 
         # --- Write head ---
         # Input: PFC state + td_error + reward → write_strength + erase_strength
@@ -154,11 +158,9 @@ class Hippocampus(nn.Module):
         keys_norm = F.normalize(keys, dim=-1)                     # (n_slots, key_dim)
         sims = (keys_norm @ key_norm.squeeze(0))                  # (n_slots,)
 
-        # Weight by usage (empty slots have usage ~0, so low attention)
-        weighted = sims * usage
-
-        # Softmax → attention weights
-        return F.softmax(weighted * 10.0, dim=0)
+        # Softmax on raw similarity — usage doesn't gate attention
+        # Random key init provides differentiation from the start
+        return F.softmax(sims * 10.0, dim=0)
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
