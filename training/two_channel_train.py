@@ -1507,6 +1507,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     sleep_nrem_total = 0
     sleep_rem_total = 0
     sleep_rem_td_errors = []
+    sleep_rem_critic_values = []
+    sleep_patch_deltas = []
 
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
@@ -1514,15 +1516,30 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         if op_step_count >= op_switch_interval:
             # Sleep between tasks — like sleeping between days
             if hippocampus is not None and len(hippocampus) > 0:
+                # Snapshot patch norms before sleep
+                pre_sleep_norm = sum(
+                    (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                    (p.delta_up.norm().item() if p.delta_up is not None else 0)
+                    for p in mach.patches
+                )
                 # NREM: replay compressed activations → Hebbian updates (sharp-wave ripples)
                 n_nrem = hippocampus.replay_nrem(mach, n_replays=4, device=device)
                 sleep_nrem_total += n_nrem
-                # REM: full Qwen forward with novel prompts → discover new patterns (dreaming)
+                # REM: full Qwen forward with free generation → internal surprise drives plasticity
                 rem_dreams = hippocampus.replay_rem(
                     mach, patched_model, tokenizer, n_dreams=2, device=device
                 )
                 sleep_rem_total += len(rem_dreams)
-                sleep_rem_td_errors.extend(td for _, td, _ in rem_dreams)
+                for d in rem_dreams:
+                    sleep_rem_td_errors.append(d['td_error'])
+                    sleep_rem_critic_values.append(d['critic_value'])
+                # Snapshot patch norms after sleep
+                post_sleep_norm = sum(
+                    (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                    (p.delta_up.norm().item() if p.delta_up is not None else 0)
+                    for p in mach.patches
+                )
+                sleep_patch_deltas.append(post_sleep_norm - pre_sleep_norm)
 
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
@@ -1803,10 +1820,17 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             # Sleep cycle stats
             if sleep_nrem_total > 0 or sleep_rem_total > 0:
                 rem_avg_td = sum(abs(t) for t in sleep_rem_td_errors) / len(sleep_rem_td_errors) if sleep_rem_td_errors else 0
-                print(f"  Sleep cycles: NREM={sleep_nrem_total} replays, REM={sleep_rem_total} dreams (avg_|td|={rem_avg_td:.3f})")
+                rem_avg_val = sum(sleep_rem_critic_values) / len(sleep_rem_critic_values) if sleep_rem_critic_values else 0
+                avg_patch_delta = sum(sleep_patch_deltas) / len(sleep_patch_deltas) if sleep_patch_deltas else 0
+                print(f"  Sleep: NREM={sleep_nrem_total} replays, REM={sleep_rem_total} dreams")
+                print(f"    REM avg_|td|={rem_avg_td:.4f}  avg_critic_val={rem_avg_val:.4f}  avg_patch_Δ={avg_patch_delta:+.4f}")
+                if rem_avg_td < 0.01:
+                    print(f"    ⚠ REM td≈0 — critic not surprised by dreams, sleep may be inert")
                 sleep_nrem_total = 0
                 sleep_rem_total = 0
                 sleep_rem_td_errors = []
+                sleep_rem_critic_values = []
+                sleep_patch_deltas = []
 
             # Quick validation — save/restore continuous state
             print(f"  --- Operation validation (step {step}) ---")

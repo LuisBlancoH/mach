@@ -366,6 +366,12 @@ def main():
                 total_nrem = 0
                 total_rem = 0
                 rem_td_errors = []
+                rem_critic_vals = []
+                pre_norm = sum(
+                    (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                    (p.delta_up.norm().item() if p.delta_up is not None else 0)
+                    for p in mach.patches
+                )
                 for cycle in range(args.sleep_cycles):
                     n_nrem = hipp.replay_nrem(mach, n_replays=4, device=config.DEVICE)
                     total_nrem += n_nrem
@@ -373,9 +379,19 @@ def main():
                         mach, patched_model, tokenizer, n_dreams=2, device=config.DEVICE
                     )
                     total_rem += len(dreams)
-                    rem_td_errors.extend(td for _, td, _ in dreams)
+                    for d in dreams:
+                        rem_td_errors.append(d['td_error'])
+                        rem_critic_vals.append(d['critic_value'])
+                post_norm = sum(
+                    (p.delta_down.norm().item() if p.delta_down is not None else 0) +
+                    (p.delta_up.norm().item() if p.delta_up is not None else 0)
+                    for p in mach.patches
+                )
                 rem_avg_td = sum(abs(t) for t in rem_td_errors) / len(rem_td_errors) if rem_td_errors else 0
-                print(f"    Sleep: {total_nrem} NREM replays, {total_rem} REM dreams (avg_|td|={rem_avg_td:.3f})")
+                rem_avg_val = sum(rem_critic_vals) / len(rem_critic_vals) if rem_critic_vals else 0
+                print(f"    Sleep: {total_nrem} NREM, {total_rem} REM | "
+                      f"avg_|td|={rem_avg_td:.4f} critic_val={rem_avg_val:.4f} "
+                      f"patch_Δ={post_norm - pre_norm:+.4f}")
 
             results = run_adaptation_test(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,

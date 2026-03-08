@@ -499,7 +499,7 @@ class Hippocampus(nn.Module):
         This is task-agnostic: no arithmetic generator, no scoring. The system
         dreams whatever emerges from reinstated context.
 
-        Returns list of (n_tokens_generated, critic_td, ep_td) for each dream.
+        Returns list of dict with dream diagnostics.
         """
         if device is None:
             device = self.episodes.device
@@ -560,9 +560,15 @@ class Hippocampus(nn.Module):
                     reward=0.0, step_idx=0, n_steps=1, device=device
                 )
 
-                # Capture critic's TD error from the dream
+                # Capture diagnostics from the dream
                 dream_td = mach._last_td_error if hasattr(mach, '_last_td_error') else 0.0
-                dreams.append((dream_len, dream_td, ep_td))
+                critic_val = mach._prev_value if hasattr(mach, '_prev_value') else 0.0
+                dreams.append({
+                    'td_error': dream_td,
+                    'critic_value': critic_val,
+                    'ep_td': ep_td,
+                    'etas': mach._last_etas.tolist() if hasattr(mach, '_last_etas') and mach._last_etas is not None else [],
+                })
 
         return dreams
 
