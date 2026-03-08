@@ -481,24 +481,28 @@ class Hippocampus(nn.Module):
         return replayed
 
     def replay_rem(self, mach, patched_model, tokenizer, n_dreams=2, device=None):
-        """REM replay (dreaming): run Qwen forward with replayed context.
+        """REM replay (dreaming): free generation from reinstated context.
 
-        Like REM sleep — full generative replay:
+        Brain-faithful REM sleep:
         1. Sample salient episodes (prioritized by |TD error|)
-        2. Reinstate PFC + neuromod from episode
-        3. Generate a novel arithmetic prompt (dream content)
-        4. Run full Qwen forward → patches capture activations → Hebbian update
+        2. Reinstate PFC + neuromod from episode (set the "mood")
+        3. Let Qwen generate freely — the dream content emerges from the
+           interaction of reinstated context + current patch state
+        4. Hebbian update driven by CRITIC prediction error (internal signal),
+           not external reward — dreams have no ground truth
 
-        Unlike NREM (which uses stored compressed activations), REM runs the
-        full forward pass — this lets the system discover new activation patterns
-        and generalize across operations.
+        The learning signal is purely internal: the critic evaluates whether
+        the dream activations match its predictions. Surprise (high |TD error|
+        from critic) drives plasticity — the system learns from its own
+        expectations, not external feedback.
 
-        Returns list of (dream_op, reward, td_error) for each dream.
+        This is task-agnostic: no arithmetic generator, no scoring. The system
+        dreams whatever emerges from reinstated context.
+
+        Returns list of (n_tokens_generated, critic_td, ep_td) for each dream.
         """
         if device is None:
             device = self.episodes.device
-
-        from data.arithmetic import generate_few_shot_episode, extract_number
 
         valid_indices = torch.where(self.ep_valid)[0]
         if len(valid_indices) == 0:
@@ -531,35 +535,34 @@ class Hippocampus(nn.Module):
                         'alpha': torch.tensor(0.5, device=device),
                     }
 
-                # Generate a novel prompt (dream content)
-                import random
-                ops = ['add', 'sub', 'mul', 'div', 'mod', 'gcd', 'abs_diff']
-                dream_op = random.choice(ops)
-                problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
-                prompt = problems[0]['prompt']
-                answer = problems[0]['answer']
+                # Dream: free generation from a seed token
+                # The seed is minimal — dream content emerges from patches + PFC
+                seed_ids = tokenizer.encode("", return_tensors='pt').to(device)
+                if seed_ids.numel() == 0:
+                    # Some tokenizers return empty for "" — use BOS or a space
+                    seed_ids = torch.tensor([[tokenizer.bos_token_id or 1]], device=device)
 
-                # Forward pass — hooks capture pre/post activations
-                inputs = tokenizer(prompt, return_tensors='pt').to(device)
-                outputs = patched_model(**inputs)
+                # Generate a short dream sequence (like a sleep burst)
+                dream_len = 8  # short — just enough for activations to flow
+                input_ids = seed_ids
+                for _ in range(dream_len):
+                    outputs = patched_model(input_ids=input_ids)
+                    next_token = outputs.logits[0, -1].argmax(-1, keepdim=True)
+                    input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
 
-                # Score the dream: did patches help produce the right answer?
-                logits = outputs.logits[0, -1]
-                predicted_token = tokenizer.decode(logits.argmax(-1).item()).strip()
-                predicted = extract_number(predicted_token)
-                from training.two_channel_train import graded_reward
-                reward = graded_reward(predicted, answer)
-
-                # Hebbian update from dream experience
-                # This drives plasticity using the LIVE activations from forward pass
-                # (not stored compressed ones like NREM)
+                # Hebbian update from dream activations
+                # Reward = 0 (no external feedback during sleep)
+                # The critic's prediction error IS the learning signal:
+                # if the critic is surprised by these activations, plasticity fires
                 if hasattr(mach, 'compute_context_gates'):
                     mach.compute_context_gates()
                 mach.hebbian_step(
-                    reward=reward, step_idx=0, n_steps=1, device=device
+                    reward=0.0, step_idx=0, n_steps=1, device=device
                 )
 
-                dreams.append((dream_op, reward, ep_td))
+                # Capture critic's TD error from the dream
+                dream_td = mach._last_td_error if hasattr(mach, '_last_td_error') else 0.0
+                dreams.append((dream_len, dream_td, ep_td))
 
         return dreams
 

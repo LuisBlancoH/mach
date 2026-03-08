@@ -365,7 +365,7 @@ def main():
             if "SLEEP" in mode_name and hipp is not None and len(hipp) > 0:
                 total_nrem = 0
                 total_rem = 0
-                rem_rewards = []
+                rem_td_errors = []
                 for cycle in range(args.sleep_cycles):
                     n_nrem = hipp.replay_nrem(mach, n_replays=4, device=config.DEVICE)
                     total_nrem += n_nrem
@@ -373,9 +373,9 @@ def main():
                         mach, patched_model, tokenizer, n_dreams=2, device=config.DEVICE
                     )
                     total_rem += len(dreams)
-                    rem_rewards.extend(r for _, r, _ in dreams)
-                rem_avg = sum(rem_rewards) / len(rem_rewards) if rem_rewards else 0
-                print(f"    Sleep: {total_nrem} NREM replays, {total_rem} REM dreams (avg_r={rem_avg:.3f})")
+                    rem_td_errors.extend(td for _, td, _ in dreams)
+                rem_avg_td = sum(abs(t) for t in rem_td_errors) / len(rem_td_errors) if rem_td_errors else 0
+                print(f"    Sleep: {total_nrem} NREM replays, {total_rem} REM dreams (avg_|td|={rem_avg_td:.3f})")
 
             results = run_adaptation_test(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,

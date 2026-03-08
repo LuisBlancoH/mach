@@ -1506,7 +1506,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     # Sleep cycle counters
     sleep_nrem_total = 0
     sleep_rem_total = 0
-    sleep_rem_rewards = []
+    sleep_rem_td_errors = []
 
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
@@ -1522,7 +1522,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     mach, patched_model, tokenizer, n_dreams=2, device=device
                 )
                 sleep_rem_total += len(rem_dreams)
-                sleep_rem_rewards.extend(r for _, r, _ in rem_dreams)
+                sleep_rem_td_errors.extend(td for _, td, _ in rem_dreams)
 
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
@@ -1802,11 +1802,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             _log_hebbian_diagnostics(mach, meta_params, step, hippocampus=hippocampus)
             # Sleep cycle stats
             if sleep_nrem_total > 0 or sleep_rem_total > 0:
-                rem_avg_r = sum(sleep_rem_rewards) / len(sleep_rem_rewards) if sleep_rem_rewards else 0
-                print(f"  Sleep cycles: NREM={sleep_nrem_total} replays, REM={sleep_rem_total} dreams (avg_r={rem_avg_r:.3f})")
+                rem_avg_td = sum(abs(t) for t in sleep_rem_td_errors) / len(sleep_rem_td_errors) if sleep_rem_td_errors else 0
+                print(f"  Sleep cycles: NREM={sleep_nrem_total} replays, REM={sleep_rem_total} dreams (avg_|td|={rem_avg_td:.3f})")
                 sleep_nrem_total = 0
                 sleep_rem_total = 0
-                sleep_rem_rewards = []
+                sleep_rem_td_errors = []
 
             # Quick validation — save/restore continuous state
             print(f"  --- Operation validation (step {step}) ---")
