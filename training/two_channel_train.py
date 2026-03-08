@@ -1464,6 +1464,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     window_ce = torch.tensor(0.0, device=device, requires_grad=True)
     window_critic_losses = []
     window_nuclei_losses = []
+    # Gradient tracking: accumulate norms between checkpoints
+    _grad_accum = {}  # component → list of norms
     all_rewards = []
     current_op = random.choice(DIVERSE_TRAIN_OPS)
     op_step_count = 0
@@ -1648,6 +1650,19 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 total_loss = total_loss + 0.1 * avg_nuclei
             total_loss.backward()
 
+            # Capture gradient norms BEFORE clipping/zeroing
+            for name, p in mach.named_parameters():
+                if p.grad is not None and p.grad.abs().sum() > 0:
+                    comp = name.split('.')[0]
+                    _grad_accum.setdefault(f"mach/{comp}", []).append(p.grad.norm().item())
+            if hippocampus is not None:
+                for name, p in hippocampus.named_parameters():
+                    comp = name.split('.')[0]
+                    if p.grad is not None and p.grad.abs().sum() > 0:
+                        _grad_accum.setdefault(f"hipp/{comp}", []).append(p.grad.norm().item())
+                    else:
+                        _grad_accum.setdefault(f"hipp/{comp}(ZERO)", []).append(0.0)
+
             torch.nn.utils.clip_grad_norm_(
                 meta_params, max_norm=config.PHASE5_GRAD_CLIP
             )
@@ -1752,6 +1767,15 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
         # Diagnostics + checkpoint
         if step % 2000 == 0 and step > 0:
+            # Print accumulated gradient norms (captured after each backward)
+            if _grad_accum:
+                print(f"  Gradient norms (avg over {len(next(iter(_grad_accum.values())))} backward passes):")
+                for comp in sorted(_grad_accum.keys()):
+                    norms = _grad_accum[comp]
+                    avg = sum(norms) / len(norms)
+                    mx = max(norms)
+                    print(f"    {comp}: avg={avg:.6f} max={mx:.6f} ({len(norms)} samples)")
+                _grad_accum.clear()
             _log_hebbian_diagnostics(mach, meta_params, step, hippocampus=hippocampus)
 
             # Quick validation — save/restore continuous state
