@@ -67,6 +67,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
     window_ce = torch.tensor(0.0, device=device, requires_grad=True)
     window_critic_losses = []
     window_nuclei_losses = []
+    window_hipp_losses = []
     truncation_window = 20
 
     for step, problem in enumerate(problems):
@@ -149,6 +150,11 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
             hippocampus.store(mach, act_summary, reward, td_error, global_step=step)
+            # Local REINFORCE loss for key_proj (learns at inference too)
+            if mode in ("full", "sparse", "reward_only"):
+                hipp_local = hippocampus.compute_local_loss(td_error)
+                if hipp_local.abs().item() > 0:
+                    window_hipp_losses.append(hipp_local)
 
         results.append((step, int(correct), reward, td_error))
 
@@ -165,6 +171,10 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                 if window_nuclei_losses:
                     avg_nuclei = torch.stack(window_nuclei_losses).mean()
                     total_loss = total_loss + 0.1 * avg_nuclei
+                # Hippocampus local loss (key_proj learns at inference)
+                if window_hipp_losses:
+                    avg_hipp = torch.stack(window_hipp_losses).mean()
+                    total_loss = total_loss + 0.05 * avg_hipp
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
                 optimizer.step()
@@ -215,6 +225,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []
             window_nuclei_losses = []
+            window_hipp_losses = []
 
     return results
 
@@ -455,6 +466,7 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
     window_ce = torch.tensor(0.0, device=config.DEVICE, requires_grad=True)
     window_critic_losses = []
     window_nuclei_losses = []
+    window_hipp_losses = []
     global_step = 0
 
     for cycle in range(n_cycles):
@@ -504,6 +516,10 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
                     act_summary = mach.get_activation_summary()
                     act_summary = act_summary / (act_summary.norm() + 1e-8)
                     hipp.store(mach, act_summary, reward, td_error)
+                    # Local REINFORCE loss for key_proj
+                    hipp_local = hipp.compute_local_loss(td_error)
+                    if hipp_local.abs().item() > 0:
+                        window_hipp_losses.append(hipp_local)
 
                 # Critic loss
                 if hasattr(mach, '_prev_critic_value') and mach._prev_critic_value is not None:
@@ -530,6 +546,9 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
                         if window_nuclei_losses:
                             avg_nuclei = torch.stack(window_nuclei_losses).mean()
                             total_loss = total_loss + 0.1 * avg_nuclei
+                        if window_hipp_losses:
+                            avg_hipp = torch.stack(window_hipp_losses).mean()
+                            total_loss = total_loss + 0.05 * avg_hipp
                         total_loss.backward()
                         torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
                         optimizer.step()
@@ -578,6 +597,7 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
                     window_ce = torch.tensor(0.0, device=config.DEVICE, requires_grad=True)
                     window_critic_losses = []
                     window_nuclei_losses = []
+                    window_hipp_losses = []
 
             acc = sum(corrects) / len(corrects)
             op_results[op].append((cycle, acc))
