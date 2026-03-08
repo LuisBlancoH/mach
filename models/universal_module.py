@@ -2966,6 +2966,8 @@ class MACHActivationHebbian(nn.Module):
         if hasattr(self, '_neuromod_bias') and self._neuromod_bias is not None:
             bias = self._neuromod_bias
             a = bias['alpha']  # tensor from hippocampus, gradient flows to read_gate
+            if a.requires_grad:
+                a.register_hook(lambda g: g.clamp(-1.0, 1.0))  # prevent gradient explosion through GRU chain
             etas = ((1 - a) * etas + a * bias['eta']).clamp(0.1, 1.0)
             decays = ((1 - a) * decays + a * bias['decay']).clamp(0.1, 1.0)
             expls = ((1 - a) * expls + a * bias['expl']).clamp(0.1, 0.5)
