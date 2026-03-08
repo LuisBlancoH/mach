@@ -1734,9 +1734,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             step_timer = time.time()
             hipp_str = ""
             if hippocampus is not None:
-                slot = hippocampus._last_slot if hasattr(hippocampus, '_last_slot') else -1
                 ep_idx = hippocampus._last_ep_idx if hasattr(hippocampus, '_last_ep_idx') else -1
-                hipp_str = f" | hipp: s{slot}/e{ep_idx} α={hipp_alpha:.3f}"
+                hipp_str = f" | hipp: e{ep_idx}/{len(hippocampus)} α={hipp_alpha:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
@@ -1810,12 +1809,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hippocampus is not None:
                 hippocampus.decay_all()
                 hippocampus.save()
-                n_eps = hippocampus.total_episodes()
-                ec = hippocampus.ep_count.clamp(max=hippocampus.episodes_per_slot)
-                per_slot = [f"s{i}:{ec[i].item():.0f}" for i in range(hippocampus.n_slots) if ec[i] > 0]
-                temp = hippocampus.log_temperature.exp().item()
-                print(f"  Hippocampus: {len(hippocampus)}/{hippocampus.n_slots} slots, "
-                      f"{n_eps} episodes, temp={temp:.1f}, [{' '.join(per_slot)}]")
+                print(f"  Hippocampus: {hippocampus}")
 
 
 def _consolidation_replay(mach, patched_model, tokenizer, device, hippocampus,

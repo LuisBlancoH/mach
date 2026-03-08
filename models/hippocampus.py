@@ -1,36 +1,35 @@
 """
-Hippocampus: VQ mode selection + per-slot episodic memory + replay.
+Hippocampus: distributed episodic memory + replay.
 
-VQ Codebook (thalamus/basal ganglia):
-  16 learned prototype keys. Discrete matching via straight-through.
-  Each prototype learns to represent one "mode" of operation.
+Global episode pool (CA3/CA1):
+  Flat buffer of N episodes. No discrete slots or categories.
+  Storage and retrieval use continuous similarity — like the brain's
+  distributed population code, not a codebook lookup.
+  A partial cue activates the most similar stored pattern via
+  pattern completion (winner-take-all, not blending).
 
-Per-slot episodic buffer (hippocampus proper):
-  Each slot has a buffer of 8 experiences with TD-aware eviction.
-  Stores raw (PFC, neuromod, TD error, timestamp) snapshots.
-  Also stores compressed per-layer activations for NREM replay.
-  On retrieval: learned scorer combines similarity, salience, recency.
+Pattern separation (Dentate Gyrus):
+  2-layer ReLU key projection orthogonalizes similar inputs,
+  preventing catastrophic interference between similar memories.
+
+Retrieval:
+  Query key → cosine similarity against all stored episode keys →
+  learned scorer ranks by [similarity, salience, recency] →
+  argmax selects ONE specific episode (no blending) →
+  approach/avoidance gate controls reinstatement strength.
+
+Eviction:
+  When buffer full, evict globally least-relevant episode
+  (learned scorer decides, not hardcoded rule).
 
 Replay (memory consolidation):
-  NREM replay: reactivate stored compressed activations → drive Hebbian
-    updates without running Qwen. Like sharp-wave ripples during sleep.
-    Prioritized by |TD error| — surprising memories replayed more.
-  REM replay (dreaming): run Qwen forward with generated prompts while
-    replayed PFC/neuromod influence patches. For generalization testing.
+  NREM: reactivate stored compressed activations → drive Hebbian
+    updates without running Qwen. Like sharp-wave ripples.
+  REM: run Qwen forward with generated prompts while replayed
+    PFC/neuromod influence patches. For generalization testing.
 
-This mirrors the brain:
-  - Prefrontal/thalamic context gates hippocampal retrieval
-  - Hippocampus stores specific episodes, not averages
-  - Dopamine (TD error) modulates memory salience
-  - Surprising memories persist, mundane ones get overwritten
-  - Temporal context: recency signal via timestamps
-  - NREM: compressed replay → cortical consolidation
-  - REM: generative replay → novel recombinations
-  - Cortex does the slow learning (Hebbian patches handle this)
-
-No hardcoded thresholds. Retrieval priority is learned, not formula'd.
-
-Interface is kept compatible with training/eval loops.
+No hardcoded thresholds. No discrete slots. No per-category limits.
+Retrieval priority and eviction are both learned.
 """
 
 import os
@@ -40,36 +39,28 @@ import torch.nn.functional as F
 
 
 class Hippocampus(nn.Module):
-    """VQ mode selection + per-slot episodic buffers.
+    """Distributed episodic memory with learned retrieval and replay.
 
-    VQ codebook selects a mode (straight-through gradient).
-    Per-slot ring buffer provides specific episodic recall.
-    Cortex (Hebbian patches) handles slow learning — no EMA needed.
+    Global flat buffer — no VQ slots, no per-category limits.
+    Continuous similarity retrieval with winner-take-all selection.
+    Brain-like: DG pattern separation, CA3 pattern completion,
+    dopamine-modulated salience, temporal context, replay.
     """
 
-    def __init__(self, key_dim, pfc_dim=32, n_patches=4, max_memories=16,
+    def __init__(self, key_dim, pfc_dim=32, n_patches=4, capacity=128,
                  d_proj=32, save_path=None):
         super().__init__()
         self.key_dim = key_dim
         self.pfc_dim = pfc_dim
         self.n_patches = n_patches
-        self.n_slots = max_memories
-        self.episodes_per_slot = 8
+        self.capacity = capacity
         self.d_proj = d_proj
         self.d_mem = pfc_dim + n_patches * 3  # PFC + neuromod per entry
-        # Per-layer compressed activations: pre + post per patch
-        self.d_act = d_proj * n_patches * 2  # pre(d_proj) + post(d_proj) per layer
+        self.d_act = d_proj * n_patches * 2   # compressed activations for replay
         self.save_path = save_path
 
-        # === VQ Codebook (mode selection) ===
-
-        # Learned prototype keys
-        self.prototypes = nn.Parameter(torch.randn(self.n_slots, key_dim) * 0.1)
-
-        # Learned softmax temperature for matching sharpness
-        self.log_temperature = nn.Parameter(torch.tensor(2.302585))  # init ~10
-
-        # Key projection with pattern separation (Dentate Gyrus)
+        # === Pattern separation (Dentate Gyrus) ===
+        # Orthogonalizes similar inputs to reduce interference
         input_dim = key_dim + pfc_dim
         self.key_proj = nn.Sequential(
             nn.Linear(input_dim, key_dim * 2),
@@ -84,49 +75,42 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.key_proj[2].weight[:, key_dim:])
             nn.init.zeros_(self.key_proj[2].bias)
 
-        # === Per-slot episodic buffers ===
-
-        # Ring buffer: (n_slots, episodes_per_slot, d_mem)
+        # === Global episode buffer ===
+        # Flat storage — no slots, no categories
         self.register_buffer('episodes',
-            torch.zeros(self.n_slots, self.episodes_per_slot, self.d_mem))
-        self.register_buffer('ep_head',
-            torch.zeros(self.n_slots, dtype=torch.long))
-        self.register_buffer('ep_count',
-            torch.zeros(self.n_slots, dtype=torch.long))
-        # Per-episode TD error (surprise/salience signal)
+            torch.zeros(capacity, self.d_mem))
+        self.register_buffer('ep_keys',
+            torch.zeros(capacity, key_dim))
         self.register_buffer('ep_td_errors',
-            torch.zeros(self.n_slots, self.episodes_per_slot))
-        # Per-episode timestamp (global step when stored)
+            torch.zeros(capacity))
         self.register_buffer('ep_timestamps',
-            torch.zeros(self.n_slots, self.episodes_per_slot))
-        # Per-episode compressed activations for NREM replay
-        # Layout: [pre_0, post_0, pre_1, post_1, ...] each d_proj
+            torch.zeros(capacity))
         self.register_buffer('ep_activations',
-            torch.zeros(self.n_slots, self.episodes_per_slot, self.d_act))
+            torch.zeros(capacity, self.d_act))
+        self.register_buffer('ep_valid',
+            torch.zeros(capacity, dtype=torch.bool))
+        self._write_head = 0
         self._global_step = 0
 
-        # === Read head ===
-
-        # Episode scorer: learns how to combine similarity, salience, recency
-        # Input: [pfc_similarity, |td_error|, normalized_recency]
-        # Output: scalar relevance score per episode
+        # === Learned retrieval scoring ===
+        # Input: [key_similarity, |td_error|, recency]
+        # Network learns how to weight these — no hardcoded formula
         self.episode_scorer = nn.Sequential(
             nn.Linear(3, 8),
             nn.ReLU(),
             nn.Linear(8, 1),
         )
-        # Init: default to similarity × salience (ignore recency until learned)
         with torch.no_grad():
             nn.init.zeros_(self.episode_scorer[0].weight)
-            self.episode_scorer[0].weight[0, 0] = 1.0  # sim
-            self.episode_scorer[0].weight[1, 1] = 1.0  # |td|
+            self.episode_scorer[0].weight[0, 0] = 1.0  # key similarity
+            self.episode_scorer[0].weight[1, 1] = 1.0  # salience
             nn.init.zeros_(self.episode_scorer[0].bias)
             nn.init.ones_(self.episode_scorer[2].weight)
             nn.init.zeros_(self.episode_scorer[2].bias)
 
-        # Read gate: approach/avoidance
-        # Input: match_similarity + current_td_error + episode_td_error
-        # Output: [-1, 1]
+        # === Read gate: approach/avoidance ===
+        # Input: [key_similarity, current_td_error, episode_td_error]
+        # Output: [-1, 1] — positive=reinstate, negative=repel
         self.read_gate = nn.Sequential(
             nn.Linear(3, 16),
             nn.Tanh(),
@@ -136,7 +120,7 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.read_gate[-2].bias.fill_(0.1)
 
-        # Reinstatement projections
+        # === Reinstatement projections ===
         self.read_to_pfc = nn.Linear(self.d_mem, pfc_dim)
         with torch.no_grad():
             nn.init.zeros_(self.read_to_pfc.weight)
@@ -154,14 +138,13 @@ class Hippocampus(nn.Module):
             )
             nn.init.zeros_(self.read_to_neuromod.bias)
 
-        self._last_slot = -1
         self._last_ep_idx = -1
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
 
     def _make_key(self, activation_summary, pfc_state):
-        """Project activation + PFC into key space (pattern separation)."""
+        """Project activation + PFC into key space (pattern separation / DG)."""
         if pfc_state is not None:
             pfc = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
         else:
@@ -169,64 +152,89 @@ class Hippocampus(nn.Module):
         combined = torch.cat([activation_summary, pfc])
         return self.key_proj(combined)
 
-    def _match(self, key):
-        """Find best matching prototype. Straight-through gradient."""
-        key_norm = F.normalize(key.unsqueeze(0), dim=-1)
-        proto_norm = F.normalize(self.prototypes, dim=-1)
-        sims = (proto_norm @ key_norm.squeeze(0))  # (n_slots,)
+    def _find_best(self, query_key, pfc_state, device):
+        """Pattern completion: find most relevant episode in the global pool.
 
-        temperature = self.log_temperature.exp()
-        soft = F.softmax(sims * temperature, dim=0)
-        hard = torch.zeros_like(soft)
-        hard[sims.argmax()] = 1.0
-        one_hot = hard - soft.detach() + soft
+        Like CA3 recurrent attractor dynamics:
+        - Partial cue (query key) activates stored patterns by similarity
+        - Learned scorer ranks by [similarity, salience, recency]
+        - Winner-take-all: argmax selects ONE specific episode
+        - No blending — you recall a specific memory, not an average
 
-        return sims.argmax().item(), sims, one_hot
-
-    def _best_episode(self, slot_idx, pfc_state, device):
-        """Find most relevant episode within a slot.
-
-        Learned scorer combines [similarity, |TD error|, recency].
-        Network decides how to weight these — no hardcoded formula.
-        Returns (episode_content, episode_td_error, episode_index).
+        Returns (episode_idx, episode_content, episode_td, key_similarity).
         """
-        n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
-        if n_eps == 0:
-            return None, 0.0, -1
+        n_valid = self.ep_valid.sum().item()
+        if n_valid == 0:
+            return -1, None, 0.0, 0.0
 
-        slot_eps = self.episodes[slot_idx, :n_eps].clone()  # (n_eps, d_mem)
-        pfc_flat = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
-        stored_pfcs = slot_eps[:, :self.pfc_dim]  # (n_eps, pfc_dim)
+        valid_mask = self.ep_valid  # (capacity,)
+        valid_indices = torch.where(valid_mask)[0]  # indices of valid episodes
 
-        pfc_norm = F.normalize(pfc_flat.unsqueeze(0), dim=-1)
-        stored_norm = F.normalize(stored_pfcs, dim=-1)
-        sims = (stored_norm @ pfc_norm.squeeze(0))  # (n_eps,)
+        # Key similarity: cosine between query and all stored keys
+        query_norm = F.normalize(query_key.unsqueeze(0), dim=-1)
+        stored_keys = self.ep_keys[valid_indices]  # (n_valid, key_dim)
+        stored_norm = F.normalize(stored_keys, dim=-1)
+        key_sims = (stored_norm @ query_norm.squeeze(0))  # (n_valid,)
 
-        td_errors = self.ep_td_errors[slot_idx, :n_eps]
+        # TD error salience
+        td_errors = self.ep_td_errors[valid_indices]
 
-        # Compute recency: how recently each episode was stored
-        # Normalized to [0, 1] where 1 = most recent
-        timestamps = self.ep_timestamps[slot_idx, :n_eps]
+        # Temporal recency
+        timestamps = self.ep_timestamps[valid_indices]
         ages = self._global_step - timestamps
         max_age = ages.max().clamp(min=1.0)
-        recency = 1.0 - (ages / max_age)  # (n_eps,) in [0, 1]
+        recency = 1.0 - (ages / max_age)  # [0, 1]
 
-        # Learned scoring: network decides how to combine signals
+        # Learned scoring: network decides how to rank
         scorer_input = torch.stack([
-            sims,                           # PFC similarity
-            td_errors.abs().clamp(min=1e-6), # salience
-            recency,                         # temporal recency
-        ], dim=-1)  # (n_eps, 3)
+            key_sims,
+            td_errors.abs().clamp(min=1e-6),
+            recency,
+        ], dim=-1)  # (n_valid, 3)
+        relevance = self.episode_scorer(scorer_input).squeeze(-1)  # (n_valid,)
 
-        relevance = self.episode_scorer(scorer_input).squeeze(-1)  # (n_eps,)
+        # Winner-take-all: one specific memory
+        best_local = relevance.argmax().item()
+        best_global = valid_indices[best_local].item()
+        best_sim = key_sims[best_local]
+        ep_td = td_errors[best_local].item()
 
-        best_idx = relevance.argmax().item()
-        ep_td = td_errors[best_idx].item()
-        return slot_eps[best_idx], ep_td, best_idx
+        return best_global, self.episodes[best_global].clone(), ep_td, best_sim
+
+    def _find_eviction_target(self, query_key, device):
+        """Find which episode to evict when buffer is full.
+
+        Uses the same learned scorer but in reverse: evict the episode
+        with the LOWEST relevance to the current context.
+        This is adaptive — the network learns what to forget.
+        """
+        valid_indices = torch.where(self.ep_valid)[0]
+
+        query_norm = F.normalize(query_key.unsqueeze(0), dim=-1)
+        stored_keys = self.ep_keys[valid_indices]
+        stored_norm = F.normalize(stored_keys, dim=-1)
+        key_sims = (stored_norm @ query_norm.squeeze(0))
+
+        td_errors = self.ep_td_errors[valid_indices]
+        timestamps = self.ep_timestamps[valid_indices]
+        ages = self._global_step - timestamps
+        max_age = ages.max().clamp(min=1.0)
+        recency = 1.0 - (ages / max_age)
+
+        scorer_input = torch.stack([
+            key_sims,
+            td_errors.abs().clamp(min=1e-6),
+            recency,
+        ], dim=-1)
+        relevance = self.episode_scorer(scorer_input).squeeze(-1)
+
+        # Evict least relevant
+        worst_local = relevance.argmin().item()
+        return valid_indices[worst_local].item()
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
-        """VQ match → select slot → retrieve best episode → reinstate.
+        """Pattern completion → retrieve one episode → reinstate.
 
         Returns reinstatement alpha for diagnostics.
         """
@@ -237,23 +245,15 @@ class Hippocampus(nn.Module):
 
         pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
 
-        # VQ matching
+        # Pattern separation (DG) then pattern completion (CA3)
         key = self._make_key(activation_summary, pfc)
-        slot_idx, sims, one_hot = self._match(key)
-        self._last_slot = slot_idx
-
-        # Episodic retrieval within matched slot
-        ep_content, ep_td, ep_idx = self._best_episode(slot_idx, pfc, device)
+        ep_idx, ep_content, ep_td, best_sim = self._find_best(key, pfc, device)
         self._last_ep_idx = ep_idx
 
         if ep_content is None:
-            return 0.0  # no episodes stored yet
+            return 0.0
 
         # Read gate: approach/avoidance
-        # Sees: prototype match quality + current surprise + episode's surprise
-        # Episode TD tells the gate whether this memory was from a surprising
-        # moment (positive or negative) — informs approach vs avoidance
-        best_sim = sims[slot_idx]
         gate_input = torch.stack([
             best_sim,
             torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
@@ -281,10 +281,10 @@ class Hippocampus(nn.Module):
         return abs(alpha_f)
 
     def store(self, mach, activation_summary, reward, td_error, global_step=None):
-        """VQ match → store episode in matched slot.
+        """Store episode in global buffer. Evict least relevant if full.
 
-        Eviction: overwrite least-salient (lowest |TD error|) episode.
-        Brain-like: surprising memories persist, mundane ones get overwritten.
+        No slots, no categories — episodes are stored with their keys
+        and retrieved by continuous similarity.
         """
         device = activation_summary.device
         if self.episodes.device != device:
@@ -298,7 +298,6 @@ class Hippocampus(nn.Module):
             pfc_flat = pfc.squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
 
             key = self._make_key(activation_summary, pfc_flat if pfc is None else pfc)
-            slot_idx, _, _ = self._match(key)
 
             # Compose value: PFC + neuromod
             etas = torch.zeros(self.n_patches, device=device)
@@ -310,20 +309,21 @@ class Hippocampus(nn.Module):
                 expls = mach._last_expls
             value = torch.cat([pfc_flat, etas, decays, expls])
 
-            # Eviction: if buffer not full, use next empty slot (ring buffer)
-            # If full, overwrite least-salient episode (lowest |TD error|)
-            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
-            if n_eps < self.episodes_per_slot:
-                # Buffer not full — use ring buffer head
-                write_idx = self.ep_head[slot_idx].item()
-                self.ep_head[slot_idx] = (write_idx + 1) % self.episodes_per_slot
+            # Find write position
+            n_valid = self.ep_valid.sum().item()
+            if n_valid < self.capacity:
+                # Buffer not full — use next empty position
+                empty = torch.where(~self.ep_valid)[0]
+                write_idx = empty[0].item()
             else:
-                # Buffer full — evict least surprising episode
-                write_idx = self.ep_td_errors[slot_idx].abs().argmin().item()
+                # Buffer full — evict least relevant episode
+                write_idx = self._find_eviction_target(key, device)
 
-            self.episodes[slot_idx, write_idx] = value
-            self.ep_td_errors[slot_idx, write_idx] = td_error
-            self.ep_timestamps[slot_idx, write_idx] = self._global_step
+            self.episodes[write_idx] = value
+            self.ep_keys[write_idx] = key.detach()
+            self.ep_td_errors[write_idx] = td_error
+            self.ep_timestamps[write_idx] = self._global_step
+            self.ep_valid[write_idx] = True
 
             # Store compressed activations for NREM replay
             act_parts = []
@@ -337,17 +337,15 @@ class Hippocampus(nn.Module):
                     post_f = post.float()
                     while post_f.dim() > 1:
                         post_f = post_f.mean(dim=0)
-                    pre_c = mach.hebb_rule.compress[i](pre_f)   # (d_proj,)
-                    post_c = mach.hebb_rule.compress[i](post_f)  # (d_proj,)
+                    pre_c = mach.hebb_rule.compress[i](pre_f)
+                    post_c = mach.hebb_rule.compress[i](post_f)
                     act_parts.extend([pre_c, post_c])
                 else:
                     act_parts.extend([
                         torch.zeros(self.d_proj, device=device),
                         torch.zeros(self.d_proj, device=device),
                     ])
-            self.ep_activations[slot_idx, write_idx] = torch.cat(act_parts)
-
-            self.ep_count[slot_idx] += 1
+            self.ep_activations[write_idx] = torch.cat(act_parts)
 
         return True
 
@@ -355,7 +353,7 @@ class Hippocampus(nn.Module):
         """NREM replay: reactivate stored activations → drive Hebbian updates.
 
         Like sharp-wave ripples during deep sleep:
-        1. Sample episodes prioritized by |TD error| (surprising = more replayed)
+        1. Sample episodes prioritized by |TD error|
         2. Reinstate PFC + neuromod from episode
         3. Feed stored compressed activations to Hebbian rule
         4. Patches learn from memory — no Qwen forward pass needed
@@ -365,35 +363,24 @@ class Hippocampus(nn.Module):
         if device is None:
             device = self.episodes.device
 
-        # Collect all stored episodes across all slots
-        all_episodes = []
-        for slot_idx in range(self.n_slots):
-            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
-            for ep_idx in range(n_eps):
-                all_episodes.append((slot_idx, ep_idx))
-
-        if not all_episodes:
+        valid_indices = torch.where(self.ep_valid)[0]
+        if len(valid_indices) == 0:
             return 0
 
         # Prioritized sampling: probability ∝ |TD error|
-        td_abs = torch.tensor([
-            abs(self.ep_td_errors[s, e].item())
-            for s, e in all_episodes
-        ], device=device)
-        td_abs = td_abs.clamp(min=1e-6)
+        td_abs = self.ep_td_errors[valid_indices].abs().clamp(min=1e-6)
         probs = td_abs / td_abs.sum()
 
-        n_replays = min(n_replays, len(all_episodes))
-        indices = torch.multinomial(probs, n_replays, replacement=False)
+        n_replays = min(n_replays, len(valid_indices))
+        sampled = torch.multinomial(probs, n_replays, replacement=False)
 
         replayed = 0
-        for idx in indices:
-            slot_idx, ep_idx = all_episodes[idx.item()]
-            ep_content = self.episodes[slot_idx, ep_idx]
-            ep_td = self.ep_td_errors[slot_idx, ep_idx].item()
-            ep_acts = self.ep_activations[slot_idx, ep_idx]
+        for s in sampled:
+            idx = valid_indices[s].item()
+            ep_content = self.episodes[idx]
+            ep_td = self.ep_td_errors[idx].item()
+            ep_acts = self.ep_activations[idx]
 
-            # Skip episodes with no stored activations
             if ep_acts.abs().sum() < 1e-8:
                 continue
 
@@ -413,7 +400,6 @@ class Hippocampus(nn.Module):
                 decays = torch.full((self.n_patches,), 0.5, device=device)
                 expls = torch.full((self.n_patches,), 0.2, device=device)
 
-            # Replay: feed stored compressed activations to Hebbian rule
             td_error_t = torch.tensor(ep_td, device=device, dtype=torch.float32)
 
             for patch_idx in range(self.n_patches):
@@ -426,8 +412,6 @@ class Hippocampus(nn.Module):
                 if pre_c.abs().sum() < 1e-8:
                     continue
 
-                # Drive Hebbian update with stored compressed activations
-                # Uses replay_update which accepts pre-compressed inputs
                 delta_down, delta_up = mach.hebb_rule.replay_update(
                     patch_idx, pre_c, post_c,
                     td_error=td_error_t,
@@ -452,45 +436,32 @@ class Hippocampus(nn.Module):
         Like REM sleep — full generative replay:
         1. Sample salient episodes
         2. Reinstate PFC + neuromod from episode
-        3. Generate a simple arithmetic prompt (novel combination)
+        3. Generate a novel arithmetic prompt (dream content)
         4. Run full Qwen forward → patches fire → normal Hebbian update
 
-        This enables generalization: patches learn from novel input combinations
-        while guided by stored memory states. Not wired into training loop —
-        call manually for experimentation.
-
-        Returns list of (prompt, replay_td_error) for each dream.
+        Not wired into training loop — call manually for experimentation.
+        Returns list of (prompt, replay_td_error, dream_op) for each dream.
         """
         if device is None:
             device = self.episodes.device
 
         from data.arithmetic import generate_few_shot_episode
 
-        # Collect salient episodes
-        all_episodes = []
-        for slot_idx in range(self.n_slots):
-            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
-            for ep_idx in range(n_eps):
-                all_episodes.append((slot_idx, ep_idx))
-
-        if not all_episodes:
+        valid_indices = torch.where(self.ep_valid)[0]
+        if len(valid_indices) == 0:
             return []
 
-        td_abs = torch.tensor([
-            abs(self.ep_td_errors[s, e].item())
-            for s, e in all_episodes
-        ], device=device)
-        td_abs = td_abs.clamp(min=1e-6)
+        td_abs = self.ep_td_errors[valid_indices].abs().clamp(min=1e-6)
         probs = td_abs / td_abs.sum()
 
-        n_dreams = min(n_dreams, len(all_episodes))
-        indices = torch.multinomial(probs, n_dreams, replacement=False)
+        n_dreams = min(n_dreams, len(valid_indices))
+        sampled = torch.multinomial(probs, n_dreams, replacement=False)
 
         dreams = []
-        for idx in indices:
-            slot_idx, ep_idx = all_episodes[idx.item()]
-            ep_content = self.episodes[slot_idx, ep_idx]
-            ep_td = self.ep_td_errors[slot_idx, ep_idx].item()
+        for s in sampled:
+            idx = valid_indices[s].item()
+            ep_content = self.episodes[idx]
+            ep_td = self.ep_td_errors[idx].item()
 
             # Reinstate PFC + neuromod
             pfc_stored = ep_content[:self.pfc_dim]
@@ -513,19 +484,16 @@ class Hippocampus(nn.Module):
             problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
             prompt = problems[0]['text']
 
-            # Run full forward pass through Qwen with patched model
             inputs = tokenizer(prompt, return_tensors='pt').to(device)
             with torch.no_grad():
                 outputs = patched_model(**inputs)
 
-            # Normal Hebbian step fires on the dream activations
-            # (caller handles this — we just set up the state)
             dreams.append((prompt, ep_td, dream_op))
 
         return dreams
 
     def set_neuromod(self, gamma, avg_decay):
-        """Interface compatibility. No EMA to drive."""
+        """Interface compatibility."""
         pass
 
     def reconsolidate(self, td_error):
@@ -533,7 +501,7 @@ class Hippocampus(nn.Module):
         pass
 
     def decay_all(self):
-        """No-op. Ring buffer cycles naturally."""
+        """No-op."""
         pass
 
     def save(self, path=None):
@@ -544,11 +512,12 @@ class Hippocampus(nn.Module):
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         torch.save({
             'episodes': self.episodes.cpu(),
-            'ep_head': self.ep_head.cpu(),
-            'ep_count': self.ep_count.cpu(),
+            'ep_keys': self.ep_keys.cpu(),
             'ep_td_errors': self.ep_td_errors.cpu(),
             'ep_timestamps': self.ep_timestamps.cpu(),
             'ep_activations': self.ep_activations.cpu(),
+            'ep_valid': self.ep_valid.cpu(),
+            'write_head': self._write_head,
             'global_step': self._global_step,
         }, path)
 
@@ -558,27 +527,25 @@ class Hippocampus(nn.Module):
         data = torch.load(path, map_location='cpu', weights_only=True)
         if 'episodes' in data and data['episodes'].shape == self.episodes.shape:
             self.episodes.copy_(data['episodes'])
-            self.ep_head.copy_(data['ep_head'])
-            self.ep_count.copy_(data['ep_count'])
-            if 'ep_td_errors' in data:
-                self.ep_td_errors.copy_(data['ep_td_errors'])
-            elif 'ep_rewards' in data:
-                self.ep_td_errors.copy_(data['ep_rewards'])  # legacy compat
+            self.ep_keys.copy_(data['ep_keys'])
+            self.ep_td_errors.copy_(data['ep_td_errors'])
+            self.ep_valid.copy_(data['ep_valid'])
             if 'ep_timestamps' in data:
                 self.ep_timestamps.copy_(data['ep_timestamps'])
             if 'ep_activations' in data and data['ep_activations'].shape == self.ep_activations.shape:
                 self.ep_activations.copy_(data['ep_activations'])
+            if 'write_head' in data:
+                self._write_head = data['write_head']
             if 'global_step' in data:
                 self._global_step = data['global_step']
 
     def __len__(self):
-        """Number of slots with at least one episode."""
-        return int((self.ep_count > 0).sum().item())
+        """Number of stored episodes."""
+        return int(self.ep_valid.sum().item())
 
     def total_episodes(self):
-        """Total episodes stored across all slots."""
-        return int(self.ep_count.clamp(max=self.episodes_per_slot).sum().item())
+        """Total episodes stored."""
+        return len(self)
 
     def __repr__(self):
-        n_eps = self.total_episodes()
-        return f"Hippocampus({len(self)}/{self.n_slots} slots, {n_eps} episodes)"
+        return f"Hippocampus({len(self)}/{self.capacity} episodes)"
