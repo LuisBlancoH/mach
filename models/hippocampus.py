@@ -211,11 +211,16 @@ class Hippocampus(nn.Module):
         return abs(alpha_f)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """Soft write to memory. Fully differentiable.
+        """Soft write to memory.
 
         Every step writes — the write gate controls HOW MUCH, not WHETHER.
         No threshold. The system learns to write strongly for important events
         and weakly (≈ no-op) for mundane ones.
+
+        Gradient flows through the READ path (retrieve_and_reinstate).
+        Writes are detached to avoid in-place modification conflicts with
+        the read graph. The write gate still learns via the read path:
+        what gets written determines what can be read next step.
         """
         device = activation_summary.device
         if self.memory.device != device:
@@ -223,53 +228,58 @@ class Hippocampus(nn.Module):
 
         self._reward_ema = 0.99 * self._reward_ema + 0.01 * reward
 
-        pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
-        pfc_flat = pfc.detach().squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
+        with torch.no_grad():
+            pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
+            pfc_flat = pfc.squeeze(0) if pfc is not None else torch.zeros(self.pfc_dim, device=device)
 
-        # Compose memory value: PFC state + neuromod values
-        etas = torch.zeros(self.n_patches, device=device)
-        decays = torch.zeros(self.n_patches, device=device)
-        expls = torch.zeros(self.n_patches, device=device)
-        if hasattr(mach, '_last_etas') and mach._last_etas is not None:
-            etas = mach._last_etas.detach()
-            decays = mach._last_decays.detach()
-            expls = mach._last_expls.detach()
-        raw_value = torch.cat([pfc_flat, etas, decays, expls])  # (d_mem,)
-        value = self.write_value(raw_value)                      # (d_mem,)
+            # Compose memory value: PFC state + neuromod values
+            etas = torch.zeros(self.n_patches, device=device)
+            decays = torch.zeros(self.n_patches, device=device)
+            expls = torch.zeros(self.n_patches, device=device)
+            if hasattr(mach, '_last_etas') and mach._last_etas is not None:
+                etas = mach._last_etas
+                decays = mach._last_decays
+                expls = mach._last_expls
+            raw_value = torch.cat([pfc_flat, etas, decays, expls])
+            value = self.write_value(raw_value)
 
-        # Write key
-        key = self._make_key(activation_summary.detach(), pfc_flat if pfc is None else pfc.detach())
+            # Write key
+            key = self._make_key(activation_summary, pfc_flat if pfc is None else pfc)
 
-        # Content-based write addressing: write near similar existing memories
-        # OR to least-used slots (allocation)
-        content_attn = self._content_attention(key)          # (n_slots,)
-        alloc_attn = F.softmax(-self.usage * 10.0, dim=0)    # least-used slots
-        # Blend: content for reinforcing, allocation for new memories
-        write_attn = 0.5 * content_attn + 0.5 * alloc_attn  # (n_slots,)
+            # Content-based write addressing + allocation
+            content_attn = self._content_attention(key)
+            alloc_attn = F.softmax(-self.usage * 10.0, dim=0)
+            write_attn = 0.5 * content_attn + 0.5 * alloc_attn
 
-        # Write gate: learned strength based on context
-        gate_input = torch.cat([
-            pfc_flat,
-            torch.tensor([td_error], device=device, dtype=torch.float32),
-            torch.tensor([reward], device=device, dtype=torch.float32),
-        ])
-        gates = self.write_gate(gate_input)
-        write_strength = torch.sigmoid(gates[0])   # [0, 1]
-        erase_strength = torch.sigmoid(gates[1])    # [0, 1]
+            # Write gate: learned strength based on context
+            gate_input = torch.cat([
+                pfc_flat,
+                torch.tensor([td_error], device=device, dtype=torch.float32),
+                torch.tensor([reward], device=device, dtype=torch.float32),
+            ])
+            gates = self.write_gate(gate_input)
+            write_strength = torch.sigmoid(gates[0])
+            erase_strength = torch.sigmoid(gates[1])
 
-        # Erase then write (DNC-style)
-        erase = write_attn.unsqueeze(1) * erase_strength    # (n_slots, 1)
-        self.memory = self.memory * (1 - erase) + \
-            write_attn.unsqueeze(1) * write_strength * value.unsqueeze(0)
+            # Erase then write (DNC-style)
+            erase = write_attn.unsqueeze(1) * erase_strength
+            self.memory.copy_(
+                self.memory * (1 - erase) +
+                write_attn.unsqueeze(1) * write_strength * value.unsqueeze(0)
+            )
 
-        # Update keys: blend toward new key at write locations
-        self.keys = self.keys * (1 - write_attn.unsqueeze(1) * write_strength) + \
-            write_attn.unsqueeze(1) * write_strength * key.unsqueeze(0)
+            # Update keys
+            ws = (write_attn * write_strength).unsqueeze(1)
+            self.keys.copy_(
+                self.keys * (1 - ws) + ws * key.unsqueeze(0)
+            )
 
-        # Update usage
-        self.usage = self.usage * (1 - erase.squeeze(1)) + write_attn * write_strength
+            # Update usage
+            self.usage.copy_(
+                self.usage * (1 - erase.squeeze(1)) + write_attn * write_strength
+            )
 
-        return True  # always "stores" (soft write)
+        return True
 
     def set_neuromod(self, gamma, avg_decay):
         """Accept neuromod signals. Kept for interface compatibility.
