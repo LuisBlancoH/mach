@@ -257,12 +257,6 @@ class Hippocampus(nn.Module):
         write_strength = torch.sigmoid(gates[0])   # [0, 1]
         erase_strength = torch.sigmoid(gates[1])    # [0, 1]
 
-        # Inductive bias: surprise amplifies writes
-        # Not a threshold — just "surprising events write harder"
-        # Like amygdala modulation of hippocampal encoding
-        salience = abs(td_error)
-        write_strength = write_strength * salience
-
         # Erase then write (DNC-style)
         erase = write_attn.unsqueeze(1) * erase_strength    # (n_slots, 1)
         self.memory = self.memory * (1 - erase) + \
