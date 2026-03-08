@@ -140,23 +140,30 @@ class Hippocampus(nn.Module):
 
         self._last_ep_idx = -1
         self._last_alpha = 0.0
+        self._last_key = None       # stored for local loss (before detach)
+        self._last_best_sim = None  # similarity of retrieved episode
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
 
     def _make_key(self, activation_summary, pfc_state):
-        """Project activation + PFC into key space (pattern separation / DG)."""
+        """Project activation + PFC into key space (pattern separation / DG).
+
+        Key is DETACHED from the main loss graph. key_proj learns via a local
+        REINFORCE signal (compute_local_loss), not through the critic chain.
+        Brain-faithful: DG learns pattern separation from local prediction
+        error, not from cortical backprop.
+        """
         if pfc_state is not None:
             pfc = pfc_state.squeeze(0) if pfc_state.dim() > 1 else pfc_state
         else:
             pfc = torch.zeros(self.pfc_dim, device=activation_summary.device)
         combined = torch.cat([activation_summary, pfc])
         key = self.key_proj(combined)
-        # Clamp gradient: key_proj → cosine_sim → alpha → PFC → GRU chain
-        # amplifies gradient by ~1000x. Same approach as Qwen boundary clamping.
-        if key.requires_grad:
-            key.register_hook(lambda g: g.clamp(-1.0, 1.0))
-        return key
+        # Store for local loss computation (before detach)
+        self._last_key = key
+        # Detach from main graph — key_proj learns via local loss only
+        return key.detach()
 
     def _find_best(self, query_key, pfc_state, device):
         """Pattern completion: find most relevant episode in the global pool.
@@ -257,7 +264,18 @@ class Hippocampus(nn.Module):
         self._last_ep_idx = ep_idx
 
         if ep_content is None:
+            self._last_best_sim = None
             return 0.0
+
+        # Compute similarity using the NON-detached key for local loss
+        # (the detached key was used for retrieval; this one tracks through key_proj)
+        if self._last_key is not None:
+            stored_key = self.ep_keys[ep_idx]  # buffer, no grad
+            self._last_best_sim = F.cosine_similarity(
+                self._last_key.unsqueeze(0), stored_key.unsqueeze(0)
+            ).squeeze()
+        else:
+            self._last_best_sim = None
 
         # Read gate: approach/avoidance
         gate_input = torch.stack([
@@ -290,6 +308,29 @@ class Hippocampus(nn.Module):
 
         self._last_alpha = alpha_abs.item()
         return self._last_alpha
+
+    def compute_local_loss(self, td_error):
+        """Local REINFORCE loss for key_proj (pattern separation).
+
+        Brain-faithful: DG learns from local prediction error signals,
+        not from backprop through the cortical chain. When retrieval was
+        followed by positive surprise (td_error > 0), reinforce the key
+        mapping that found this memory. When negative, weaken it.
+
+        loss = -td_error × similarity(key_proj(input), stored_key)
+
+        This trains key_proj to map inputs to keys that retrieve helpful
+        memories. Only key_proj gets gradient (similarity uses _last_key
+        which was computed before detach).
+        """
+        if self._last_best_sim is None or self._last_key is None:
+            return torch.tensor(0.0)
+
+        # REINFORCE: reward good retrievals, punish bad ones
+        td = torch.tensor(td_error, dtype=torch.float32, device=self._last_best_sim.device) \
+            if not isinstance(td_error, torch.Tensor) else td_error.detach()
+        loss = -td * self._last_best_sim
+        return loss
 
     def store(self, mach, activation_summary, reward, td_error, global_step=None):
         """Store episode in global buffer. Evict least relevant if full.

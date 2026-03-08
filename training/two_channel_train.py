@@ -1464,6 +1464,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     window_ce = torch.tensor(0.0, device=device, requires_grad=True)
     window_critic_losses = []
     window_nuclei_losses = []
+    window_hipp_losses = []  # local REINFORCE losses for hippocampus key_proj
     # Gradient tracking: accumulate norms between checkpoints
     _grad_accum = {}  # component → list of norms
     all_rewards = []
@@ -1640,6 +1641,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         if hasattr(mach, '_nuclei_loss'):
             window_nuclei_losses.append(mach._nuclei_loss)
 
+        # Hippocampus local loss: REINFORCE signal for key_proj (pattern separation)
+        if hippocampus is not None and hasattr(mach, '_last_td_error'):
+            hipp_local = hippocampus.compute_local_loss(mach._last_td_error)
+            if hipp_local.abs().item() > 0:
+                window_hipp_losses.append(hipp_local)
+
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
             avg_critic = torch.stack(window_critic_losses).mean() if window_critic_losses else torch.tensor(0.0, device=device)
@@ -1648,6 +1655,10 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if window_nuclei_losses:
                 avg_nuclei = torch.stack(window_nuclei_losses).mean()
                 total_loss = total_loss + 0.1 * avg_nuclei
+            # Hippocampus local loss: REINFORCE for key_proj pattern separation
+            if window_hipp_losses:
+                avg_hipp = torch.stack(window_hipp_losses).mean()
+                total_loss = total_loss + 0.05 * avg_hipp
             total_loss.backward()
 
             # Capture gradient norms BEFORE clipping/zeroing
@@ -1720,6 +1731,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             window_ce = torch.tensor(0.0, device=device, requires_grad=True)
             window_critic_losses = []
             window_nuclei_losses = []
+            window_hipp_losses = []
 
         # Logging
         if step % 100 == 0 and step > 0:
