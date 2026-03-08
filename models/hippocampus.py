@@ -187,8 +187,9 @@ class Hippocampus(nn.Module):
             best_sim = float(sims[best_idx])
             # Merge gate: learned decision boundary for "same memory"
             with torch.no_grad():
+                device = next(self.merge_gate.parameters()).device
                 merge_prob = self.merge_gate(
-                    torch.tensor([best_sim], dtype=torch.float32)
+                    torch.tensor([best_sim], dtype=torch.float32, device=device)
                 ).item()
             if merge_prob > 0.5:
                 # Reinforce existing memory with saturation
