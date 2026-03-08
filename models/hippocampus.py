@@ -139,6 +139,7 @@ class Hippocampus(nn.Module):
             nn.init.zeros_(self.read_to_neuromod.bias)
 
         self._last_ep_idx = -1
+        self._last_alpha = 0.0
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
@@ -280,7 +281,8 @@ class Hippocampus(nn.Module):
                 'alpha': alpha_f,
             }
 
-        return abs(alpha_f)
+        self._last_alpha = abs(alpha_f)
+        return self._last_alpha
 
     def store(self, mach, activation_summary, reward, td_error, global_step=None):
         """Store episode in global buffer. Evict least relevant if full.

@@ -1752,7 +1752,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
         # Diagnostics + checkpoint
         if step % 2000 == 0 and step > 0:
-            _log_hebbian_diagnostics(mach, meta_params, step)
+            _log_hebbian_diagnostics(mach, meta_params, step, hippocampus=hippocampus)
 
             # Quick validation — save/restore continuous state
             print(f"  --- Operation validation (step {step}) ---")
@@ -2046,7 +2046,7 @@ def ablate_hebbian(base_model, mach, patched_model, tokenizer, device,
     return results
 
 
-def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
+def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
     """Log gradient norms and weight stats for Hebbian architecture."""
     diag = {}
 
@@ -2061,7 +2061,40 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx):
 
     for component, norms in component_grad_norms.items():
         avg_norm = sum(norms) / len(norms)
+        max_norm = max(norms)
         diag[f"grad_norm/{component}"] = avg_norm
+        diag[f"grad_max/{component}"] = max_norm
+
+    # Hippocampus gradient diagnostics
+    if hippocampus is not None:
+        hipp_grad_norms = {}
+        hipp_no_grad = []
+        for name, param in hippocampus.named_parameters():
+            component = name.split('.')[0]  # e.g. key_proj, read_gate, episode_scorer, read_to_pfc
+            if param.grad is not None and param.grad.abs().sum() > 0:
+                norm = param.grad.norm().item()
+                if component not in hipp_grad_norms:
+                    hipp_grad_norms[component] = []
+                hipp_grad_norms[component].append(norm)
+            else:
+                hipp_no_grad.append(name)
+
+        for component, norms in hipp_grad_norms.items():
+            diag[f"hipp_grad/{component}"] = sum(norms) / len(norms)
+            diag[f"hipp_grad_max/{component}"] = max(norms)
+
+        if hipp_no_grad:
+            print(f"  Hippocampus params with NO gradient: {hipp_no_grad}")
+
+        # Hippocampus weight norms (are parameters growing/changing?)
+        for name, param in hippocampus.named_parameters():
+            component = name.split('.')[0]
+            diag[f"hipp_weight/{name}"] = param.data.norm().item()
+
+        # Hippocampus buffer stats
+        diag["hipp/n_episodes"] = len(hippocampus)
+        if hasattr(hippocampus, '_last_alpha'):
+            diag["hipp/last_alpha"] = hippocampus._last_alpha
 
     # Patch delta stats
     for i, patch in enumerate(mach.patches):
