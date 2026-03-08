@@ -2548,9 +2548,11 @@ class LearnedPlasticityRule(nn.Module):
                 nn.init.normal_(head.weight, std=0.01)
                 nn.init.zeros_(head.bias)
 
-        # Init plasticity net output layer to near-zero (start conservative)
+        # Init plasticity net output layer to small values (not zero!)
+        # Zero weights kill gradient to all earlier layers and inputs.
+        # Small values keep initial writes conservative while allowing gradient flow.
         for pnet in self.plasticity_net:
-            nn.init.zeros_(pnet[-1].weight)
+            nn.init.normal_(pnet[-1].weight, std=0.01)
             nn.init.zeros_(pnet[-1].bias)
 
         # Eligibility traces: list-of-lists of independent scalar tensors
@@ -2960,11 +2962,10 @@ class MACHActivationHebbian(nn.Module):
         gamma = 0.1 + 0.9 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
 
         # Hippocampal reinstatement: blend stored neuromod values into current
-        # alpha > 0: approach (blend toward stored state)
-        # alpha < 0: avoidance (blend AWAY from stored state)
+        # alpha controls blend strength (tensor — gradient flows to hippocampus read_gate)
         if hasattr(self, '_neuromod_bias') and self._neuromod_bias is not None:
             bias = self._neuromod_bias
-            a = bias['alpha']
+            a = bias['alpha']  # tensor from hippocampus, gradient flows to read_gate
             etas = ((1 - a) * etas + a * bias['eta']).clamp(0.1, 1.0)
             decays = ((1 - a) * decays + a * bias['decay']).clamp(0.1, 1.0)
             expls = ((1 - a) * expls + a * bias['expl']).clamp(0.1, 0.5)

@@ -269,19 +269,21 @@ class Hippocampus(nn.Module):
         if pfc is not None:
             mach._pfc_state = mach._pfc_state.detach() + alpha * pfc_delta.unsqueeze(0)
 
-        # Neuromod bias from episode
-        alpha_f = alpha.item()
-        if abs(alpha_f) > 1e-4 and hasattr(mach, '_eta_state'):
+        # Neuromod bias from episode — keep as TENSORS for gradient flow
+        # alpha stays as tensor → read_gate gets gradient through neuromod blending
+        # neuromod values stay as tensors → read_to_neuromod gets gradient
+        alpha_abs = alpha.abs()
+        if alpha_abs.item() > 1e-4 and hasattr(mach, '_eta_state'):
             neuromod_raw = self.read_to_neuromod(ep_content)
             nm = neuromod_raw.view(3, self.n_patches)
             mach._neuromod_bias = {
                 'eta': nm[0].clamp(0.1, 1.0),
                 'decay': nm[1].clamp(0.1, 1.0),
                 'expl': nm[2].clamp(0.1, 0.5),
-                'alpha': alpha_f,
+                'alpha': alpha_abs,  # tensor, not float — gradient flows to read_gate
             }
 
-        self._last_alpha = abs(alpha_f)
+        self._last_alpha = alpha_abs.item()
         return self._last_alpha
 
     def store(self, mach, activation_summary, reward, td_error, global_step=None):
