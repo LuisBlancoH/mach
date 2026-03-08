@@ -1613,7 +1613,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             # Store current state (strength = |td_error|, no threshold)
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
-            hippocampus.store(mach, act_summary, reward, mach._last_td_error)
+            hippocampus.store(mach, act_summary, reward, mach._last_td_error,
+                              global_step=step)
 
         # Critic loss: TD target for previous step's value prediction
         # V(s_{t-1}) should equal r_{t-1} + γ·V(s_t)

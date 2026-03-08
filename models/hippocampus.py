@@ -6,18 +6,19 @@ VQ Codebook (thalamus/basal ganglia):
   Each prototype learns to represent one "mode" of operation.
 
 Per-slot episodic buffer (hippocampus proper):
-  Each slot has a ring buffer of the last 8 specific experiences.
-  Stores raw (PFC, neuromod, reward) snapshots — real episodic memory.
-  On retrieval: within the matched slot, find the episode with the
-  most similar PFC state (argmax over 8).
+  Each slot has a buffer of 8 experiences with TD-aware eviction.
+  Stores raw (PFC, neuromod, TD error, timestamp) snapshots.
+  On retrieval: learned scorer combines similarity, salience, recency.
 
 This mirrors the brain:
   - Prefrontal/thalamic context gates hippocampal retrieval
   - Hippocampus stores specific episodes, not averages
+  - Dopamine (TD error) modulates memory salience
+  - Surprising memories persist, mundane ones get overwritten
+  - Temporal context: recency signal via timestamps
   - Cortex does the slow learning (Hebbian patches handle this)
-  - No EMA — that's what the patches are for
 
-No hardcoded thresholds. No storage gates. No similarity thresholds.
+No hardcoded thresholds. Retrieval priority is learned, not formula'd.
 
 Interface is kept compatible with training/eval loops.
 """
@@ -82,8 +83,29 @@ class Hippocampus(nn.Module):
         # Per-episode TD error (surprise/salience signal)
         self.register_buffer('ep_td_errors',
             torch.zeros(self.n_slots, self.episodes_per_slot))
+        # Per-episode timestamp (global step when stored)
+        self.register_buffer('ep_timestamps',
+            torch.zeros(self.n_slots, self.episodes_per_slot))
+        self._global_step = 0
 
         # === Read head ===
+
+        # Episode scorer: learns how to combine similarity, salience, recency
+        # Input: [pfc_similarity, |td_error|, normalized_recency]
+        # Output: scalar relevance score per episode
+        self.episode_scorer = nn.Sequential(
+            nn.Linear(3, 8),
+            nn.ReLU(),
+            nn.Linear(8, 1),
+        )
+        # Init: default to similarity × salience (ignore recency until learned)
+        with torch.no_grad():
+            nn.init.zeros_(self.episode_scorer[0].weight)
+            self.episode_scorer[0].weight[0, 0] = 1.0  # sim
+            self.episode_scorer[0].weight[1, 1] = 1.0  # |td|
+            nn.init.zeros_(self.episode_scorer[0].bias)
+            nn.init.ones_(self.episode_scorer[2].weight)
+            nn.init.zeros_(self.episode_scorer[2].bias)
 
         # Read gate: approach/avoidance
         # Input: match_similarity + current_td_error + episode_td_error
@@ -147,8 +169,8 @@ class Hippocampus(nn.Module):
     def _best_episode(self, slot_idx, pfc_state, device):
         """Find most relevant episode within a slot.
 
-        Relevance = PFC similarity × |TD error| (salience).
-        Similar state + surprising outcome = most informative memory.
+        Learned scorer combines [similarity, |TD error|, recency].
+        Network decides how to weight these — no hardcoded formula.
         Returns (episode_content, episode_td_error, episode_index).
         """
         n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
@@ -163,9 +185,23 @@ class Hippocampus(nn.Module):
         stored_norm = F.normalize(stored_pfcs, dim=-1)
         sims = (stored_norm @ pfc_norm.squeeze(0))  # (n_eps,)
 
-        # Weight similarity by salience (|TD error|)
         td_errors = self.ep_td_errors[slot_idx, :n_eps]
-        relevance = sims * td_errors.abs().clamp(min=1e-6)
+
+        # Compute recency: how recently each episode was stored
+        # Normalized to [0, 1] where 1 = most recent
+        timestamps = self.ep_timestamps[slot_idx, :n_eps]
+        ages = self._global_step - timestamps
+        max_age = ages.max().clamp(min=1.0)
+        recency = 1.0 - (ages / max_age)  # (n_eps,) in [0, 1]
+
+        # Learned scoring: network decides how to combine signals
+        scorer_input = torch.stack([
+            sims,                           # PFC similarity
+            td_errors.abs().clamp(min=1e-6), # salience
+            recency,                         # temporal recency
+        ], dim=-1)  # (n_eps, 3)
+
+        relevance = self.episode_scorer(scorer_input).squeeze(-1)  # (n_eps,)
 
         best_idx = relevance.argmax().item()
         ep_td = td_errors[best_idx].item()
@@ -227,7 +263,7 @@ class Hippocampus(nn.Module):
 
         return abs(alpha_f)
 
-    def store(self, mach, activation_summary, reward, td_error):
+    def store(self, mach, activation_summary, reward, td_error, global_step=None):
         """VQ match → store episode in matched slot.
 
         Eviction: overwrite least-salient (lowest |TD error|) episode.
@@ -236,6 +272,9 @@ class Hippocampus(nn.Module):
         device = activation_summary.device
         if self.episodes.device != device:
             self.to(device)
+
+        if global_step is not None:
+            self._global_step = global_step
 
         with torch.no_grad():
             pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
@@ -267,6 +306,7 @@ class Hippocampus(nn.Module):
 
             self.episodes[slot_idx, write_idx] = value
             self.ep_td_errors[slot_idx, write_idx] = td_error
+            self.ep_timestamps[slot_idx, write_idx] = self._global_step
             self.ep_count[slot_idx] += 1
 
         return True
@@ -294,6 +334,8 @@ class Hippocampus(nn.Module):
             'ep_head': self.ep_head.cpu(),
             'ep_count': self.ep_count.cpu(),
             'ep_td_errors': self.ep_td_errors.cpu(),
+            'ep_timestamps': self.ep_timestamps.cpu(),
+            'global_step': self._global_step,
         }, path)
 
     def _load(self, path):
@@ -308,6 +350,10 @@ class Hippocampus(nn.Module):
                 self.ep_td_errors.copy_(data['ep_td_errors'])
             elif 'ep_rewards' in data:
                 self.ep_td_errors.copy_(data['ep_rewards'])  # legacy compat
+            if 'ep_timestamps' in data:
+                self.ep_timestamps.copy_(data['ep_timestamps'])
+            if 'global_step' in data:
+                self._global_step = data['global_step']
 
     def __len__(self):
         """Number of slots with at least one episode."""
