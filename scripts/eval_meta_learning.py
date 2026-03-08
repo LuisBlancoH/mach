@@ -258,6 +258,8 @@ def main():
                         help="Quick smoke test: 25 steps, 1 op per category")
     parser.add_argument("--memory-path", type=str, default=None,
                         help="Path to hippocampal memory file (adds +hippocampus eval modes)")
+    parser.add_argument("--sleep-cycles", type=int, default=0,
+                        help="Run N sleep cycles (NREM+REM) before eval to measure consolidation effect")
     args = parser.parse_args()
 
     if args.quick:
@@ -323,6 +325,11 @@ def main():
             ("FULL + HIPPOCAMPUS", "full", True),
             ("REWARD ONLY + HIPPOCAMPUS", "reward_only", True),
         ])
+    if args.sleep_cycles > 0 and args.memory_path:
+        modes.extend([
+            (f"FULL + HIPP + SLEEP ({args.sleep_cycles} cycles)", "full", True),
+            (f"REWARD ONLY + HIPP + SLEEP ({args.sleep_cycles} cycles)", "reward_only", True),
+        ])
 
     for mode_name, mode_key, use_hipp in modes:
         print("\n" + "=" * 80)
@@ -353,6 +360,22 @@ def main():
                     key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
                     save_path=args.memory_path,
                 ).to(config.DEVICE)
+
+            # Pre-eval sleep: run NREM+REM cycles to consolidate before testing
+            if "SLEEP" in mode_name and hipp is not None and len(hipp) > 0:
+                total_nrem = 0
+                total_rem = 0
+                rem_rewards = []
+                for cycle in range(args.sleep_cycles):
+                    n_nrem = hipp.replay_nrem(mach, n_replays=4, device=config.DEVICE)
+                    total_nrem += n_nrem
+                    dreams = hipp.replay_rem(
+                        mach, patched_model, tokenizer, n_dreams=2, device=config.DEVICE
+                    )
+                    total_rem += len(dreams)
+                    rem_rewards.extend(r for _, r, _ in dreams)
+                rem_avg = sum(rem_rewards) / len(rem_rewards) if rem_rewards else 0
+                print(f"    Sleep: {total_nrem} NREM replays, {total_rem} REM dreams (avg_r={rem_avg:.3f})")
 
             results = run_adaptation_test(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,

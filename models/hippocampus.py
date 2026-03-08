@@ -484,18 +484,21 @@ class Hippocampus(nn.Module):
         """REM replay (dreaming): run Qwen forward with replayed context.
 
         Like REM sleep — full generative replay:
-        1. Sample salient episodes
+        1. Sample salient episodes (prioritized by |TD error|)
         2. Reinstate PFC + neuromod from episode
         3. Generate a novel arithmetic prompt (dream content)
-        4. Run full Qwen forward → patches fire → normal Hebbian update
+        4. Run full Qwen forward → patches capture activations → Hebbian update
 
-        Not wired into training loop — call manually for experimentation.
-        Returns list of (prompt, replay_td_error, dream_op) for each dream.
+        Unlike NREM (which uses stored compressed activations), REM runs the
+        full forward pass — this lets the system discover new activation patterns
+        and generalize across operations.
+
+        Returns list of (dream_op, reward, td_error) for each dream.
         """
         if device is None:
             device = self.episodes.device
 
-        from data.arithmetic import generate_few_shot_episode
+        from data.arithmetic import generate_few_shot_episode, extract_number
 
         valid_indices = torch.where(self.ep_valid)[0]
         if len(valid_indices) == 0:
@@ -508,37 +511,55 @@ class Hippocampus(nn.Module):
         sampled = torch.multinomial(probs, n_dreams, replacement=False)
 
         dreams = []
-        for s in sampled:
-            idx = valid_indices[s].item()
-            ep_content = self.episodes[idx]
-            ep_td = self.ep_td_errors[idx].item()
+        with torch.no_grad():
+            for s in sampled:
+                idx = valid_indices[s].item()
+                ep_content = self.episodes[idx]
+                ep_td = self.ep_td_errors[idx].item()
 
-            # Reinstate PFC + neuromod
-            pfc_stored = ep_content[:self.pfc_dim]
-            if hasattr(mach, '_pfc_state'):
-                mach._pfc_state = pfc_stored.unsqueeze(0).clone()
+                # Reinstate PFC + neuromod from episode
+                pfc_stored = ep_content[:self.pfc_dim]
+                if hasattr(mach, '_pfc_state'):
+                    mach._pfc_state = pfc_stored.unsqueeze(0).clone()
 
-            neuromod_stored = ep_content[self.pfc_dim:]
-            if hasattr(mach, '_neuromod_bias') and neuromod_stored.shape[0] >= self.n_patches * 3:
-                mach._neuromod_bias = {
-                    'eta': neuromod_stored[:self.n_patches].clamp(0.1, 1.0),
-                    'decay': neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0),
-                    'expl': neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5),
-                    'alpha': 0.5,
-                }
+                neuromod_stored = ep_content[self.pfc_dim:]
+                if hasattr(mach, '_neuromod_bias') and neuromod_stored.shape[0] >= self.n_patches * 3:
+                    mach._neuromod_bias = {
+                        'eta': neuromod_stored[:self.n_patches].clamp(0.1, 1.0),
+                        'decay': neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0),
+                        'expl': neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5),
+                        'alpha': torch.tensor(0.5, device=device),
+                    }
 
-            # Generate a novel prompt (dream content)
-            import random
-            ops = ['add', 'sub', 'mul', 'div', 'mod', 'gcd', 'abs_diff']
-            dream_op = random.choice(ops)
-            problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
-            prompt = problems[0]['text']
+                # Generate a novel prompt (dream content)
+                import random
+                ops = ['add', 'sub', 'mul', 'div', 'mod', 'gcd', 'abs_diff']
+                dream_op = random.choice(ops)
+                problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
+                prompt = problems[0]['text']
+                answer = problems[0]['answer']
 
-            inputs = tokenizer(prompt, return_tensors='pt').to(device)
-            with torch.no_grad():
+                # Forward pass — hooks capture pre/post activations
+                inputs = tokenizer(prompt, return_tensors='pt').to(device)
                 outputs = patched_model(**inputs)
 
-            dreams.append((prompt, ep_td, dream_op))
+                # Score the dream: did patches help produce the right answer?
+                logits = outputs.logits[0, -1]
+                predicted_token = tokenizer.decode(logits.argmax(-1).item()).strip()
+                predicted = extract_number(predicted_token)
+                from training.two_channel_train import graded_reward
+                reward = graded_reward(predicted, answer)
+
+                # Hebbian update from dream experience
+                # This drives plasticity using the LIVE activations from forward pass
+                # (not stored compressed ones like NREM)
+                if hasattr(mach, 'compute_context_gates'):
+                    mach.compute_context_gates()
+                mach.hebbian_step(
+                    reward=reward, step_idx=0, n_steps=1, device=device
+                )
+
+                dreams.append((dream_op, reward, ep_td))
 
         return dreams
 

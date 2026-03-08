@@ -1503,15 +1503,26 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     import time
     step_timer = time.time()
 
+    # Sleep cycle counters
+    sleep_nrem_total = 0
+    sleep_rem_total = 0
+    sleep_rem_rewards = []
+
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
         op_step_count += 1
         if op_step_count >= op_switch_interval:
-            # NREM replay: consolidate memories between task switches
-            # Like sleeping between days — replay salient episodes to drive
-            # Hebbian learning from stored activations
+            # Sleep between tasks — like sleeping between days
             if hippocampus is not None and len(hippocampus) > 0:
-                n_replayed = hippocampus.replay_nrem(mach, n_replays=4, device=device)
+                # NREM: replay compressed activations → Hebbian updates (sharp-wave ripples)
+                n_nrem = hippocampus.replay_nrem(mach, n_replays=4, device=device)
+                sleep_nrem_total += n_nrem
+                # REM: full Qwen forward with novel prompts → discover new patterns (dreaming)
+                rem_dreams = hippocampus.replay_rem(
+                    mach, patched_model, tokenizer, n_dreams=2, device=device
+                )
+                sleep_rem_total += len(rem_dreams)
+                sleep_rem_rewards.extend(r for _, r, _ in rem_dreams)
 
             current_op = random.choice(DIVERSE_TRAIN_OPS)
             op_step_count = 0
@@ -1789,6 +1800,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     print(f"    {comp}: avg={avg:.6f} max={mx:.6f} ({len(norms)} samples)")
                 _grad_accum.clear()
             _log_hebbian_diagnostics(mach, meta_params, step, hippocampus=hippocampus)
+            # Sleep cycle stats
+            if sleep_nrem_total > 0 or sleep_rem_total > 0:
+                rem_avg_r = sum(sleep_rem_rewards) / len(sleep_rem_rewards) if sleep_rem_rewards else 0
+                print(f"  Sleep cycles: NREM={sleep_nrem_total} replays, REM={sleep_rem_total} dreams (avg_r={rem_avg_r:.3f})")
+                sleep_nrem_total = 0
+                sleep_rem_total = 0
+                sleep_rem_rewards = []
 
             # Quick validation — save/restore continuous state
             print(f"  --- Operation validation (step {step}) ---")
