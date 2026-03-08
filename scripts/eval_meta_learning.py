@@ -148,7 +148,7 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
             hippocampus.reconsolidate(td_error)
             act_summary = mach.get_activation_summary()
             act_summary = act_summary / (act_summary.norm() + 1e-8)
-            hippocampus.store(mach, act_summary, reward, td_error)
+            hippocampus.store(mach, act_summary, reward, td_error, global_step=step)
 
         results.append((step, int(correct), reward, td_error))
 
