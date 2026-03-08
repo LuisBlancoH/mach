@@ -1728,7 +1728,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             hipp_str = ""
             if hippocampus is not None:
                 slot = hippocampus._last_slot if hasattr(hippocampus, '_last_slot') else -1
-                hipp_str = f" | hipp: s{slot} α={hipp_alpha:.3f}"
+                ep_idx = hippocampus._last_ep_idx if hasattr(hippocampus, '_last_ep_idx') else -1
+                hipp_str = f" | hipp: s{slot}/e{ep_idx} α={hipp_alpha:.3f}"
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
@@ -1804,8 +1805,9 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 hippocampus.save()
                 wc = hippocampus.write_count
                 active = (wc > 0).sum().item()
+                n_eps = hippocampus.total_episodes()
                 top_slots = wc.topk(min(5, len(wc))).values.tolist()
-                print(f"  Hippocampus: {active}/{hippocampus.n_slots} active slots, "
+                print(f"  Hippocampus: {active}/{hippocampus.n_slots} slots, {n_eps} episodes, "
                       f"top writes={[f'{w:.0f}' for w in top_slots]}")
 
 
