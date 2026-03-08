@@ -434,6 +434,20 @@ def main():
             ablate_hebbian(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,
             )
+        elif args.continuous:
+            from training.two_channel_train import meta_train_continuous
+            meta_train_continuous(
+                base_model, mach, patched_model, tokenizer, config.DEVICE,
+                n_steps=args.n_steps, lr=args.lr,
+                truncation_window=args.truncation_window,
+                checkpoint_path=args.checkpoint,
+                save_path=save_path,
+                curriculum=curriculum,
+                context_size=args.context_size,
+                thinking_tokens=args.thinking_tokens,
+                memory_path=args.memory_path,
+                dense_only=args.dense_only,
+            )
         else:
             meta_train_hebbian(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,
