@@ -43,16 +43,23 @@ class Hippocampus(nn.Module):
         self.register_buffer('memory', torch.zeros(self.n_slots, self.d_mem))
         self.register_buffer('usage', torch.zeros(self.n_slots))  # how used each slot is
 
-        # --- Key projection: activation_summary + PFC → key space ---
+        # --- Key projection with pattern separation (Dentate Gyrus) ---
+        # Two-layer ReLU: sparse activation orthogonalizes similar inputs
+        # This IS the DG — similar add/sub/mul get distinct sparse codes
         input_dim = key_dim + pfc_dim
-        self.key_proj = nn.Linear(input_dim, key_dim)
-        # Init near-identity for activation part, near-zero for PFC part
+        self.key_proj = nn.Sequential(
+            nn.Linear(input_dim, key_dim * 2),
+            nn.ReLU(),  # sparsity = pattern separation
+            nn.Linear(key_dim * 2, key_dim),
+        )
+        # Init: activation part near-identity, PFC part near-zero
         with torch.no_grad():
-            nn.init.zeros_(self.key_proj.weight)
-            self.key_proj.weight[:key_dim, :key_dim].copy_(
-                torch.eye(key_dim) * 0.1
-            )
-            nn.init.zeros_(self.key_proj.bias)
+            nn.init.zeros_(self.key_proj[0].weight)
+            self.key_proj[0].weight[:key_dim, :key_dim].copy_(torch.eye(key_dim))
+            nn.init.zeros_(self.key_proj[0].bias)
+            nn.init.eye_(self.key_proj[2].weight[:, :key_dim])
+            nn.init.zeros_(self.key_proj[2].weight[:, key_dim:])
+            nn.init.zeros_(self.key_proj[2].bias)
 
         # --- Stored keys (buffer, written alongside memory) ---
         self.register_buffer('keys', torch.zeros(self.n_slots, key_dim))
@@ -249,6 +256,12 @@ class Hippocampus(nn.Module):
         gates = self.write_gate(gate_input)
         write_strength = torch.sigmoid(gates[0])   # [0, 1]
         erase_strength = torch.sigmoid(gates[1])    # [0, 1]
+
+        # Inductive bias: surprise amplifies writes
+        # Not a threshold — just "surprising events write harder"
+        # Like amygdala modulation of hippocampal encoding
+        salience = abs(td_error)
+        write_strength = write_strength * salience
 
         # Erase then write (DNC-style)
         erase = write_attn.unsqueeze(1) * erase_strength    # (n_slots, 1)
