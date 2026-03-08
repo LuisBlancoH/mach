@@ -85,24 +85,6 @@ class Hippocampus(nn.Module):
         with torch.no_grad():
             self.reinstatement_gate[-2].bias.fill_(0.3)
 
-        # Learned merge gate: decides if two keys are "same memory" (CA3)
-        # Input: cosine similarity between keys
-        # Output: Sigmoid → merge probability
-        # Replaces hardcoded duplicate threshold
-        self.merge_gate = nn.Sequential(
-            nn.Linear(1, 4),
-            nn.Tanh(),
-            nn.Linear(4, 1),
-            nn.Sigmoid(),
-        )
-        # Init: merge when sim > ~0.9 (sigmoid crosses 0.5 at input ≈ 0.9)
-        # Arithmetic ops have similar activations — need high bar to keep distinct
-        with torch.no_grad():
-            self.merge_gate[0].weight.fill_(10.0)  # sharpen
-            self.merge_gate[0].bias.fill_(-9.0)     # shift to cross at ~0.9
-            self.merge_gate[2].weight.fill_(1.0)
-            self.merge_gate[2].bias.fill_(0.0)
-
         # Learned strength ceiling — replaces hardcoded 10.0
         # Log-space so it's always positive; init at ln(10) ≈ 2.3
         self.log_strength_ceiling = nn.Parameter(torch.tensor(2.302585))
@@ -167,8 +149,9 @@ class Hippocampus(nn.Module):
     def store(self, mach, activation_summary, reward, td_error):
         """Encode current state into memory. Strength proportional to surprise.
 
-        No threshold — everything gets stored. Weak memories decay away.
-        Near-duplicates reinforce existing memory instead of duplicating.
+        No threshold — everything gets stored. Weak memories decay away naturally.
+        The hippocampus stores everything; consolidation (decay + eviction) handles
+        cleanup. This is brain-faithful: hippocampus doesn't filter, it encodes.
         """
         strength = abs(td_error)  # initial strength = how surprising
         if strength < 1e-6:
@@ -178,25 +161,6 @@ class Hippocampus(nn.Module):
             pfc = mach._pfc_state.detach() if hasattr(mach, '_pfc_state') else None
             key = self.encode_key(activation_summary, pfc)
             key_np = key.cpu().numpy().astype(np.float32)
-
-        # Near-duplicate check (CA3 — don't store what you already know)
-        # Learned merge gate replaces hardcoded threshold
-        if self._keys:
-            sims = self._cosine_similarities(key_np)
-            best_idx = int(sims.argmax())
-            best_sim = float(sims[best_idx])
-            # Merge gate: learned decision boundary for "same memory"
-            with torch.no_grad():
-                device = next(self.merge_gate.parameters()).device
-                merge_prob = self.merge_gate(
-                    torch.tensor([best_sim], dtype=torch.float32, device=device)
-                ).item()
-            if merge_prob > 0.5:
-                # Reinforce existing memory with saturation
-                ceil = self.strength_ceiling
-                headroom = max(0.0, ceil - self._strengths[best_idx]) / ceil
-                self._strengths[best_idx] += strength * headroom
-                return False
 
         # Extract compressed state
         pfc = mach._pfc_state.detach().squeeze(0).cpu().numpy().astype(np.float32)
