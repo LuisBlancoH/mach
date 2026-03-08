@@ -536,7 +536,7 @@ class Hippocampus(nn.Module):
                 ops = ['add', 'sub', 'mul', 'div', 'mod', 'gcd', 'abs_diff']
                 dream_op = random.choice(ops)
                 problems = generate_few_shot_episode(1, n_demos=0, op_type=dream_op)
-                prompt = problems[0]['text']
+                prompt = problems[0]['prompt']
                 answer = problems[0]['answer']
 
                 # Forward pass — hooks capture pre/post activations
