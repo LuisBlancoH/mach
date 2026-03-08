@@ -1137,7 +1137,7 @@ def run_episode_hebbian(base_model, mach, patched_model, tokenizer,
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
-        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else getattr(mach, 'gamma', 0.95)
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
         if hasattr(mach, '_nuclei_loss'):
             nuclei_losses.append(mach._nuclei_loss)
@@ -1235,7 +1235,7 @@ def run_episode_hebbian_cot(base_model, mach, patched_model, tokenizer,
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             critic_losses.append(critic_loss)
         mach._prev_critic_value = value
-        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else getattr(mach, 'gamma', 0.95)
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
         if hasattr(mach, '_nuclei_loss'):
             nuclei_losses.append(mach._nuclei_loss)
@@ -1631,7 +1631,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             critic_loss = (mach._prev_critic_value - td_target) ** 2
             window_critic_losses.append(critic_loss)
         mach._prev_critic_value = value
-        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else mach.gamma
+        mach._prev_gamma = mach._current_gamma.detach() if hasattr(mach, '_current_gamma') else getattr(mach, 'gamma', 0.95)
         mach._prev_reward = torch.tensor(reward, device=device, dtype=torch.float32)
 
         # Nuclei loss: direct RPE signal to neuromodulatory nuclei
