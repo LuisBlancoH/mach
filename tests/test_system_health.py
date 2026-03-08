@@ -284,16 +284,35 @@ def test_critic_value_changes():
 
 
 def test_reward_only_mode():
-    """Inference mode: no CE loss, only critic+nuclei. Components still adapt."""
+    """Inference mode: no CE loss, only critic+nuclei+hippocampus. Components still adapt."""
     mach = make_mach()
 
-    # Simulate 5 steps of reward-only mode
+    # Create hippocampus
+    key_dim = mach.n_patches * mach.hebb_rule.d_proj
+    d_proj = mach.hebb_rule.d_proj
+    hipp = Hippocampus(key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
+                       d_proj=d_proj)
+
+    # Simulate 5 steps of reward-only mode with hippocampus
     initial_patches = [p.delta_down.clone() for p in mach.patches]
     values = []
+    hipp_losses = []
     for step in range(5):
         simulate_forward_pass(mach)
+        mach.compute_context_gates()
         value, _ = mach.hebbian_step(reward=1.0, step_idx=step, n_steps=5, device='cpu')
         values.append(value.detach())
+
+        # Hippocampus store + retrieve
+        act_summary = mach.get_activation_summary()
+        act_summary = act_summary / (act_summary.norm() + 1e-8)
+        td_error = float(step + 1) * 0.1
+        hipp.store(mach, act_summary, reward=1.0, td_error=td_error, global_step=step)
+        if step > 0:
+            hipp.retrieve_and_reinstate(mach, act_summary, current_td_error=td_error)
+            hipp_local = hipp.compute_local_loss(td_error)
+            if hipp_local.abs().item() > 0:
+                hipp_losses.append(hipp_local)
 
     # Patches should have changed (Hebbian writes happen regardless of loss)
     patches_changed = any(
@@ -301,10 +320,20 @@ def test_reward_only_mode():
         for i, p in enumerate(mach.patches)
     )
 
-    # Build reward-only loss (critic + nuclei, no CE)
+    # Build reward-only loss (critic + nuclei + hippocampus local, no CE)
     mach.zero_grad()
+    hipp.zero_grad()
     simulate_forward_pass(mach)
+    mach.compute_context_gates()
     value, _ = mach.hebbian_step(reward=-1.0, step_idx=5, n_steps=6, device='cpu')
+
+    # Hippocampus retrieve + local loss for final step
+    act_summary = mach.get_activation_summary()
+    act_summary = act_summary / (act_summary.norm() + 1e-8)
+    hipp.retrieve_and_reinstate(mach, act_summary, current_td_error=-0.5)
+    hipp_local = hipp.compute_local_loss(-0.5)
+    if hipp_local.abs().item() > 0:
+        hipp_losses.append(hipp_local)
 
     # TD critic loss
     if len(values) > 0:
@@ -314,20 +343,40 @@ def test_reward_only_mode():
         # Nuclei RPE loss
         nuclei_loss = mach._nuclei_loss if hasattr(mach, '_nuclei_loss') else torch.tensor(0.0)
         total_loss = critic_loss + 0.1 * nuclei_loss
+
+        # Hippocampus local REINFORCE loss
+        if hipp_losses:
+            avg_hipp = torch.stack(hipp_losses).mean()
+            total_loss = total_loss + 0.05 * avg_hipp
+
         total_loss.backward()
 
-        # Check which components got gradient
+        # Check which MACH components got gradient
         grad_components = set()
         for name, p in mach.named_parameters():
             if p.grad is not None and p.grad.abs().sum() > 0:
                 grad_components.add(name.split('.')[0])
 
+        # Check which hippocampus components got gradient
+        hipp_grad_components = set()
+        hipp_no_grad = []
+        for name, p in hipp.named_parameters():
+            comp = name.split('.')[0]
+            if p.grad is not None and p.grad.abs().sum() > 0:
+                hipp_grad_components.add(comp)
+            else:
+                hipp_no_grad.append(name)
+
         print(f"  Patches changed: {patches_changed}")
-        print(f"  Components with gradient (reward-only): {sorted(grad_components)}")
+        print(f"  MACH components with gradient (reward-only): {sorted(grad_components)}")
+        print(f"  Hipp components with gradient (reward-only): {sorted(hipp_grad_components)}")
+        if hipp_no_grad:
+            print(f"  Hipp NO gradient: {hipp_no_grad}")
 
         assert patches_changed, "FAIL: patches not written in reward-only mode"
         assert 'critic_gru' in grad_components, "FAIL: critic has no gradient in reward-only"
-        print("  PASS: reward-only mode works correctly")
+        assert 'key_proj' in hipp_grad_components, "FAIL: hippocampus key_proj has no gradient in reward-only"
+        print("  PASS: reward-only mode works correctly (including hippocampus)")
     else:
         print("  SKIP: no values accumulated")
 
