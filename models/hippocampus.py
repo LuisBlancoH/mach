@@ -262,9 +262,11 @@ class Hippocampus(nn.Module):
         alpha = self.read_gate(gate_input).squeeze()
 
         # Reinstate PFC from episode
+        # Detach old PFC: gradient flows through alpha and pfc_delta (learned),
+        # not through the prior PFC chain (which has its own gradient path via GRU)
         pfc_delta = self.read_to_pfc(ep_content)
         if pfc is not None:
-            mach._pfc_state = mach._pfc_state + alpha * pfc_delta.unsqueeze(0)
+            mach._pfc_state = mach._pfc_state.detach() + alpha * pfc_delta.unsqueeze(0)
 
         # Neuromod bias from episode
         alpha_f = alpha.item()
@@ -367,66 +369,64 @@ class Hippocampus(nn.Module):
         if len(valid_indices) == 0:
             return 0
 
-        # Prioritized sampling: probability ∝ |TD error|
-        td_abs = self.ep_td_errors[valid_indices].abs().clamp(min=1e-6)
-        probs = td_abs / td_abs.sum()
+        # Replay is offline consolidation — no gradient needed
+        # Like sleep: the brain isn't learning from live experience during replay
+        with torch.no_grad():
+            # Prioritized sampling: probability ∝ |TD error|
+            td_abs = self.ep_td_errors[valid_indices].abs().clamp(min=1e-6)
+            probs = td_abs / td_abs.sum()
 
-        n_replays = min(n_replays, len(valid_indices))
-        sampled = torch.multinomial(probs, n_replays, replacement=False)
+            n_replays = min(n_replays, len(valid_indices))
+            sampled = torch.multinomial(probs, n_replays, replacement=False)
 
-        replayed = 0
-        for s in sampled:
-            idx = valid_indices[s].item()
-            ep_content = self.episodes[idx]
-            ep_td = self.ep_td_errors[idx].item()
-            ep_acts = self.ep_activations[idx]
+            replayed = 0
+            for s in sampled:
+                idx = valid_indices[s].item()
+                ep_content = self.episodes[idx]
+                ep_td = self.ep_td_errors[idx].item()
+                ep_acts = self.ep_activations[idx]
 
-            if ep_acts.abs().sum() < 1e-8:
-                continue
-
-            # Reinstate PFC state
-            pfc_stored = ep_content[:self.pfc_dim]
-            if hasattr(mach, '_pfc_state'):
-                mach._pfc_state = pfc_stored.unsqueeze(0).clone()
-
-            # Reinstate neuromod from episode
-            neuromod_stored = ep_content[self.pfc_dim:]
-            if hasattr(mach, '_last_etas') and neuromod_stored.shape[0] >= self.n_patches * 3:
-                etas = neuromod_stored[:self.n_patches].clamp(0.1, 1.0)
-                decays = neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0)
-                expls = neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5)
-            else:
-                etas = torch.full((self.n_patches,), 0.5, device=device)
-                decays = torch.full((self.n_patches,), 0.5, device=device)
-                expls = torch.full((self.n_patches,), 0.2, device=device)
-
-            td_error_t = torch.tensor(ep_td, device=device, dtype=torch.float32)
-
-            for patch_idx in range(self.n_patches):
-                if not hasattr(mach, 'hebb_rule'):
-                    break
-                offset = patch_idx * self.d_proj * 2
-                pre_c = ep_acts[offset:offset + self.d_proj]
-                post_c = ep_acts[offset + self.d_proj:offset + self.d_proj * 2]
-
-                if pre_c.abs().sum() < 1e-8:
+                if ep_acts.abs().sum() < 1e-8:
                     continue
 
-                delta_down, delta_up = mach.hebb_rule.replay_update(
-                    patch_idx, pre_c, post_c,
-                    td_error=td_error_t,
-                    eta=etas[patch_idx],
-                    decay=decays[patch_idx],
-                )
-                scale = (etas[patch_idx] * mach.gate_scale).clamp(0, 1.0)
-                mach.patches[patch_idx].accumulate_write(
-                    "down", scale * delta_down, decay=decays[patch_idx]
-                )
-                mach.patches[patch_idx].accumulate_write(
-                    "up", scale * delta_up, decay=decays[patch_idx]
-                )
+                # Reinstate neuromod from episode
+                neuromod_stored = ep_content[self.pfc_dim:]
+                if hasattr(mach, '_last_etas') and neuromod_stored.shape[0] >= self.n_patches * 3:
+                    etas = neuromod_stored[:self.n_patches].clamp(0.1, 1.0)
+                    decays = neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0)
+                    expls = neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5)
+                else:
+                    etas = torch.full((self.n_patches,), 0.5, device=device)
+                    decays = torch.full((self.n_patches,), 0.5, device=device)
+                    expls = torch.full((self.n_patches,), 0.2, device=device)
 
-            replayed += 1
+                td_error_t = torch.tensor(ep_td, device=device, dtype=torch.float32)
+
+                for patch_idx in range(self.n_patches):
+                    if not hasattr(mach, 'hebb_rule'):
+                        break
+                    offset = patch_idx * self.d_proj * 2
+                    pre_c = ep_acts[offset:offset + self.d_proj]
+                    post_c = ep_acts[offset + self.d_proj:offset + self.d_proj * 2]
+
+                    if pre_c.abs().sum() < 1e-8:
+                        continue
+
+                    delta_down, delta_up = mach.hebb_rule.replay_update(
+                        patch_idx, pre_c, post_c,
+                        td_error=td_error_t,
+                        eta=etas[patch_idx],
+                        decay=decays[patch_idx],
+                    )
+                    scale = (etas[patch_idx] * mach.gate_scale).clamp(0, 1.0)
+                    mach.patches[patch_idx].accumulate_write(
+                        "down", scale * delta_down, decay=decays[patch_idx]
+                    )
+                    mach.patches[patch_idx].accumulate_write(
+                        "up", scale * delta_up, decay=decays[patch_idx]
+                    )
+
+                replayed += 1
 
         return replayed
 
