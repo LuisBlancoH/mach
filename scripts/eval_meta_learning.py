@@ -36,7 +36,7 @@ from training.two_channel_train import graded_reward
 
 def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                         op_type, n_steps=200, mode="full", sparse_interval=1,
-                        lr=1e-4, hippocampus=None):
+                        lr=1e-4, hippocampus=None, thinking_tokens=0):
     """
     Run n_steps of a single operation and track accuracy over time.
 
@@ -46,6 +46,8 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
         "baseline" — no patches, no updates
         "sparse" — full system but reward only every sparse_interval steps
         "reward_only" — NO CE loss, only critic loss + Hebbian (simulates deployment)
+
+    thinking_tokens: if > 0, generate N tokens before answering (inner speech/CoT)
     """
     mach.reset_episode()
 
@@ -97,25 +99,58 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                 mach, act_summary, td_err, top_k=3, device=device
             )
 
-        if mode in ("full", "sparse"):
-            output = patched_model(input_ids=encoding.input_ids, labels=labels)
-            window_ce = window_ce + output.loss
-        elif mode == "reward_only":
-            # Forward pass WITH patches (so they affect output) but NO CE loss
-            # Gradient flows only through critic loss → machinery
-            output = patched_model(input_ids=encoding.input_ids, labels=labels)
-            # Don't add output.loss to window_ce — CE is not available at deployment
-        else:
+        if thinking_tokens > 0 and mode != "baseline":
+            # CoT: generate thinking tokens, then score answer
+            prompt_ids = encoding.input_ids[0, :prompt_len].unsqueeze(0)
             with torch.no_grad():
-                output = patched_model(input_ids=encoding.input_ids, labels=labels)
+                generated = prompt_ids
+                for _ in range(thinking_tokens):
+                    out = patched_model(input_ids=generated)
+                    next_token = out.logits[0, -1:].argmax(dim=-1, keepdim=True)
+                    generated = torch.cat([generated, next_token], dim=1)
+                    tok_text = tokenizer.decode(next_token[0], skip_special_tokens=False)
+                    if "=" in tok_text or "\n" in tok_text:
+                        break
 
-        with torch.no_grad():
-            logits = output.logits
-            pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
-            pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
-            predicted = extract_number(pred_text)
-            correct = (predicted == problem["answer"])
-            reward = graded_reward(predicted, problem["answer"])
+            answer_ids = tokenizer(problem["answer"], return_tensors="pt",
+                                   add_special_tokens=False).input_ids.to(device)
+            full_ids = torch.cat([generated, answer_ids], dim=1)
+            cot_labels = full_ids.clone()
+            cot_labels[0, :generated.shape[1]] = -100
+
+            if mode in ("full", "sparse"):
+                output = patched_model(input_ids=full_ids, labels=cot_labels)
+                window_ce = window_ce + output.loss
+            elif mode == "reward_only":
+                output = patched_model(input_ids=full_ids, labels=cot_labels)
+            else:
+                with torch.no_grad():
+                    output = patched_model(input_ids=full_ids, labels=cot_labels)
+
+            with torch.no_grad():
+                pred_tokens = output.logits[0, generated.shape[1] - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = graded_reward(predicted, problem["answer"])
+        else:
+            # Direct: no thinking
+            if mode in ("full", "sparse"):
+                output = patched_model(input_ids=encoding.input_ids, labels=labels)
+                window_ce = window_ce + output.loss
+            elif mode == "reward_only":
+                output = patched_model(input_ids=encoding.input_ids, labels=labels)
+            else:
+                with torch.no_grad():
+                    output = patched_model(input_ids=encoding.input_ids, labels=labels)
+
+            with torch.no_grad():
+                logits = output.logits
+                pred_tokens = logits[0, prompt_len - 1:-1].argmax(dim=-1)
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True).strip()
+                predicted = extract_number(pred_text)
+                correct = (predicted == problem["answer"])
+                reward = graded_reward(predicted, problem["answer"])
 
         # Sparse reward: only give feedback every N steps
         if mode == "sparse" and step % sparse_interval != 0:
@@ -260,6 +295,8 @@ def main():
                         help="Path to hippocampal memory file (adds +hippocampus eval modes)")
     parser.add_argument("--sleep-cycles", type=int, default=0,
                         help="Run N sleep cycles (NREM+REM) before eval to measure consolidation effect")
+    parser.add_argument("--thinking-tokens", type=int, default=0,
+                        help="CoT: generate N thinking tokens before answering (0=off)")
     args = parser.parse_args()
 
     if args.quick:
@@ -314,24 +351,37 @@ def main():
         del mach, patched_model
 
     # --- Test each mode ---
+    # (name, mode_key, use_hipp, thinking_tokens, sleep_type)
+    # sleep_type: None, "both", "nrem", "rem"
     modes = [
-        ("HEBBIAN ONLY (frozen meta-params)", "hebbian", False),
-        ("FULL SYSTEM (gradient + Hebbian)", "full", False),
-        ("REWARD ONLY (no CE — simulates deployment)", "reward_only", False),
-        (f"SPARSE REWARD (every {args.sparse_interval} steps)", "sparse", False),
+        ("HEBBIAN ONLY (frozen meta-params)", "hebbian", False, 0, None),
+        ("FULL SYSTEM (gradient + Hebbian)", "full", False, 0, None),
+        ("REWARD ONLY (no CE — simulates deployment)", "reward_only", False, 0, None),
+        (f"SPARSE REWARD (every {args.sparse_interval} steps)", "sparse", False, 0, None),
     ]
     if args.memory_path:
         modes.extend([
-            ("FULL + HIPPOCAMPUS", "full", True),
-            ("REWARD ONLY + HIPPOCAMPUS", "reward_only", True),
+            ("FULL + HIPPOCAMPUS", "full", True, 0, None),
+            ("REWARD ONLY + HIPPOCAMPUS", "reward_only", True, 0, None),
         ])
     if args.sleep_cycles > 0 and args.memory_path:
         modes.extend([
-            (f"FULL + HIPP + SLEEP ({args.sleep_cycles} cycles)", "full", True),
-            (f"REWARD ONLY + HIPP + SLEEP ({args.sleep_cycles} cycles)", "reward_only", True),
+            (f"FULL + HIPP + NREM ONLY ({args.sleep_cycles} cycles)", "full", True, 0, "nrem"),
+            (f"FULL + HIPP + REM ONLY ({args.sleep_cycles} cycles)", "full", True, 0, "rem"),
+            (f"FULL + HIPP + SLEEP ({args.sleep_cycles} cycles)", "full", True, 0, "both"),
+            (f"REWARD ONLY + HIPP + SLEEP ({args.sleep_cycles} cycles)", "reward_only", True, 0, "both"),
         ])
+    if args.thinking_tokens > 0:
+        modes.extend([
+            (f"FULL + CoT ({args.thinking_tokens} tokens)", "full", False, args.thinking_tokens, None),
+            (f"REWARD ONLY + CoT ({args.thinking_tokens} tokens)", "reward_only", False, args.thinking_tokens, None),
+        ])
+        if args.memory_path:
+            modes.extend([
+                (f"FULL + HIPP + CoT ({args.thinking_tokens} tokens)", "full", True, args.thinking_tokens, None),
+            ])
 
-    for mode_name, mode_key, use_hipp in modes:
+    for mode_name, mode_key, use_hipp, cot_tokens, sleep_type in modes:
         print("\n" + "=" * 80)
         print(mode_name)
         print("=" * 80)
@@ -361,8 +411,8 @@ def main():
                     save_path=args.memory_path,
                 ).to(config.DEVICE)
 
-            # Pre-eval sleep: run NREM+REM cycles to consolidate before testing
-            if "SLEEP" in mode_name and hipp is not None and len(hipp) > 0:
+            # Pre-eval sleep: run NREM and/or REM cycles to consolidate before testing
+            if sleep_type is not None and hipp is not None and len(hipp) > 0:
                 total_nrem = 0
                 total_rem = 0
                 rem_td_errors = []
@@ -373,15 +423,17 @@ def main():
                     for p in mach.patches
                 )
                 for cycle in range(args.sleep_cycles):
-                    n_nrem = hipp.replay_nrem(mach, n_replays=4, device=config.DEVICE)
-                    total_nrem += n_nrem
-                    dreams = hipp.replay_rem(
-                        mach, patched_model, tokenizer, n_dreams=2, device=config.DEVICE
-                    )
-                    total_rem += len(dreams)
-                    for d in dreams:
-                        rem_td_errors.append(d['td_error'])
-                        rem_critic_vals.append(d['critic_value'])
+                    if sleep_type in ("nrem", "both"):
+                        n_nrem = hipp.replay_nrem(mach, n_replays=4, device=config.DEVICE)
+                        total_nrem += n_nrem
+                    if sleep_type in ("rem", "both"):
+                        dreams = hipp.replay_rem(
+                            mach, patched_model, tokenizer, n_dreams=2, device=config.DEVICE
+                        )
+                        total_rem += len(dreams)
+                        for d in dreams:
+                            rem_td_errors.append(d['td_error'])
+                            rem_critic_vals.append(d['critic_value'])
                 post_norm = sum(
                     (p.delta_down.norm().item() if p.delta_down is not None else 0) +
                     (p.delta_up.norm().item() if p.delta_up is not None else 0)
@@ -389,15 +441,18 @@ def main():
                 )
                 rem_avg_td = sum(abs(t) for t in rem_td_errors) / len(rem_td_errors) if rem_td_errors else 0
                 rem_avg_val = sum(rem_critic_vals) / len(rem_critic_vals) if rem_critic_vals else 0
-                print(f"    Sleep: {total_nrem} NREM, {total_rem} REM | "
-                      f"avg_|td|={rem_avg_td:.4f} critic_val={rem_avg_val:.4f} "
-                      f"patch_Δ={post_norm - pre_norm:+.4f}")
+                parts = []
+                if total_nrem > 0:
+                    parts.append(f"NREM={total_nrem}")
+                if total_rem > 0:
+                    parts.append(f"REM={total_rem} avg_|td|={rem_avg_td:.4f} critic_val={rem_avg_val:.4f}")
+                print(f"    Sleep: {', '.join(parts)} | patch_Δ={post_norm - pre_norm:+.4f}")
 
             results = run_adaptation_test(
                 base_model, mach, patched_model, tokenizer, config.DEVICE,
                 op, n_steps=args.n_steps, mode=mode_key,
                 sparse_interval=args.sparse_interval, lr=args.lr,
-                hippocampus=hipp,
+                hippocampus=hipp, thinking_tokens=cot_tokens,
             )
 
             curve = compute_learning_curve(results, window=20)
