@@ -3421,11 +3421,11 @@ class AttentionPatch(nn.Module):
             self.d_model, self.hidden_dim, device=self.up_base.device
         )
 
-    def accumulate_write(self, weight_name, delta_W):
+    def accumulate_write(self, weight_name, delta_W, decay=1.0):
         if weight_name == "down":
-            self.delta_down = self.delta_down + delta_W
+            self.delta_down = decay * self.delta_down + delta_W
         else:
-            self.delta_up = self.delta_up + delta_W
+            self.delta_up = decay * self.delta_up + delta_W
 
     def forward(self, hidden_states):
         W_down = self.down_base + (self.delta_down if self.delta_down is not None else 0)
