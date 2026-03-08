@@ -45,6 +45,9 @@ def load_base_model():
         param.requires_grad = False
     model.gradient_checkpointing_enable()
 
+    # Performance: enable cuDNN autotuner for consistent speed
+    torch.backends.cudnn.benchmark = True
+
     d_model = model.config.hidden_size
     n_layers = model.config.num_hidden_layers
     print(f"  d_model={d_model}, n_layers={n_layers}")
