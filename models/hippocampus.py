@@ -79,13 +79,14 @@ class Hippocampus(nn.Module):
             torch.zeros(self.n_slots, dtype=torch.long))
         self.register_buffer('ep_count',
             torch.zeros(self.n_slots, dtype=torch.long))
-        self.register_buffer('ep_rewards',
+        # Per-episode TD error (surprise/salience signal)
+        self.register_buffer('ep_td_errors',
             torch.zeros(self.n_slots, self.episodes_per_slot))
 
         # === Read head ===
 
         # Read gate: approach/avoidance
-        # Input: match_similarity + td_error + reward_ema
+        # Input: match_similarity + current_td_error + episode_td_error
         # Output: [-1, 1]
         self.read_gate = nn.Sequential(
             nn.Linear(3, 16),
@@ -114,7 +115,6 @@ class Hippocampus(nn.Module):
             )
             nn.init.zeros_(self.read_to_neuromod.bias)
 
-        self._reward_ema = 0.0
         self._last_slot = -1
         self._last_ep_idx = -1
 
@@ -145,9 +145,11 @@ class Hippocampus(nn.Module):
         return sims.argmax().item(), sims, one_hot
 
     def _best_episode(self, slot_idx, pfc_state, device):
-        """Find most relevant episode within a slot by PFC similarity.
+        """Find most relevant episode within a slot.
 
-        Argmax over the buffer. Always returns something if buffer non-empty.
+        Relevance = PFC similarity × |TD error| (salience).
+        Similar state + surprising outcome = most informative memory.
+        Returns (episode_content, episode_td_error, episode_index).
         """
         n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
         if n_eps == 0:
@@ -161,8 +163,13 @@ class Hippocampus(nn.Module):
         stored_norm = F.normalize(stored_pfcs, dim=-1)
         sims = (stored_norm @ pfc_norm.squeeze(0))  # (n_eps,)
 
-        best_idx = sims.argmax().item()
-        return slot_eps[best_idx], sims[best_idx].item(), best_idx
+        # Weight similarity by salience (|TD error|)
+        td_errors = self.ep_td_errors[slot_idx, :n_eps]
+        relevance = sims * td_errors.abs().clamp(min=1e-6)
+
+        best_idx = relevance.argmax().item()
+        ep_td = td_errors[best_idx].item()
+        return slot_eps[best_idx], ep_td, best_idx
 
     def retrieve_and_reinstate(self, mach, activation_summary, current_td_error,
                                top_k=3, device=None):
@@ -183,18 +190,21 @@ class Hippocampus(nn.Module):
         self._last_slot = slot_idx
 
         # Episodic retrieval within matched slot
-        ep_content, ep_sim, ep_idx = self._best_episode(slot_idx, pfc, device)
+        ep_content, ep_td, ep_idx = self._best_episode(slot_idx, pfc, device)
         self._last_ep_idx = ep_idx
 
         if ep_content is None:
             return 0.0  # no episodes stored yet
 
         # Read gate: approach/avoidance
+        # Sees: prototype match quality + current surprise + episode's surprise
+        # Episode TD tells the gate whether this memory was from a surprising
+        # moment (positive or negative) — informs approach vs avoidance
         best_sim = sims[slot_idx]
         gate_input = torch.stack([
             best_sim,
             torch.tensor(abs(current_td_error), device=device, dtype=torch.float32),
-            torch.tensor(self._reward_ema, device=device, dtype=torch.float32),
+            torch.tensor(ep_td, device=device, dtype=torch.float32),
         ])
         alpha = self.read_gate(gate_input).squeeze()
 
@@ -218,15 +228,14 @@ class Hippocampus(nn.Module):
         return abs(alpha_f)
 
     def store(self, mach, activation_summary, reward, td_error):
-        """VQ match → append to matched slot's ring buffer.
+        """VQ match → store episode in matched slot.
 
-        Always stores. No threshold. Ring buffer handles capacity.
+        Eviction: overwrite least-salient (lowest |TD error|) episode.
+        Brain-like: surprising memories persist, mundane ones get overwritten.
         """
         device = activation_summary.device
         if self.episodes.device != device:
             self.to(device)
-
-        self._reward_ema = 0.99 * self._reward_ema + 0.01 * reward
 
         with torch.no_grad():
             pfc = mach._pfc_state if hasattr(mach, '_pfc_state') else None
@@ -245,11 +254,19 @@ class Hippocampus(nn.Module):
                 expls = mach._last_expls
             value = torch.cat([pfc_flat, etas, decays, expls])
 
-            # Append to ring buffer
-            head = self.ep_head[slot_idx].item()
-            self.episodes[slot_idx, head] = value
-            self.ep_rewards[slot_idx, head] = reward
-            self.ep_head[slot_idx] = (head + 1) % self.episodes_per_slot
+            # Eviction: if buffer not full, use next empty slot (ring buffer)
+            # If full, overwrite least-salient episode (lowest |TD error|)
+            n_eps = min(self.ep_count[slot_idx].item(), self.episodes_per_slot)
+            if n_eps < self.episodes_per_slot:
+                # Buffer not full — use ring buffer head
+                write_idx = self.ep_head[slot_idx].item()
+                self.ep_head[slot_idx] = (write_idx + 1) % self.episodes_per_slot
+            else:
+                # Buffer full — evict least surprising episode
+                write_idx = self.ep_td_errors[slot_idx].abs().argmin().item()
+
+            self.episodes[slot_idx, write_idx] = value
+            self.ep_td_errors[slot_idx, write_idx] = td_error
             self.ep_count[slot_idx] += 1
 
         return True
@@ -276,7 +293,7 @@ class Hippocampus(nn.Module):
             'episodes': self.episodes.cpu(),
             'ep_head': self.ep_head.cpu(),
             'ep_count': self.ep_count.cpu(),
-            'ep_rewards': self.ep_rewards.cpu(),
+            'ep_td_errors': self.ep_td_errors.cpu(),
         }, path)
 
     def _load(self, path):
@@ -287,7 +304,10 @@ class Hippocampus(nn.Module):
             self.episodes.copy_(data['episodes'])
             self.ep_head.copy_(data['ep_head'])
             self.ep_count.copy_(data['ep_count'])
-            self.ep_rewards.copy_(data['ep_rewards'])
+            if 'ep_td_errors' in data:
+                self.ep_td_errors.copy_(data['ep_td_errors'])
+            elif 'ep_rewards' in data:
+                self.ep_td_errors.copy_(data['ep_rewards'])  # legacy compat
 
     def __len__(self):
         """Number of slots with at least one episode."""
