@@ -469,15 +469,14 @@ class Hippocampus(nn.Module):
                         decay=decays[patch_idx],
                     )
                     scale = (etas[patch_idx] * mach.gate_scale).clamp(0, 1.0)
-                    # Gentle replay decay: sleep consolidates, not overwrites.
-                    # Training decay (0.5-0.9) compounds across 40 replays → erases patches.
-                    # Replay decay ≈ 1.0 means "add to existing" without shrinking.
-                    replay_decay = 0.99
+                    # No decay during replay — sleep adds consolidated memories
+                    # on top of existing patches without shrinking them.
+                    # (Training decay compounds across 40 replays → erases patches)
                     mach.patches[patch_idx].accumulate_write(
-                        "down", scale * delta_down, decay=replay_decay
+                        "down", scale * delta_down, decay=1.0
                     )
                     mach.patches[patch_idx].accumulate_write(
-                        "up", scale * delta_up, decay=replay_decay
+                        "up", scale * delta_up, decay=1.0
                     )
 
                 replayed += 1
