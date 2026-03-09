@@ -284,7 +284,7 @@ def compute_learning_curve(results, window=20):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--n-rank", type=int, default=config.HEBBIAN_N_RANK)
+    parser.add_argument("--n-rank", type=int, default=16)
     parser.add_argument("--held-out-ops", nargs="+", default=["mod", "max", "min"])
     parser.add_argument("--train-ops", nargs="+", default=["add", "div", "gcd"])
     parser.add_argument("--n-steps", type=int, default=200,
