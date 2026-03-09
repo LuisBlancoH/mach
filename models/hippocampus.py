@@ -140,8 +140,9 @@ class Hippocampus(nn.Module):
 
         self._last_ep_idx = -1
         self._last_alpha = 0.0
-        self._last_key = None       # stored for local loss (before detach)
-        self._last_best_sim = None  # similarity of retrieved episode
+        self._last_key = None           # stored for local loss (before detach)
+        self._last_best_sim = None      # similarity of retrieved episode
+        self._last_alpha_tensor = None  # stored for read_gate local loss
 
         if save_path and os.path.exists(save_path):
             self._load(save_path)
@@ -284,47 +285,49 @@ class Hippocampus(nn.Module):
             torch.tensor(ep_td, device=device, dtype=torch.float32),
         ])
         alpha = self.read_gate(gate_input).squeeze()
+        self._last_alpha_tensor = alpha  # Store for local REINFORCE loss
 
         # Reinstate PFC from episode
-        # Keep PFC connected — gradient flows through alpha and pfc_delta to read_gate.
-        # This is now the ONLY gradient path for read_gate (neuromod override removed).
-        # Separate hippocampus grad clipping prevents amplification through the PFC GRU chain.
+        # Detach alpha from PFC path — read_gate learns via local REINFORCE,
+        # not through cortical backprop (same principle as key_proj).
+        # Brain-faithful: BG dopamine modulates hippocampal gating locally.
         pfc_delta = self.read_to_pfc(ep_content)
         if pfc is not None:
-            mach._pfc_state = mach._pfc_state + alpha * pfc_delta.unsqueeze(0)
-
-        # No direct neuromod override — that's the nuclei's job.
-        # The reinstated PFC context flows into nuclei GRUs via the normal
-        # corticostriatal pathway (pfc_state → critic_proj → nuclei), so the
-        # nuclei learn to produce the right neuromod settings when they
-        # recognize a reinstated context. Brain-faithful: hippocampus
-        # reinstates context, basal ganglia evaluates it.
+            mach._pfc_state = mach._pfc_state.detach() + alpha.detach() * pfc_delta.unsqueeze(0)
 
         self._last_alpha = alpha.abs().item()
         return self._last_alpha
 
     def compute_local_loss(self, td_error):
-        """Local REINFORCE loss for key_proj (pattern separation).
+        """Local REINFORCE losses for key_proj and read_gate.
 
-        Brain-faithful: DG learns from local prediction error signals,
-        not from backprop through the cortical chain. When retrieval was
-        followed by positive surprise (td_error > 0), reinforce the key
-        mapping that found this memory. When negative, weaken it.
+        Brain-faithful: both learn from local dopaminergic signals (TD error),
+        not from backprop through the cortical chain.
 
-        loss = -td_error × similarity(key_proj(input), stored_key)
+        key_proj:   -td_error × similarity — reinforce keys that find helpful memories
+        read_gate:  -td_error × alpha — reinforce gating strength that led to good outcomes
 
-        This trains key_proj to map inputs to keys that retrieve helpful
-        memories. Only key_proj gets gradient (similarity uses _last_key
-        which was computed before detach).
+        Positive surprise → reinforce retrieval + gating
+        Negative surprise → weaken them
         """
-        if self._last_best_sim is None or self._last_key is None:
-            return torch.tensor(0.0)
-
-        # REINFORCE: reward good retrievals, punish bad ones
-        td = torch.tensor(td_error, dtype=torch.float32, device=self._last_best_sim.device) \
+        td = torch.tensor(td_error, dtype=torch.float32) \
             if not isinstance(td_error, torch.Tensor) else td_error.detach()
-        loss = -td * self._last_best_sim
-        return loss
+
+        losses = []
+
+        # key_proj local loss: reinforce good key mappings
+        if self._last_best_sim is not None and self._last_key is not None:
+            td = td.to(self._last_best_sim.device)
+            losses.append(-td * self._last_best_sim)
+
+        # read_gate local loss: reinforce good gating decisions
+        if hasattr(self, '_last_alpha_tensor') and self._last_alpha_tensor is not None:
+            td = td.to(self._last_alpha_tensor.device)
+            losses.append(-td * self._last_alpha_tensor)
+
+        if not losses:
+            return torch.tensor(0.0)
+        return torch.stack(losses).sum()
 
     def store(self, mach, activation_summary, reward, td_error, global_step=None):
         """Store episode in global buffer. Evict least relevant if full.
