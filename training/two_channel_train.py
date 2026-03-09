@@ -1436,7 +1436,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           truncation_window=20, checkpoint_path=None,
                           save_path=None, curriculum=None,
                           context_size=0, thinking_tokens=0,
-                          memory_path=None, dense_only=False):
+                          memory_path=None, dense_only=False,
+                          ce_anneal_start=0.7):
     """
     Continuous Hebbian training: no episodes, no resets.
 
@@ -1468,8 +1469,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     optimizer = torch.optim.Adam(meta_params, lr=lr)
 
     n_meta = sum(p.numel() for p in meta_params)
+    ce_anneal_step = int(n_steps * ce_anneal_start)
+    ce_anneal_end = n_steps  # CE reaches 0 at final step
     print(f"Continuous training: {n_meta:,} params, {n_steps} steps, "
-          f"truncation every {truncation_window}")
+          f"truncation every {truncation_window}, "
+          f"CE anneal: 1.0 until step {ce_anneal_step}, then → 0.0")
 
     # Initialize patches once — never reset
     mach.reset_episode()
@@ -1481,6 +1485,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     window_hipp_losses = []  # local REINFORCE losses for hippocampus key_proj
     # Gradient tracking: accumulate norms between checkpoints
     _grad_accum = {}  # component → list of norms
+    ce_weight = 1.0  # current CE weight (annealed over training)
     all_rewards = []
     current_op = random.choice(DIVERSE_TRAIN_OPS)
     op_step_count = 0
@@ -1691,8 +1696,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
         # Truncated backprop every N steps
         if (step + 1) % truncation_window == 0:
+            # CE annealing: full CE until ce_anneal_start, then linear decay to 0
+            if step < ce_anneal_step:
+                ce_weight = 1.0
+            else:
+                ce_weight = max(0.0, 1.0 - (step - ce_anneal_step) / (ce_anneal_end - ce_anneal_step))
             avg_critic = torch.stack(window_critic_losses).mean() if window_critic_losses else torch.tensor(0.0, device=device)
-            total_loss = window_ce + 0.5 * avg_critic
+            total_loss = ce_weight * window_ce + 0.5 * avg_critic
             # Nuclei auxiliary loss: direct RPE → nuclei (like VTA plasticity)
             if window_nuclei_losses:
                 avg_nuclei = torch.stack(window_nuclei_losses).mean()
@@ -1832,10 +1842,12 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
             if hippocampus is not None:
                 ep_idx = hippocampus._last_ep_idx if hasattr(hippocampus, '_last_ep_idx') else -1
                 hipp_str = f" | hipp: e{ep_idx}/{len(hippocampus)} α={hipp_alpha:.3f}"
+            ce_w = ce_weight if step >= ce_anneal_step else 1.0
+            ce_str = f" ce={ce_w:.2f}" if ce_w < 1.0 else ""
             print(
                 f"Step {step:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} avg_r={avg_r:.2f}{neuromod_str}"
-                f"{hipp_str}"
+                f"{hipp_str}{ce_str}"
                 f" [{steps_per_sec:.1f} st/s]"
             )
             if wandb is not None:

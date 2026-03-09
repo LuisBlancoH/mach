@@ -177,6 +177,8 @@ def main():
                         help="Path for persistent hippocampal memory (e.g. memory/episodic.json)")
     parser.add_argument("--dense-only", action="store_true",
                         help="Disable sparse reward blocks (always immediate reward)")
+    parser.add_argument("--ce-anneal-start", type=float, default=0.7,
+                        help="Fraction of training where CE starts decaying to 0 (default: 0.7)")
     args = parser.parse_args()
 
     if args.task == "token_map":
@@ -450,6 +452,7 @@ def main():
                 thinking_tokens=args.thinking_tokens,
                 memory_path=args.memory_path,
                 dense_only=args.dense_only,
+                ce_anneal_start=args.ce_anneal_start,
             )
         else:
             meta_train_hebbian(
@@ -551,6 +554,7 @@ def main():
                 thinking_tokens=args.thinking_tokens,
                 memory_path=args.memory_path,
                 dense_only=args.dense_only,
+                ce_anneal_start=args.ce_anneal_start,
             )
         else:
             meta_train_hebbian(
