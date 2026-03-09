@@ -1423,18 +1423,9 @@ def _repair_checkpoint(mach):
     PFC explosion (discovered at 98k): context_gate weights grew to ~50,
     saturating sigmoid, killing gradient, causing PFC state to grow to 10^17.
     """
-    if hasattr(mach, 'context_gates'):
-        needs_repair = False
-        for gate in mach.context_gates:
-            if gate.weight.abs().max() > 5.0 or gate.bias.abs().max() > 5.0:
-                needs_repair = True
-                break
-        if needs_repair:
-            print("  ⚠ Repairing corrupted context_gates (weights > 5.0)")
-            with torch.no_grad():
-                for gate in mach.context_gates:
-                    nn.init.xavier_uniform_(gate.weight)
-                    gate.bias.fill_(1.0)  # sigmoid ≈ 0.73, mostly open
+    # Note: context_gate weights were near-init values even at 98k.
+    # The problem was PFC state (10^17), not the gate weights themselves.
+    # PFC normalization (unit norm) is the real fix. No gate repair needed.
     if hasattr(mach, '_pfc_state') and mach._pfc_state.norm() > 100:
         print(f"  ⚠ Repairing corrupted PFC state (norm={mach._pfc_state.norm():.1f})")
         mach._pfc_state = torch.zeros_like(mach._pfc_state)
