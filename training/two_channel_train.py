@@ -1418,6 +1418,28 @@ def meta_train_hebbian(base_model, mach, patched_model, tokenizer,
                 print(f"  Checkpoint saved to {save_path}")
 
 
+def _repair_checkpoint(mach):
+    """Repair corrupted PFC/context_gate weights if needed.
+    PFC explosion (discovered at 98k): context_gate weights grew to ~50,
+    saturating sigmoid, killing gradient, causing PFC state to grow to 10^17.
+    """
+    if hasattr(mach, 'context_gates'):
+        needs_repair = False
+        for gate in mach.context_gates:
+            if gate.weight.abs().max() > 5.0 or gate.bias.abs().max() > 5.0:
+                needs_repair = True
+                break
+        if needs_repair:
+            print("  ⚠ Repairing corrupted context_gates (weights > 5.0)")
+            with torch.no_grad():
+                for gate in mach.context_gates:
+                    nn.init.xavier_uniform_(gate.weight)
+                    gate.bias.fill_(1.0)  # sigmoid ≈ 0.73, mostly open
+    if hasattr(mach, '_pfc_state') and mach._pfc_state.norm() > 100:
+        print(f"  ⚠ Repairing corrupted PFC state (norm={mach._pfc_state.norm():.1f})")
+        mach._pfc_state = torch.zeros_like(mach._pfc_state)
+
+
 def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                           device, n_steps=40000, lr=None,
                           truncation_window=20, checkpoint_path=None,
@@ -1449,6 +1471,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         print(f"Loading checkpoint from {checkpoint_path}...")
         state_dict = torch.load(checkpoint_path, map_location=device)
         mach.load_state_dict(state_dict, strict=False)
+        _repair_checkpoint(mach)
 
     meta_params = list(mach.parameters())
     optimizer = torch.optim.Adam(meta_params, lr=lr)
@@ -1715,6 +1738,15 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 if hipp_params:
                     torch.nn.utils.clip_grad_norm_(hipp_params, max_norm=1.0)
             optimizer.step()
+            # Synaptic scaling: clamp context gate weights to prevent saturation.
+            # PFC exploded at 98k because context_gate weights grew to ~50,
+            # saturating sigmoid → killing gradient → unbounded PFC state growth.
+            # Brain analogy: homeostatic synaptic scaling keeps weights in functional range.
+            if hasattr(mach, 'context_gates'):
+                with torch.no_grad():
+                    for gate in mach.context_gates:
+                        gate.weight.clamp_(-2.0, 2.0)
+                        gate.bias.clamp_(-3.0, 3.0)
             optimizer.zero_grad()
 
             # Detach patch deltas and critic state (break computation graph, keep values)

@@ -2892,7 +2892,10 @@ class MACHActivationHebbian(nn.Module):
         critic_context = self._critic_state.squeeze(0).detach()  # (64,)
         pfc_input = self.pfc_proj(torch.cat([act_summary, critic_context])).unsqueeze(0)  # (1, 32)
         self._pfc_state = self.pfc_gru(pfc_input, self._pfc_state)
+        # Homeostatic plasticity: PFC neurons have bounded firing rates.
+        # LayerNorm prevents unbounded state growth that killed PFC at 98k steps.
         h = self._pfc_state.squeeze(0)  # (32,)
+        h = h / (h.norm() + 1e-8)  # unit norm — bounded "firing rate"
         # Per-patch gates from PFC task representation
         for i in range(self.n_patches):
             self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (d_model,)
