@@ -1691,9 +1691,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
             # Capture gradient norms BEFORE clipping/zeroing
             for name, p in mach.named_parameters():
+                comp = name.split('.')[0]
                 if p.grad is not None and p.grad.abs().sum() > 0:
-                    comp = name.split('.')[0]
                     _grad_accum.setdefault(f"mach/{comp}", []).append(p.grad.norm().item())
+                elif comp in ('pfc_gru', 'pfc_proj', 'context_gates', 'critic_gru', 'critic_proj'):
+                    # Track PFC/critic even when zero so we can diagnose death
+                    grad_status = "NONE" if p.grad is None else "ZERO"
+                    _grad_accum.setdefault(f"mach/{comp}({grad_status})", []).append(0.0)
             if hippocampus is not None:
                 for name, p in hippocampus.named_parameters():
                     comp = name.split('.')[0]
@@ -2194,6 +2198,30 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
         diag["gain/std"] = gains.std().item()
         diag["gain/min"] = gains.min().item()
         diag["gain/max"] = gains.max().item()
+
+    # PFC / context gate diagnostics
+    if hasattr(mach, '_context_gate_values') and mach._context_gate_values:
+        for i, gate in mach._context_gate_values.items():
+            g = gate.detach()
+            diag[f"context_gate/patch{i}_mean"] = g.mean().item()
+            diag[f"context_gate/patch{i}_std"] = g.std().item()
+    else:
+        diag["context_gate/EMPTY"] = 1.0
+    if hasattr(mach, '_pfc_state') and mach._pfc_state is not None:
+        pfc = mach._pfc_state.detach()
+        diag["pfc/state_norm"] = pfc.norm().item()
+        diag["pfc/state_mean"] = pfc.mean().item()
+        diag["pfc/requires_grad"] = float(mach._pfc_state.requires_grad)
+    # PFC/critic/context_gates weight norms
+    for name in ('pfc_gru', 'pfc_proj', 'critic_gru', 'critic_proj'):
+        mod = getattr(mach, name, None)
+        if mod is not None:
+            for pname, p in mod.named_parameters():
+                diag[f"weight/{name}.{pname}"] = p.data.norm().item()
+    if hasattr(mach, 'context_gates'):
+        for i, gate in enumerate(mach.context_gates):
+            for pname, p in gate.named_parameters():
+                diag[f"weight/context_gate{i}.{pname}"] = p.data.norm().item()
 
     # Neuromodulation stats
     if hasattr(mach, '_last_etas') and mach._last_etas is not None:

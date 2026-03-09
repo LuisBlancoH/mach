@@ -2837,6 +2837,7 @@ class MACHActivationHebbian(nn.Module):
             patch.reset_deltas()
         self._pre_activations.clear()
         self._post_activations.clear()
+        self._context_gate_values.clear()  # prevent stale gates from previous episode
         self._attn_pre_activations.clear()
         self._attn_post_activations.clear()
         # Reset critic memory, nuclei states, and PFC state
