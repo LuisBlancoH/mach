@@ -402,6 +402,7 @@ def main():
 
             state = torch.load(args.checkpoint, map_location=config.DEVICE)
             mach.load_state_dict(state, strict=False)
+            mach.reset_episode()  # initialize patch deltas before sleep/eval
 
             patched_model = ActivationHebbianPatchedModel(base_model, mach)
 
