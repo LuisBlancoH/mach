@@ -79,12 +79,20 @@ class DifferentiablePatch(nn.Module):
         """Return accumulated gain vector for multiplicative modulation."""
         return self.delta_gain if self.delta_gain is not None else 0
 
-    def forward(self, hidden_states):
-        """Forward with accumulated deltas. Operates in float32."""
+    def forward(self, hidden_states, context=None):
+        """Forward with accumulated deltas. Operates in float32.
+
+        Args:
+            context: optional (hidden_dim,) top-down signal from PFC.
+                     Added to hidden layer before activation — shifts what
+                     the patch computes based on task context.
+        """
         W_down = self.delta_down if self.delta_down is not None else 0
         W_up = self.delta_up if self.delta_up is not None else 0
 
         h = torch.nn.functional.linear(hidden_states, W_down)
+        if context is not None:
+            h = h + context
         h = self.act(h)
         h = torch.nn.functional.linear(h, W_up)
         return h
@@ -2809,6 +2817,12 @@ class MACHActivationHebbian(nn.Module):
         # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default
         with torch.no_grad():
             self.context_gates.bias.fill_(1.0)
+        # Top-down contextual input: PFC → patch hidden layer
+        # Like prefrontal projections to cortical areas that shift WHAT they compute.
+        # PFC state (32) → patch hidden_dim (256), one projection per patch.
+        self.pfc_to_patch = nn.ModuleList([
+            nn.Linear(32, hidden_dim) for _ in patch_layers
+        ])
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
@@ -2826,6 +2840,7 @@ class MACHActivationHebbian(nn.Module):
         self._attn_pre_activations = {}   # input to self_attn
         self._attn_post_activations = {}  # attention output (after patch)
         self._context_gate_values = {}  # precomputed gates for hooks
+        self._pfc_context = {}  # top-down context vectors for patches
 
     def reset_episode(self):
         """Call at the start of each episode."""
@@ -2839,6 +2854,7 @@ class MACHActivationHebbian(nn.Module):
         self._pre_activations.clear()
         self._post_activations.clear()
         self._context_gate_values.clear()  # prevent stale gates from previous episode
+        self._pfc_context = {}
         self._attn_pre_activations.clear()
         self._attn_post_activations.clear()
         # Reset critic memory, nuclei states, and PFC state
@@ -2905,6 +2921,10 @@ class MACHActivationHebbian(nn.Module):
         gates = torch.sigmoid(self.context_gates(h))  # (n_patches,)
         for i in range(self.n_patches):
             self._context_gate_values[i] = gates[i]  # scalar
+        # Top-down contextual input: shift what each patch computes
+        self._pfc_context = {}
+        for i in range(self.n_patches):
+            self._pfc_context[i] = self.pfc_to_patch[i](h)  # (hidden_dim,)
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input.
@@ -3125,8 +3145,10 @@ class ActivationHebbianPatchedModel(nn.Module):
 
                     self.mach._pre_activations[patch_idx] = h
 
-                    patch_out = patch(h.float())
-                    # PFC context gate: task-dependent selection of patch dimensions
+                    # PFC top-down context: shifts what the patch computes
+                    pfc_ctx = self.mach._pfc_context.get(patch_idx)
+                    patch_out = patch(h.float(), context=pfc_ctx)
+                    # PFC gain gate: scales how much this patch contributes
                     ctx_gate = self.mach._context_gate_values.get(patch_idx)
                     if ctx_gate is not None:
                         patch_out = patch_out * ctx_gate.to(patch_out.dtype)

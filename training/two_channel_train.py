@@ -1718,7 +1718,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                 comp = name.split('.')[0]
                 if p.grad is not None and p.grad.abs().sum() > 0:
                     _grad_accum.setdefault(f"mach/{comp}", []).append(p.grad.norm().item())
-                elif comp in ('pfc_gru', 'pfc_proj', 'context_gates', 'critic_gru', 'critic_proj'):
+                elif comp in ('pfc_gru', 'pfc_proj', 'context_gates', 'pfc_to_patch', 'critic_gru', 'critic_proj'):
                     # Track PFC/critic even when zero so we can diagnose death
                     grad_status = "NONE" if p.grad is None else "ZERO"
                     _grad_accum.setdefault(f"mach/{comp}({grad_status})", []).append(0.0)
@@ -2267,6 +2267,13 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
         if hasattr(mod, 'named_parameters'):
             for pname, p in mod.named_parameters():
                 diag[f"weight/context_gates.{pname}"] = p.data.norm().item()
+    if hasattr(mach, '_pfc_context') and mach._pfc_context:
+        for i, ctx in mach._pfc_context.items():
+            c = ctx.detach()
+            diag[f"pfc_context/patch{i}_norm"] = c.norm().item()
+    if hasattr(mach, 'pfc_to_patch'):
+        for i, proj in enumerate(mach.pfc_to_patch):
+            diag[f"weight/pfc_to_patch{i}.weight"] = proj.weight.data.norm().item()
 
     # Neuromodulation stats
     if hasattr(mach, '_last_etas') and mach._last_etas is not None:
