@@ -1720,7 +1720,16 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     else:
                         _grad_accum.setdefault(f"hipp/{comp}(ZERO)", []).append(0.0)
 
-            # Clip MACH and hippocampus gradients separately so they don't compete
+            # Clip nuclei output layers individually — decay_out/eta_out gradients
+            # grow proportional to accumulated patch deltas (avg=9.6, max=135 at 98k),
+            # dominating the global norm and starving small components like gamma_gru.
+            for nuc_name in ('decay_out', 'eta_out', 'expl_out', 'gamma_out'):
+                nuc = getattr(mach, nuc_name, None)
+                if nuc is not None:
+                    nuc_params = [p for p in nuc.parameters() if p.grad is not None]
+                    if nuc_params:
+                        torch.nn.utils.clip_grad_norm_(nuc_params, max_norm=1.0)
+            # Then clip remaining MACH params globally
             torch.nn.utils.clip_grad_norm_(
                 meta_params, max_norm=config.PHASE5_GRAD_CLIP
             )

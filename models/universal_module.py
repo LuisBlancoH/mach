@@ -2893,10 +2893,12 @@ class MACHActivationHebbian(nn.Module):
         pfc_input = self.pfc_proj(torch.cat([act_summary, critic_context])).unsqueeze(0)  # (1, 32)
         self._pfc_state = self.pfc_gru(pfc_input, self._pfc_state)
         # Homeostatic plasticity: PFC neurons have bounded firing rates.
-        # Normalize the state itself — hippocampal reinstatement adds to _pfc_state
-        # every retrieval, bypassing GRU's tanh bound. Without this, state drifted
-        # to 10^17 at 98k steps, killing critic_gru, key_proj, and context_gates.
-        self._pfc_state = self._pfc_state / (self._pfc_state.norm() + 1e-8)
+        # Hippocampal reinstatement adds to _pfc_state every retrieval, bypassing
+        # GRU's tanh bound. Without clamping, state drifted to 10^17 at 98k steps.
+        # Per-element clamp (not unit-norm): preserves direction + magnitude info
+        # that context_gates need for task differentiation. GRU tanh gives [-1,1]
+        # per element; allow slight overshoot from hippocampal additions.
+        self._pfc_state = self._pfc_state.clamp(-2.0, 2.0)
         h = self._pfc_state.squeeze(0)  # (32,)
         # Per-patch gates from PFC task representation
         for i in range(self.n_patches):
