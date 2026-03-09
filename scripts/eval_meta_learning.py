@@ -53,14 +53,16 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
 
     if mode in ("full", "sparse", "reward_only"):
         mach.train()
-        meta_params = [p for p in mach.parameters() if p.requires_grad]
+        mach_params = [p for p in mach.parameters() if p.requires_grad]
+        hipp_params = []
         if hippocampus is not None:
-            for p in hippocampus.parameters():
-                if p.requires_grad:
-                    meta_params.append(p)
+            hipp_params = [p for p in hippocampus.parameters() if p.requires_grad]
+        meta_params = mach_params + hipp_params
         optimizer = torch.optim.Adam(meta_params, lr=lr)
     else:
         mach.eval()
+        mach_params = []
+        hipp_params = []
         optimizer = None
 
     problems = generate_few_shot_episode(n_steps, n_demos=0, op_type=op_type)
@@ -211,7 +213,9 @@ def run_adaptation_test(base_model, mach, patched_model, tokenizer, device,
                     avg_hipp = torch.stack(window_hipp_losses).mean()
                     total_loss = total_loss + 0.05 * avg_hipp
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(mach_params, max_norm=1.0)
+                if hipp_params:
+                    torch.nn.utils.clip_grad_norm_(hipp_params, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -548,11 +552,11 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
     # No reset_episode — patches and state persist across everything
     mach.reset_episode()
     mach.train()
-    meta_params = [p for p in mach.parameters() if p.requires_grad]
+    mach_params = [p for p in mach.parameters() if p.requires_grad]
+    hipp_params = []
     if hipp is not None:
-        for p in hipp.parameters():
-            if p.requires_grad:
-                meta_params.append(p)
+        hipp_params = [p for p in hipp.parameters() if p.requires_grad]
+    meta_params = mach_params + hipp_params
     optimizer = torch.optim.Adam(meta_params, lr=lr)
 
     op_results = {op: [] for op in ops}
@@ -644,7 +648,9 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
                             avg_hipp = torch.stack(window_hipp_losses).mean()
                             total_loss = total_loss + 0.05 * avg_hipp
                         total_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(meta_params, max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(mach_params, max_norm=1.0)
+                        if hipp_params:
+                            torch.nn.utils.clip_grad_norm_(hipp_params, max_norm=1.0)
                         optimizer.step()
                         optimizer.zero_grad()
 

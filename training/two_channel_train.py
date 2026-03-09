@@ -1702,9 +1702,14 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     else:
                         _grad_accum.setdefault(f"hipp/{comp}(ZERO)", []).append(0.0)
 
+            # Clip MACH and hippocampus gradients separately so they don't compete
             torch.nn.utils.clip_grad_norm_(
                 meta_params, max_norm=config.PHASE5_GRAD_CLIP
             )
+            if hippocampus is not None:
+                hipp_params = [p for p in hippocampus.parameters() if p.requires_grad and p.grad is not None]
+                if hipp_params:
+                    torch.nn.utils.clip_grad_norm_(hipp_params, max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
