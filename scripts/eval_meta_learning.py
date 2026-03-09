@@ -412,7 +412,7 @@ def main():
                 from models.hippocampus import Hippocampus
                 key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
                 hipp = Hippocampus(
-                    key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
+                    key_dim=key_dim, pfc_dim=mach.pfc_dim, n_patches=mach.n_patches,
                     save_path=args.memory_path,
                 ).to(config.DEVICE)
 
@@ -547,7 +547,7 @@ def run_sequential_eval(base_model, d_model, n_layers, patch_layers, tokenizer,
     if use_hipp:
         key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
         hipp = Hippocampus(
-            key_dim=key_dim, pfc_dim=32, n_patches=mach.n_patches,
+            key_dim=key_dim, pfc_dim=mach.pfc_dim, n_patches=mach.n_patches,
         ).to(config.DEVICE)
 
     # No reset_episode — patches and state persist across everything

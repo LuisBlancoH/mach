@@ -1505,7 +1505,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         key_dim = len(mach.patch_layers) * mach.hebb_rule.d_proj
         hippocampus = Hippocampus(
             key_dim=key_dim,
-            pfc_dim=32,
+            pfc_dim=mach.pfc_dim,
             n_patches=mach.n_patches,
             save_path=memory_path,
         ).to(device)

@@ -2727,9 +2727,15 @@ class MACHActivationHebbian(nn.Module):
     def __init__(self, d_model, n_layers, patch_layers, hidden_dim=256,
                  n_rank=2, d_proj=32, exploration_noise=0.3, init_std=0.001,
                  frozen_projections=False, consolidation=False, ema_decay=0.95,
-                 delta_decay=1.0, consolidation_interval=0, gamma=0.95):
+                 delta_decay=1.0, consolidation_interval=0, gamma=0.95,
+                 pfc_dim=None, critic_dim=None, nuclei_dim=None):
         super().__init__()
         from config import GATE_SCALE
+        # Import brain dimensions with fallbacks for backward compat
+        import config
+        pfc_dim = pfc_dim or getattr(config, 'PFC_DIM', 32)
+        critic_dim = critic_dim or getattr(config, 'CRITIC_DIM', 64)
+        nuclei_dim = nuclei_dim or getattr(config, 'NUCLEI_DIM', 8)
         self.d_model = d_model
         self.n_patches = len(patch_layers)
         self.patch_layers = patch_layers
@@ -2742,6 +2748,9 @@ class MACHActivationHebbian(nn.Module):
         self.delta_decay = delta_decay
         self.consolidation_interval = consolidation_interval
         self.gamma = gamma  # TD discount factor
+        self.pfc_dim = pfc_dim
+        self.critic_dim = critic_dim
+        self.nuclei_dim = nuclei_dim
         self._step_count = 0
         self._reward_ema = 0.0
         self._prev_value = 0.0  # V(s_{t-1}) for TD bootstrapping
@@ -2776,52 +2785,48 @@ class MACHActivationHebbian(nn.Module):
 
         # Basal ganglia: GRU integrates temporal context + PFC task context
         d_critic_in = len(patch_layers) * d_proj
-        self.critic_proj = nn.Linear(d_critic_in + 32, 64)  # +32 for PFC state
-        self.critic_gru = nn.GRUCell(64, 64)
-        self.register_buffer('_critic_state', torch.zeros(1, 64))
+        self.critic_proj = nn.Linear(d_critic_in + pfc_dim, critic_dim)
+        self.critic_gru = nn.GRUCell(critic_dim, critic_dim)
+        self.register_buffer('_critic_state', torch.zeros(1, critic_dim))
 
-        # Separate nuclei with recurrent dynamics: each has its own GRU (8-dim)
+        # Separate nuclei with recurrent dynamics
         # Like VTA/LC/basal forebrain — shared cortical input, separate circuits + own temporal dynamics
         n_p = len(patch_layers)
-        self.value_head = nn.Linear(64, 1)                              # VTA: reward prediction
+        self.value_head = nn.Linear(critic_dim, 1)                       # VTA: reward prediction
 
-        # Each nucleus: GRU(64→8) for own temporal state, then Linear(8→n_patches) for per-patch output
-        self.eta_gru = nn.GRUCell(64, 8)                                # dopamine dynamics
-        self.eta_out = nn.Linear(8, n_p)                                # per-patch plasticity
-        self.decay_gru = nn.GRUCell(64, 8)                              # ACh dynamics
-        self.decay_out = nn.Linear(8, n_p)                              # per-patch retention
-        self.expl_gru = nn.GRUCell(64, 8)                               # LC dynamics
-        self.expl_out = nn.Linear(8, n_p)                               # per-patch exploration
-        self.gamma_gru = nn.GRUCell(64, 8)                               # serotonin dynamics
-        self.gamma_out = nn.Linear(8, 1)                                 # scalar discount factor
+        # Each nucleus: GRU(critic_dim→nuclei_dim) for own temporal state
+        self.eta_gru = nn.GRUCell(critic_dim, nuclei_dim)                # dopamine dynamics
+        self.eta_out = nn.Linear(nuclei_dim, n_p)                        # per-patch plasticity
+        self.decay_gru = nn.GRUCell(critic_dim, nuclei_dim)              # ACh dynamics
+        self.decay_out = nn.Linear(nuclei_dim, n_p)                      # per-patch retention
+        self.expl_gru = nn.GRUCell(critic_dim, nuclei_dim)               # LC dynamics
+        self.expl_out = nn.Linear(nuclei_dim, n_p)                       # per-patch exploration
+        self.gamma_gru = nn.GRUCell(critic_dim, nuclei_dim)              # serotonin dynamics
+        self.gamma_out = nn.Linear(nuclei_dim, 1)                        # scalar discount factor
 
-        self.register_buffer('_eta_state', torch.zeros(1, 8))
-        self.register_buffer('_decay_state', torch.zeros(1, 8))
-        self.register_buffer('_expl_state', torch.zeros(1, 8))
-        self.register_buffer('_gamma_state', torch.zeros(1, 8))
+        self.register_buffer('_eta_state', torch.zeros(1, nuclei_dim))
+        self.register_buffer('_decay_state', torch.zeros(1, nuclei_dim))
+        self.register_buffer('_expl_state', torch.zeros(1, nuclei_dim))
+        self.register_buffer('_gamma_state', torch.zeros(1, nuclei_dim))
 
         # PFC: recurrent circuit for task representation + context gating
         # Reads all-layer activation summary (early=concrete, late=abstract)
         # Maintains stable task set through own GRU dynamics
         # Separate from critic GRU: critic predicts reward, PFC represents task context
-        d_pfc_in = len(patch_layers) * d_proj  # same as critic input (128)
-        self.pfc_proj = nn.Linear(d_pfc_in + 64, 32)  # +64 for critic state
-        self.pfc_gru = nn.GRUCell(32, 32)          # recurrent task representation
-        self.register_buffer('_pfc_state', torch.zeros(1, 32))
-        # Per-patch gate from PFC state
+        d_pfc_in = len(patch_layers) * d_proj
+        self.pfc_proj = nn.Linear(d_pfc_in + critic_dim, pfc_dim)
+        self.pfc_gru = nn.GRUCell(pfc_dim, pfc_dim)
+        self.register_buffer('_pfc_state', torch.zeros(1, pfc_dim))
         # Per-patch scalar gates from PFC: "how much to USE this patch"
-        # (complementary to eta which controls "how much to LEARN")
         # Brain-faithful: PFC modulates at region level, not individual synapses.
-        # Linear(32→n_patches) instead of n_patches × Linear(32→d_model).
-        self.context_gates = nn.Linear(32, len(patch_layers))
+        self.context_gates = nn.Linear(pfc_dim, len(patch_layers))
         # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default
         with torch.no_grad():
             self.context_gates.bias.fill_(1.0)
         # Top-down contextual input: PFC → patch hidden layer
         # Like prefrontal projections to cortical areas that shift WHAT they compute.
-        # PFC state (32) → patch hidden_dim (256), one projection per patch.
         self.pfc_to_patch = nn.ModuleList([
-            nn.Linear(32, hidden_dim) for _ in patch_layers
+            nn.Linear(pfc_dim, hidden_dim) for _ in patch_layers
         ])
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
@@ -2858,12 +2863,13 @@ class MACHActivationHebbian(nn.Module):
         self._attn_pre_activations.clear()
         self._attn_post_activations.clear()
         # Reset critic memory, nuclei states, and PFC state
-        self._critic_state = torch.zeros(1, 64, device=self._critic_state.device)
-        self._eta_state = torch.zeros(1, 8, device=self._critic_state.device)
-        self._decay_state = torch.zeros(1, 8, device=self._critic_state.device)
-        self._expl_state = torch.zeros(1, 8, device=self._critic_state.device)
-        self._gamma_state = torch.zeros(1, 8, device=self._critic_state.device)
-        self._pfc_state = torch.zeros(1, 32, device=self._critic_state.device)
+        dev = self._critic_state.device
+        self._critic_state = torch.zeros(1, self.critic_dim, device=dev)
+        self._eta_state = torch.zeros(1, self.nuclei_dim, device=dev)
+        self._decay_state = torch.zeros(1, self.nuclei_dim, device=dev)
+        self._expl_state = torch.zeros(1, self.nuclei_dim, device=dev)
+        self._gamma_state = torch.zeros(1, self.nuclei_dim, device=dev)
+        self._pfc_state = torch.zeros(1, self.pfc_dim, device=dev)
         # Reset eligibility traces for both residual and attention patches
         self.hebb_rule.reset_traces(self._critic_state.device)
         self.attn_hebb_rule.reset_traces(self._critic_state.device)
