@@ -312,6 +312,9 @@ class Hippocampus(nn.Module):
         """
         td = torch.tensor(td_error, dtype=torch.float32) \
             if not isinstance(td_error, torch.Tensor) else td_error.detach()
+        # Clamp TD signal: dopamine neurons have bounded firing rates (~3-20 Hz).
+        # Unclamped TD caused key_proj gradient spikes to 42k (avg=107).
+        td = td.clamp(-1.0, 1.0)
 
         losses = []
 
