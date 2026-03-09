@@ -1528,6 +1528,8 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     sleep_rem_td_errors = []
     sleep_rem_critic_values = []
     sleep_patch_deltas = []
+    # Per-operation context gate tracking
+    _op_gate_accum = {}  # {op: {patch_idx: [gate_values]}}
 
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
@@ -1657,6 +1659,13 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
 
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
+
+        # Track per-op context gate values
+        if hasattr(mach, '_context_gate_values') and mach._context_gate_values:
+            if current_op not in _op_gate_accum:
+                _op_gate_accum[current_op] = {}
+            for i, g in mach._context_gate_values.items():
+                _op_gate_accum[current_op].setdefault(i, []).append(g.detach().item())
 
         # Hippocampus: update dynamics from nuclei, reconsolidate, then store
         if hippocampus is not None:
@@ -1867,6 +1876,16 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     print(f"    {comp}: avg={avg:.6f} max={mx:.6f} ({len(norms)} samples)")
                 _grad_accum.clear()
             _log_hebbian_diagnostics(mach, meta_params, step, hippocampus=hippocampus)
+            # Per-operation context gate summary
+            if _op_gate_accum:
+                print("  Context gates by operation:")
+                for op in sorted(_op_gate_accum.keys()):
+                    gates_str = " ".join(
+                        f"p{i}={sum(vs)/len(vs):.2f}"
+                        for i, vs in sorted(_op_gate_accum[op].items())
+                    )
+                    print(f"    {op:<10} {gates_str}")
+                _op_gate_accum.clear()
             # Sleep cycle stats
             if sleep_nrem_total > 0 or sleep_rem_total > 0:
                 rem_avg_td = sum(abs(t) for t in sleep_rem_td_errors) / len(sleep_rem_td_errors) if sleep_rem_td_errors else 0
