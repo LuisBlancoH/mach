@@ -59,12 +59,12 @@ def train_predictive_coding(patched_model, pc_network, tokenizer,
             labels = input_ids.clone()
             labels[0, :prompt_len] = -100
 
-            # Forward pass (hooks apply predictive coding corrections)
+            # Two-pass forward: capture → settle → correct
             outputs = patched_model(input_ids=input_ids, labels=labels)
             ce_loss = outputs.loss
 
-            # Auxiliary prediction loss: drive hierarchy to predict accurately
-            pred_loss = pc_network.get_prediction_loss()
+            # Prediction loss computed during settle phase
+            pred_loss = patched_model._last_prediction_loss
             total_loss = ce_loss + prediction_weight * pred_loss
 
             optimizer.zero_grad()
@@ -188,10 +188,10 @@ def train_predictive_coding_continuous(patched_model, pc_network, tokenizer,
         labels = input_ids.clone()
         labels[0, :prompt_len] = -100
 
-        # Forward + backward
+        # Two-pass forward: capture → settle → correct
         outputs = patched_model(input_ids=input_ids, labels=labels)
         ce_loss = outputs.loss
-        pred_loss = pc_network.get_prediction_loss()
+        pred_loss = patched_model._last_prediction_loss
         total_loss = ce_loss + prediction_weight * pred_loss
 
         optimizer.zero_grad()

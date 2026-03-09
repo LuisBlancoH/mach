@@ -2,17 +2,18 @@
 Predictive Coding Patches for frozen LLM augmentation.
 
 The brain never really processes raw sensory input — it only processes its
-own errors. Each cortical column maintains a prediction of what it expects,
-and only the mismatch (prediction error) drives computation and correction.
+own errors. Each cortical column predicts what it expects, and only the
+mismatch (prediction error) drives computation and correction.
 
-Architecture:
-  - PredictiveCodingPatch: one cortical column (predict → compare → correct)
-  - PredictiveCodingNetwork: hierarchy of patches (top-down predictions, bottom-up errors)
-  - PredictiveCodingPatchedModel: hooks into frozen Qwen
+Two-pass architecture (faithful to cortical processing):
+  1. FEEDFORWARD SWEEP: Qwen runs normally, hidden states captured (observation)
+  2. RECURRENT SETTLING: PC hierarchy iterates on captured states —
+     top-down predictions meet bottom-up evidence, errors converge
+  3. CORRECTED PASS: Qwen runs again with settled corrections applied
 
 Top-down predictions flow from abstract (layer 34) to concrete (layer 9).
 Bottom-up prediction errors flow from concrete to abstract.
-Predictions use the PREVIOUS forward pass's state (like the brain).
+Settling iterates on the SAME input (like the brain's ~200ms processing).
 """
 
 import torch
@@ -26,14 +27,11 @@ def _clamp_grad(grad):
 
 
 class PredictiveCodingPatch(nn.Module):
-    """One cortical column: predict → compare → precision-weight → correct.
+    """One cortical column.
 
-    Each patch:
-    1. Compresses Qwen's hidden state to representation space (bottom-up)
-    2. Compares to top-down prediction from the patch above
-    3. Precision-weights the error (learned attention to what matters)
-    4. Projects weighted error back as correction to Qwen's residual stream
-    5. Updates its representation and generates prediction for the patch below
+    Compresses Qwen's hidden state, computes prediction error against
+    top-down prediction, precision-weights the error, and projects
+    the correction back to Qwen's residual stream.
     """
 
     def __init__(self, d_model, d_repr=128):
@@ -48,7 +46,7 @@ class PredictiveCodingPatch(nn.Module):
         self.predict_down = nn.Linear(d_repr, d_repr)
 
         # Precision weighting: which errors to trust (brain's version of attention)
-        # Input: [compressed_actual, prediction_error] → precision weights
+        # Input: [compressed_actual, error] → precision weights
         self.precision = nn.Linear(d_repr * 2, d_repr)
 
         # Error → correction: project precision-weighted error back to residual stream
@@ -58,136 +56,161 @@ class PredictiveCodingPatch(nn.Module):
         nn.init.zeros_(self.error_to_correction.weight)
         nn.init.zeros_(self.error_to_correction.bias)
 
-        # Persistent state (survives across forward passes, like cortical activity)
-        self.representation = None  # (batch, d_repr) current belief
-        self.prediction = None      # (batch, d_repr) prediction for level below
-
-        # Diagnostics
+        # Diagnostics (set during settle)
         self._last_error_norm = 0.0
         self._last_precision_mean = 0.0
         self._last_weighted_error_norm = 0.0
 
-    def reset(self):
-        """Clear persistent state."""
-        self.representation = None
-        self.prediction = None
-
-    def forward(self, actual_hidden, top_down_prediction):
-        """Process one layer of Qwen's hidden states.
+    def compute_error(self, compressed, prediction):
+        """Compute precision-weighted prediction error.
 
         Args:
-            actual_hidden: Qwen's hidden state at this layer (batch, seq, d_model)
-            top_down_prediction: prediction from the patch above (batch, d_repr) or None
+            compressed: compressed bottom-up features (batch, seq, d_repr)
+            prediction: top-down prediction (batch, d_repr) or None
 
         Returns:
-            correction: additive correction to Qwen's residual stream (batch, seq, d_model)
+            weighted_error: precision-weighted error (batch, seq, d_repr)
+            representation: updated belief (batch, d_repr)
         """
-        # 1. Bottom-up: compress Qwen's actual hidden state
-        compressed = self.compress(actual_hidden.float())  # (batch, seq, d_repr)
-
-        # 2. Prediction error
-        if top_down_prediction is not None:
-            # Expand prediction to match sequence length
-            pred = top_down_prediction.unsqueeze(1).expand_as(compressed)
+        if prediction is not None:
+            pred = prediction.unsqueeze(1).expand_as(compressed)
             error = compressed - pred
         else:
-            # Top-most patch: no prediction from above, full surprise
+            # Top-most patch: no prediction, everything is error
             error = compressed
 
-        # 3. Precision weighting (learned inverse-variance)
-        precision_input = torch.cat([compressed, error], dim=-1)  # (batch, seq, 2*d_repr)
-        precision_weights = torch.sigmoid(self.precision(precision_input))  # [0, 1]
+        # Precision weighting (learned inverse-variance)
+        precision_input = torch.cat([compressed, error], dim=-1)
+        precision_weights = torch.sigmoid(self.precision(precision_input))
         weighted_error = error * precision_weights
 
-        # 4. Update representation: detached running belief
+        # Representation: prediction + weighted evidence (Bayesian update)
         # Pool over sequence for the persistent representation
-        compressed_mean = compressed.detach().mean(dim=1)  # (batch, d_repr)
-        if self.representation is not None:
-            self.representation = 0.8 * self.representation + 0.2 * compressed_mean
+        if prediction is not None:
+            representation = prediction + weighted_error.mean(dim=1)
         else:
-            self.representation = compressed_mean
-
-        # 5. Generate prediction for level below (used NEXT forward pass)
-        self.prediction = self.predict_down(self.representation)  # (batch, d_repr)
-
-        # 6. Project weighted error to correction in Qwen's space
-        correction = self.error_to_correction(weighted_error)  # (batch, seq, d_model)
+            representation = compressed.mean(dim=1)
 
         # Diagnostics
         self._last_error_norm = error.detach().norm().item()
         self._last_precision_mean = precision_weights.detach().mean().item()
         self._last_weighted_error_norm = weighted_error.detach().norm().item()
 
-        return correction.to(actual_hidden.dtype)
+        return weighted_error, representation
 
 
 class PredictiveCodingNetwork(nn.Module):
-    """Hierarchy of predictive coding patches.
+    """Hierarchy of predictive coding patches with iterative settling.
 
-    Patches are ordered from concrete (early Qwen layer) to abstract (late layer).
-    Top-down predictions flow: patch3 → patch2 → patch1 → patch0
-    Bottom-up errors flow: patch0 → patch1 → patch2 → patch3
+    Two-pass architecture:
+    1. Capture: hooks store Qwen hidden states without modification
+    2. Settle: iterate top-down predictions and bottom-up errors on captured states
+    3. Correct: hooks apply the settled corrections to Qwen's second forward pass
 
-    Predictions use the PREVIOUS forward pass state — like the brain,
-    which is always predicting slightly ahead of incoming sensory data.
+    The settling loop (step 2) is the "recurrent processing" that the brain
+    does for ~200ms when perceiving a stimulus. It runs entirely in the small
+    PC representation space (d_repr=128), so it's cheap.
     """
 
-    def __init__(self, d_model, d_repr=128, patch_layers=None):
+    def __init__(self, d_model, d_repr=128, patch_layers=None, n_settle=3):
         super().__init__()
         if patch_layers is None:
             patch_layers = [9, 18, 27, 34]
         self.patch_layers = patch_layers
+        self.d_model = d_model
         self.d_repr = d_repr
+        self.n_settle = n_settle
 
         self.patches = nn.ModuleList([
             PredictiveCodingPatch(d_model, d_repr) for _ in patch_layers
         ])
 
-        # Stored predictions from previous forward pass
-        # predictions[i] = what patch i+1 predicted for patch i
-        self._predictions = [None] * len(patch_layers)
+        # State set during two-pass forward
+        self._captured = {}          # {patch_idx: hidden_state} from first pass
+        self._corrections = {}       # {patch_idx: correction} from settling
+        self._mode = "capture"       # "capture" | "correct"
 
     def reset(self):
-        """Clear all state. Call between eval runs or training restarts."""
-        for patch in self.patches:
-            patch.reset()
-        self._predictions = [None] * len(self.patch_layers)
+        """Clear all state."""
+        self._captured.clear()
+        self._corrections.clear()
+        self._mode = "capture"
 
-    def get_correction(self, patch_idx, actual_hidden):
-        """Compute correction for one patch layer.
+    def settle(self):
+        """Run predictive coding hierarchy on captured states until convergence.
 
-        Called by the hook during Qwen's forward pass.
-        Uses the prediction from the PREVIOUS forward pass.
+        This is the brain's ~200ms recurrent processing of a single stimulus.
+        Top-down predictions and bottom-up errors iterate until the hierarchy
+        agrees on an interpretation.
+
+        Returns:
+            prediction_loss: auxiliary loss for training the predictive model
         """
-        # Top-down prediction from the patch above (from previous forward pass)
-        if patch_idx == len(self.patches) - 1:
-            top_down = None  # top-most patch: no prediction from above
-        else:
-            top_down = self._predictions[patch_idx]
+        n = len(self.patches)
 
-        # Compute correction via predictive coding
-        correction = self.patches[patch_idx](actual_hidden, top_down)
+        # Compress all captured hidden states (gradient flows through compress)
+        compressed = {}
+        for i in range(n):
+            h = self._captured.get(i)
+            if h is None:
+                continue
+            compressed[i] = self.patches[i].compress(h.float())
 
-        # Store this patch's prediction for the level below (used next forward pass)
-        self._predictions[patch_idx] = self.patches[patch_idx].prediction
+        # Initialize representations from compressed activations
+        representations = {}
+        for i in range(n):
+            if i in compressed:
+                representations[i] = compressed[i].mean(dim=1)  # (batch, d_repr)
 
-        return correction
+        # Iterative settling: top-down predictions meet bottom-up errors
+        for t in range(self.n_settle):
+            # Top-down pass: generate predictions (abstract → concrete)
+            predictions = {}
+            for i in range(n - 1, 0, -1):
+                if i in representations:
+                    predictions[i - 1] = self.patches[i].predict_down(
+                        representations[i]
+                    )
 
-    def get_prediction_loss(self):
-        """Auxiliary loss: how well did higher patches predict lower patches?
+            # Bottom-up pass: compute errors, update representations
+            for i in range(n):
+                if i not in compressed:
+                    continue
+                pred = predictions.get(i)  # None for top-most patch
+                weighted_error, new_repr = self.patches[i].compute_error(
+                    compressed[i], pred
+                )
+                representations[i] = new_repr
 
-        Drives the hierarchy to build accurate models of Qwen's computation.
-        """
-        loss = 0.0
-        count = 0
-        for i in range(len(self.patches) - 1):
-            # Patch i+1 predicted what patch i should see
-            prediction = self._predictions[i]
-            actual = self.patches[i].representation
-            if prediction is not None and actual is not None:
-                loss = loss + F.mse_loss(prediction, actual.detach())
-                count += 1
-        return loss / max(count, 1)
+        # After settling: compute final corrections from final errors
+        # Re-run one last error computation with settled predictions
+        final_predictions = {}
+        for i in range(n - 1, 0, -1):
+            if i in representations:
+                final_predictions[i - 1] = self.patches[i].predict_down(
+                    representations[i]
+                )
+
+        prediction_loss = 0.0
+        pred_count = 0
+        for i in range(n):
+            if i not in compressed:
+                continue
+            pred = final_predictions.get(i)
+            weighted_error, _ = self.patches[i].compute_error(compressed[i], pred)
+
+            # Correction: project weighted error back to Qwen's space
+            correction = self.patches[i].error_to_correction(weighted_error)
+            self._corrections[i] = correction
+
+            # Prediction loss: how well did higher patches predict this one?
+            if pred is not None and i in representations:
+                actual_repr = compressed[i].detach().mean(dim=1)
+                prediction_loss = prediction_loss + F.mse_loss(pred, actual_repr)
+                pred_count += 1
+
+        prediction_loss = prediction_loss / max(pred_count, 1)
+        return prediction_loss
 
     def get_diagnostics(self):
         """Return diagnostic dict for logging."""
@@ -196,22 +219,22 @@ class PredictiveCodingNetwork(nn.Module):
             diag[f"pc/patch{i}_error_norm"] = patch._last_error_norm
             diag[f"pc/patch{i}_precision_mean"] = patch._last_precision_mean
             diag[f"pc/patch{i}_weighted_error_norm"] = patch._last_weighted_error_norm
-            if patch.representation is not None:
-                diag[f"pc/patch{i}_repr_norm"] = patch.representation.norm().item()
-        # Prediction accuracy
-        for i in range(len(self.patches) - 1):
-            pred = self._predictions[i]
-            actual = self.patches[i].representation
-            if pred is not None and actual is not None:
-                cos = F.cosine_similarity(
-                    pred.flatten(), actual.detach().flatten(), dim=0
-                ).item()
-                diag[f"pc/pred_cos_{i+1}_to_{i}"] = cos
+        # Correction norms
+        for i, corr in self._corrections.items():
+            if corr is not None:
+                diag[f"pc/patch{i}_correction_norm"] = corr.detach().norm().item()
         return diag
 
 
 class PredictiveCodingPatchedModel(nn.Module):
-    """Hooks a PredictiveCodingNetwork into a frozen Qwen model."""
+    """Two-pass model: capture → settle → correct.
+
+    Pass 1 (capture): Qwen runs normally, hooks store hidden states
+    Pass 2 (correct): Qwen runs again, hooks apply settled corrections
+
+    Between the two passes, the PC hierarchy settles — iterating
+    top-down predictions and bottom-up errors on the captured states.
+    """
 
     def __init__(self, base_model, pc_network):
         super().__init__()
@@ -233,16 +256,23 @@ class PredictiveCodingPatchedModel(nn.Module):
             else:
                 h = output
 
-            correction = self.pc_network.get_correction(patch_idx, h)
-            h_new = h + correction.to(h.dtype)
+            if self.pc_network._mode == "capture":
+                # Phase 1: just observe, don't modify
+                self.pc_network._captured[patch_idx] = h.detach()
+                return output
 
-            # Gradient clamping at Qwen boundary
-            if h_new.requires_grad:
-                h_new.register_hook(_clamp_grad)
+            elif self.pc_network._mode == "correct":
+                # Phase 3: apply pre-computed correction
+                correction = self.pc_network._corrections.get(patch_idx)
+                if correction is not None:
+                    h_new = h + correction.to(h.dtype)
+                    if h_new.requires_grad:
+                        h_new.register_hook(_clamp_grad)
+                    if isinstance(output, tuple):
+                        return (h_new,) + output[1:]
+                    return h_new
 
-            if isinstance(output, tuple):
-                return (h_new,) + output[1:]
-            return h_new
+            return output
         return hook
 
     @property
@@ -250,11 +280,52 @@ class PredictiveCodingPatchedModel(nn.Module):
         return self.base_model.device
 
     def forward(self, input_ids, labels=None, attention_mask=None):
-        return self.base_model(
+        """Two-pass forward: capture → settle → correct.
+
+        Pass 1: Run Qwen, capture hidden states at patch layers (no modification)
+        Settle: PC hierarchy iterates on captured states
+        Pass 2: Run Qwen again with corrections applied → compute loss
+        """
+        # Phase 1: Feedforward sweep (observation only)
+        self.pc_network._mode = "capture"
+        self.pc_network._captured.clear()
+        self.pc_network._corrections.clear()
+        with torch.no_grad():
+            self.base_model(input_ids=input_ids)
+
+        # Phase 2: Recurrent settling (cheap — only PC network, not Qwen)
+        prediction_loss = self.pc_network.settle()
+
+        # Phase 3: Corrected forward pass (gradients flow through corrections)
+        self.pc_network._mode = "correct"
+        outputs = self.base_model(
             input_ids=input_ids, labels=labels, attention_mask=attention_mask
         )
 
+        # Store prediction loss for the training loop to use
+        self._last_prediction_loss = prediction_loss
+
+        return outputs
+
     def generate(self, *args, **kwargs):
+        """Generate with two-pass: capture → settle → generate."""
+        input_ids = kwargs.get('input_ids', args[0] if args else None)
+        if input_ids is None:
+            return self.base_model.generate(*args, **kwargs)
+
+        # Capture pass
+        self.pc_network._mode = "capture"
+        self.pc_network._captured.clear()
+        self.pc_network._corrections.clear()
+        with torch.no_grad():
+            self.base_model(input_ids=input_ids)
+
+        # Settle
+        with torch.no_grad():
+            self.pc_network.settle()
+
+        # Generate with corrections
+        self.pc_network._mode = "correct"
         return self.base_model.generate(*args, **kwargs)
 
     def remove_hooks(self):
