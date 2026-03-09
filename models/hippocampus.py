@@ -286,27 +286,21 @@ class Hippocampus(nn.Module):
         alpha = self.read_gate(gate_input).squeeze()
 
         # Reinstate PFC from episode
-        # Detach old PFC: gradient flows through alpha and pfc_delta (learned),
-        # not through the prior PFC chain (which has its own gradient path via GRU)
+        # Keep PFC connected — gradient flows through alpha and pfc_delta to read_gate.
+        # This is now the ONLY gradient path for read_gate (neuromod override removed).
+        # Separate hippocampus grad clipping prevents amplification through the PFC GRU chain.
         pfc_delta = self.read_to_pfc(ep_content)
         if pfc is not None:
-            mach._pfc_state = mach._pfc_state.detach() + alpha * pfc_delta.unsqueeze(0)
+            mach._pfc_state = mach._pfc_state + alpha * pfc_delta.unsqueeze(0)
 
-        # Neuromod bias from episode — keep as TENSORS for gradient flow
-        # alpha stays as tensor → read_gate gets gradient through neuromod blending
-        # neuromod values stay as tensors → read_to_neuromod gets gradient
-        alpha_abs = alpha.abs()
-        if alpha_abs.item() > 1e-4 and hasattr(mach, '_eta_state'):
-            neuromod_raw = self.read_to_neuromod(ep_content)
-            nm = neuromod_raw.view(3, self.n_patches)
-            mach._neuromod_bias = {
-                'eta': nm[0].clamp(0.1, 1.0),
-                'decay': nm[1].clamp(0.1, 1.0),
-                'expl': nm[2].clamp(0.1, 0.5),
-                'alpha': alpha_abs,  # tensor, not float — gradient flows to read_gate
-            }
+        # No direct neuromod override — that's the nuclei's job.
+        # The reinstated PFC context flows into nuclei GRUs via the normal
+        # corticostriatal pathway (pfc_state → critic_proj → nuclei), so the
+        # nuclei learn to produce the right neuromod settings when they
+        # recognize a reinstated context. Brain-faithful: hippocampus
+        # reinstates context, basal ganglia evaluates it.
 
-        self._last_alpha = alpha_abs.item()
+        self._last_alpha = alpha.abs().item()
         return self._last_alpha
 
     def compute_local_loss(self, td_error):
@@ -526,14 +520,8 @@ class Hippocampus(nn.Module):
                 if hasattr(mach, '_pfc_state'):
                     mach._pfc_state = pfc_stored.unsqueeze(0).clone()
 
-                neuromod_stored = ep_content[self.pfc_dim:]
-                if hasattr(mach, '_neuromod_bias') and neuromod_stored.shape[0] >= self.n_patches * 3:
-                    mach._neuromod_bias = {
-                        'eta': neuromod_stored[:self.n_patches].clamp(0.1, 1.0),
-                        'decay': neuromod_stored[self.n_patches:self.n_patches*2].clamp(0.1, 1.0),
-                        'expl': neuromod_stored[self.n_patches*2:].clamp(0.1, 0.5),
-                        'alpha': torch.tensor(0.5, device=device),
-                    }
+                # PFC reinstatement is enough — nuclei will respond to the context
+                # No direct neuromod override during dreams either
 
                 # Dream: free generation from a seed token
                 # The seed is minimal — dream content emerges from patches + PFC

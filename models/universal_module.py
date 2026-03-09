@@ -2961,17 +2961,8 @@ class MACHActivationHebbian(nn.Module):
         # Floor 0.1 (never fully myopic) + range 0.9 → [0.1, 1.0]
         gamma = 0.1 + 0.9 * torch.sigmoid(self.gamma_out(self._gamma_state.squeeze(0))).squeeze(-1)
 
-        # Hippocampal reinstatement: blend stored neuromod values into current
-        # alpha controls blend strength (tensor — gradient flows to hippocampus read_gate)
-        if hasattr(self, '_neuromod_bias') and self._neuromod_bias is not None:
-            bias = self._neuromod_bias
-            a = bias['alpha']  # tensor from hippocampus, gradient flows to read_gate
-            if a.requires_grad:
-                a.register_hook(lambda g: g.clamp(-1.0, 1.0))  # prevent gradient explosion through GRU chain
-            etas = ((1 - a) * etas + a * bias['eta']).clamp(0.1, 1.0)
-            decays = ((1 - a) * decays + a * bias['decay']).clamp(0.1, 1.0)
-            expls = ((1 - a) * expls + a * bias['expl']).clamp(0.1, 0.5)
-            self._neuromod_bias = None  # consumed
+        # Hippocampal context flows through PFC → nuclei (corticostriatal pathway).
+        # No direct neuromod override — nuclei learn to respond to reinstated PFC context.
 
         reward_t = torch.tensor(reward, device=device, dtype=torch.float32)
 
