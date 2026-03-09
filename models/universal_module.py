@@ -2801,13 +2801,14 @@ class MACHActivationHebbian(nn.Module):
         self.pfc_gru = nn.GRUCell(32, 32)          # recurrent task representation
         self.register_buffer('_pfc_state', torch.zeros(1, 32))
         # Per-patch gate from PFC state
-        self.context_gates = nn.ModuleList([
-            nn.Linear(32, d_model) for _ in patch_layers
-        ])
+        # Per-patch scalar gates from PFC: "how much to USE this patch"
+        # (complementary to eta which controls "how much to LEARN")
+        # Brain-faithful: PFC modulates at region level, not individual synapses.
+        # Linear(32→n_patches) instead of n_patches × Linear(32→d_model).
+        self.context_gates = nn.Linear(32, len(patch_layers))
         # Initialize bias to +1 so sigmoid ≈ 0.73 — mostly open by default
         with torch.no_grad():
-            for gate in self.context_gates:
-                gate.bias.fill_(1.0)
+            self.context_gates.bias.fill_(1.0)
 
         # Evolutionary priors: sensible starting points (like evolved receptor sensitivity)
         # decay: sigmoid(2.0) ≈ 0.88 — retain most of patch memory by default
@@ -2900,9 +2901,10 @@ class MACHActivationHebbian(nn.Module):
         # per element; allow slight overshoot from hippocampal additions.
         self._pfc_state = self._pfc_state.clamp(-2.0, 2.0)
         h = self._pfc_state.squeeze(0)  # (32,)
-        # Per-patch gates from PFC task representation
+        # Per-patch scalar gates from PFC task representation
+        gates = torch.sigmoid(self.context_gates(h))  # (n_patches,)
         for i in range(self.n_patches):
-            self._context_gate_values[i] = torch.sigmoid(self.context_gates[i](h))  # (d_model,)
+            self._context_gate_values[i] = gates[i]  # scalar
 
     def get_activation_summary(self):
         """Summarize captured activations for critic input.

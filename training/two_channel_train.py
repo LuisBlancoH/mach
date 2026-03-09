@@ -1749,14 +1749,11 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     torch.nn.utils.clip_grad_norm_(hipp_params, max_norm=1.0)
             optimizer.step()
             # Synaptic scaling: clamp context gate weights to prevent saturation.
-            # PFC exploded at 98k because context_gate weights grew to ~50,
-            # saturating sigmoid → killing gradient → unbounded PFC state growth.
             # Brain analogy: homeostatic synaptic scaling keeps weights in functional range.
-            if hasattr(mach, 'context_gates'):
+            if hasattr(mach, 'context_gates') and hasattr(mach.context_gates, 'weight'):
                 with torch.no_grad():
-                    for gate in mach.context_gates:
-                        gate.weight.clamp_(-2.0, 2.0)
-                        gate.bias.clamp_(-3.0, 3.0)
+                    mach.context_gates.weight.clamp_(-2.0, 2.0)
+                    mach.context_gates.bias.clamp_(-3.0, 3.0)
             optimizer.zero_grad()
 
             # Detach patch deltas and critic state (break computation graph, keep values)
@@ -2247,8 +2244,11 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
     if hasattr(mach, '_context_gate_values') and mach._context_gate_values:
         for i, gate in mach._context_gate_values.items():
             g = gate.detach()
-            diag[f"context_gate/patch{i}_mean"] = g.mean().item()
-            diag[f"context_gate/patch{i}_std"] = g.std().item()
+            if g.dim() == 0:
+                diag[f"context_gate/patch{i}"] = g.item()  # scalar gate
+            else:
+                diag[f"context_gate/patch{i}_mean"] = g.mean().item()
+                diag[f"context_gate/patch{i}_std"] = g.std().item()
     else:
         diag["context_gate/EMPTY"] = 1.0
     if hasattr(mach, '_pfc_state') and mach._pfc_state is not None:
@@ -2263,9 +2263,10 @@ def _log_hebbian_diagnostics(mach, meta_params, episode_idx, hippocampus=None):
             for pname, p in mod.named_parameters():
                 diag[f"weight/{name}.{pname}"] = p.data.norm().item()
     if hasattr(mach, 'context_gates'):
-        for i, gate in enumerate(mach.context_gates):
-            for pname, p in gate.named_parameters():
-                diag[f"weight/context_gate{i}.{pname}"] = p.data.norm().item()
+        mod = mach.context_gates
+        if hasattr(mod, 'named_parameters'):
+            for pname, p in mod.named_parameters():
+                diag[f"weight/context_gates.{pname}"] = p.data.norm().item()
 
     # Neuromodulation stats
     if hasattr(mach, '_last_etas') and mach._last_etas is not None:
