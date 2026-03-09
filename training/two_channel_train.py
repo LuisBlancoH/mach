@@ -1530,6 +1530,7 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
     sleep_patch_deltas = []
     # Per-operation context gate tracking
     _op_gate_accum = {}  # {op: {patch_idx: [gate_values]}}
+    _op_ctx_accum = {}   # {op: {patch_idx: [context_vectors]}}
 
     for step in range(n_steps):
         # Switch operation randomly (like encountering different tasks)
@@ -1660,12 +1661,17 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
         # Hebbian step (no episode info — step_idx and n_steps are meaningless)
         value, _ = mach.hebbian_step(reward, 0, 1, device)
 
-        # Track per-op context gate values
+        # Track per-op context gate values and PFC context vectors
         if hasattr(mach, '_context_gate_values') and mach._context_gate_values:
             if current_op not in _op_gate_accum:
                 _op_gate_accum[current_op] = {}
             for i, g in mach._context_gate_values.items():
                 _op_gate_accum[current_op].setdefault(i, []).append(g.detach().item())
+        if hasattr(mach, '_pfc_context') and mach._pfc_context:
+            if current_op not in _op_ctx_accum:
+                _op_ctx_accum[current_op] = {}
+            for i, ctx in mach._pfc_context.items():
+                _op_ctx_accum[current_op].setdefault(i, []).append(ctx.detach().clone())
 
         # Hippocampus: update dynamics from nuclei, reconsolidate, then store
         if hippocampus is not None:
@@ -1886,6 +1892,31 @@ def meta_train_continuous(base_model, mach, patched_model, tokenizer,
                     )
                     print(f"    {op:<10} {gates_str}")
                 _op_gate_accum.clear()
+            # Per-operation PFC top-down context: cosine similarity between ops
+            if _op_ctx_accum and len(_op_ctx_accum) > 1:
+                # Compute mean context vector per (op, patch)
+                op_means = {}
+                for op, patches in _op_ctx_accum.items():
+                    op_means[op] = {}
+                    for i, vecs in patches.items():
+                        op_means[op][i] = torch.stack(vecs).mean(dim=0)
+                ops = sorted(op_means.keys())
+                print("  PFC top-down context similarity (cosine) between operations:")
+                for i in range(len(mach.patches)):
+                    # Pairwise cosine sim for this patch
+                    sims = []
+                    for a_idx in range(len(ops)):
+                        for b_idx in range(a_idx + 1, len(ops)):
+                            va = op_means[ops[a_idx]].get(i)
+                            vb = op_means[ops[b_idx]].get(i)
+                            if va is not None and vb is not None:
+                                cos = torch.nn.functional.cosine_similarity(va, vb, dim=0).item()
+                                sims.append(cos)
+                    if sims:
+                        avg_cos = sum(sims) / len(sims)
+                        min_cos = min(sims)
+                        print(f"    patch{i}: avg_cos={avg_cos:.3f} min_cos={min_cos:.3f}")
+                _op_ctx_accum.clear()
             # Sleep cycle stats
             if sleep_nrem_total > 0 or sleep_rem_total > 0:
                 rem_avg_td = sum(abs(t) for t in sleep_rem_td_errors) / len(sleep_rem_td_errors) if sleep_rem_td_errors else 0
