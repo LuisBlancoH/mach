@@ -187,8 +187,9 @@ def main():
         torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
         optimizer.step()
 
-        # Check accuracy
+        # Check accuracy (fresh beliefs for generation)
         with torch.no_grad():
+            cortex.reset()
             prompt_ids = tokenizer(
                 p["prompt"], return_tensors="pt"
             ).input_ids.to(config.DEVICE)
@@ -258,6 +259,7 @@ def main():
                 n_correct = 0
                 for ep in eval_problems:
                     with torch.no_grad():
+                        cortex.reset()
                         prompt_ids = tokenizer(
                             ep["prompt"], return_tensors="pt"
                         ).input_ids.to(config.DEVICE)
