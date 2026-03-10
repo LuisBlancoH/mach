@@ -373,13 +373,18 @@ class ColumnarCortex(nn.Module):
                 bottom_up = column_input
             else:
                 bottom_up = self.areas[area_idx - 1].beliefs
-                if bottom_up is None:
-                    bottom_up = column_input  # fallback
+                # Fallback if no beliefs or stale shape from previous seq
+                if (bottom_up is None or
+                        bottom_up.shape[0] != column_input.shape[0]):
+                    bottom_up = column_input
 
             # Top-down prediction from area above
             top_down = None
             if area_idx < self.n_areas - 1:
                 top_down = self.areas[area_idx + 1].get_predictions()
+                # Shape guard: skip stale predictions from previous seq length
+                if top_down is not None and top_down.shape[0] != bottom_up.shape[0]:
+                    top_down = None
 
             area.settle_step(bottom_up, top_down, think_round=think_round)
 
