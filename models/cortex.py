@@ -259,38 +259,40 @@ class Cortex(nn.Module):
         self._observations[layer_idx] = hidden_state.detach()
 
     def think(self, qwen_final_hidden):
-        """Process observations through the PC hierarchy.
+        """Process observations through the PC hierarchy per-position.
 
         Takes multi-scale Qwen observations, fuses them, settles the
-        cortical hierarchy, and produces a modified hidden state for
-        generation.
+        cortical hierarchy independently at each sequence position, and
+        produces per-position modified hidden states for generation.
+
+        Each position gets its own settling — like the brain processing
+        each word/token with its own cortical column.
 
         Args:
             qwen_final_hidden: (batch, seq, d_model) Qwen's final hidden state
-                               (what it would normally generate from)
 
         Returns:
             output_hidden: (batch, seq, d_model) modified hidden state for LM head
         """
+        batch, seq, _ = qwen_final_hidden.shape
+
         # Project each observed layer into cortical space
         projected = []
         for i in range(len(self.observe_layers)):
             obs = self._observations.get(i)
             if obs is None:
-                # Fallback: use zeros if layer wasn't captured
-                batch, seq = qwen_final_hidden.shape[:2]
                 obs = torch.zeros(batch, seq, self.d_model,
                                   device=qwen_final_hidden.device)
             projected.append(self.input_projs[i](obs.float()))
 
-        # Fuse multi-scale inputs: (batch, seq, d_cortical * n_obs) → (batch, seq, d_cortical)
+        # Fuse: (batch, seq, d_cortical * n_obs) → (batch, seq, d_cortical)
         fused = self.fuse(torch.cat(projected, dim=-1))
 
-        # Pool over sequence for cortical processing
-        # The cortex processes a "gestalt" — like the brain integrating a whole scene
-        cortical_input = fused.mean(dim=1)  # (batch, d_cortical)
+        # Reshape to process all positions as a batch
+        # (batch, seq, d_cortical) → (batch * seq, d_cortical)
+        cortical_input = fused.view(batch * seq, self.d_cortical)
 
-        # Settle the PC hierarchy
+        # Settle the PC hierarchy (operates on all positions simultaneously)
         x = cortical_input
         for layer in self.layers:
             x = layer.compress(x)
@@ -310,18 +312,16 @@ class Cortex(nn.Module):
                 layer.compute_error(compressed, pred_from_above)
                 x = layer._activations
 
-        top_activation = self.layers[-1]._activations  # (batch, d_cortical)
+        # (batch * seq, d_cortical)
+        top_activation = self.layers[-1]._activations
 
-        # Project cortex output to Qwen's representation space
-        # (batch, d_cortical) → (batch, d_model) → expand to seq
-        cortex_output = self.output_proj(top_activation)  # (batch, d_model)
-        cortex_output = cortex_output.unsqueeze(1).expand_as(qwen_final_hidden)
+        # Project back to Qwen space: (batch * seq, d_cortical) → (batch * seq, d_model)
+        cortex_output = self.output_proj(top_activation)
+        cortex_output = cortex_output.view(batch, seq, self.d_model)
 
-        # Blend gate: how much to trust cortex vs original Qwen
-        gate_input = torch.cat([
-            top_activation.unsqueeze(1).expand(-1, qwen_final_hidden.shape[1], -1),
-            qwen_final_hidden.float()
-        ], dim=-1)
+        # Blend gate per position
+        top_for_gate = top_activation.view(batch, seq, self.d_cortical)
+        gate_input = torch.cat([top_for_gate, qwen_final_hidden.float()], dim=-1)
         gate = torch.sigmoid(self.blend_gate(gate_input))  # (batch, seq, 1)
         self._last_gate_value = gate.detach().mean().item()
 
