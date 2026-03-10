@@ -77,6 +77,11 @@ class CorticalArea(nn.Module):
         # === Layer norm (bounded firing rates) ===
         self.norm = nn.LayerNorm(d_col)
 
+        # === Inhibitory competition (genome) ===
+        # Temperature controls sharpness: low = winner-take-all, high = all equal
+        # Starts high (explore) and genome learns the right level
+        self.competition_temp = nn.Parameter(torch.tensor(2.0))
+
         # === State ===
         self.beliefs = None        # (batch, n_cols, d_col)
         self.W_error_delta = None  # (n_cols, d_col, d_col) — stays in graph
@@ -87,6 +92,7 @@ class CorticalArea(nn.Module):
         # Diagnostics
         self._last_error_norm = 0.0
         self._last_belief_norm = 0.0
+        self._last_sparsity = 0.0
 
     def reset(self):
         """Reset beliefs between inputs."""
@@ -114,12 +120,13 @@ class CorticalArea(nn.Module):
             return self.W_predict_base + self.W_predict_delta
         return self.W_predict_base
 
-    def settle_step(self, bottom_up, top_down=None):
+    def settle_step(self, bottom_up, top_down=None, think_round=0):
         """One settling iteration for all columns simultaneously.
 
         Args:
             bottom_up: (batch, n_cols, d_col) evidence from below
             top_down: (batch, n_cols, d_col) prediction from above, or None
+            think_round: current thinking round (higher = sharper competition)
         """
         # Initialize beliefs, or reinitialize if batch size changed
         # (happens during generation as sequence grows)
@@ -164,6 +171,14 @@ class CorticalArea(nn.Module):
             new_beliefs.reshape(b * n, d)
         ).reshape(b, n, d)
 
+        # 8. Inhibitory competition: columns compete for activation
+        # Temperature decreases with thinking rounds (explore → sharpen)
+        # temp = base_temp / (1 + round), so later rounds are sharper
+        temp = F.softplus(self.competition_temp) / (1.0 + think_round)
+        strengths = self.beliefs.norm(dim=-1)  # (batch, n_cols)
+        competition = F.softmax(strengths / (temp + 1e-6), dim=-1)  # (batch, n_cols)
+        self.beliefs = self.beliefs * competition.unsqueeze(-1)
+
         # Store for Hebbian learning
         self._last_error = weighted_error
         self._last_bottom_up = bottom_up
@@ -171,6 +186,8 @@ class CorticalArea(nn.Module):
         # Diagnostics
         self._last_error_norm = weighted_error.detach().norm().item()
         self._last_belief_norm = self.beliefs.detach().norm().item()
+        self._last_sparsity = (competition.max(dim=-1).values.mean().item()
+                               - 1.0 / self.n_columns)
 
     def get_predictions(self):
         """Generate top-down predictions from current beliefs."""
@@ -332,11 +349,12 @@ class ColumnarCortex(nn.Module):
         """Capture a Qwen hidden state (read-only)."""
         self._observations[obs_idx] = hidden_state.detach()
 
-    def _settle_once(self, column_input):
+    def _settle_once(self, column_input, think_round=0):
         """Run one settling pass through the full hierarchy.
 
         Args:
             column_input: (batch*seq, n_columns, d_col) sensory input
+            think_round: current thinking round (for competition sharpening)
         """
         for area_idx in range(self.n_areas):
             area = self.areas[area_idx]
@@ -354,7 +372,7 @@ class ColumnarCortex(nn.Module):
             if area_idx < self.n_areas - 1:
                 top_down = self.areas[area_idx + 1].get_predictions()
 
-            area.settle_step(bottom_up, top_down)
+            area.settle_step(bottom_up, top_down, think_round=think_round)
 
     def think(self, qwen_final_hidden):
         """Process observations through the columnar hierarchy.
@@ -417,8 +435,9 @@ class ColumnarCortex(nn.Module):
                 prev_beliefs = None
 
             # Settle: n_settle iterations of bottom-up/top-down/lateral
+            # Competition sharpens with each thinking round
             for t in range(self.n_settle):
-                self._settle_once(column_input)
+                self._settle_once(column_input, think_round=think_round)
 
             self._last_think_rounds = think_round + 1
 
@@ -492,6 +511,10 @@ class ColumnarCortex(nn.Module):
             diag[f"cortex/area{a}_precision"] = (
                 torch.sigmoid(area.precision).mean().item()
             )
+            diag[f"cortex/area{a}_competition_temp"] = (
+                F.softplus(area.competition_temp).item()
+            )
+            diag[f"cortex/area{a}_sparsity"] = area._last_sparsity
         diag["cortex/correction_norm"] = self._last_correction_norm
         diag["cortex/think_rounds"] = self._last_think_rounds
         return diag
