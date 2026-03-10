@@ -121,8 +121,9 @@ class CorticalArea(nn.Module):
             bottom_up: (batch, n_cols, d_col) evidence from below
             top_down: (batch, n_cols, d_col) prediction from above, or None
         """
-        # Initialize beliefs from first input
-        if self.beliefs is None:
+        # Initialize beliefs, or reinitialize if batch size changed
+        # (happens during generation as sequence grows)
+        if self.beliefs is None or self.beliefs.shape[0] != bottom_up.shape[0]:
             self.beliefs = bottom_up.clone()
 
         # 1. Prediction error: what surprised me?
@@ -384,6 +385,9 @@ class ColumnarCortex(nn.Module):
                 obs = torch.zeros(
                     batch, seq, self.d_model, device=device
                 )
+            # Slice observations to match seq (e.g., last position only during generate)
+            if obs.shape[1] != seq:
+                obs = obs[:, -seq:, :]
             projected.append(self.obs_projs[i](obs.float()))
 
         # (batch, seq, d_col * n_obs)
@@ -572,11 +576,13 @@ class ColumnarCortexModel(nn.Module):
                     output_hidden_states=True,
                 )
 
-            qwen_final = outputs.hidden_states[-1]
-            cortex_output = self.cortex.think(qwen_final)
+            # Only pass last position to cortex — beliefs accumulate
+            # across tokens as working memory (batch dim stays consistent)
+            qwen_final_last = outputs.hidden_states[-1][:, -1:, :]
+            cortex_output = self.cortex.think(qwen_final_last)
 
             with torch.no_grad():
-                logits = self.base_model.lm_head(cortex_output[:, -1:, :])
+                logits = self.base_model.lm_head(cortex_output)
 
             next_token = logits.argmax(dim=-1)
             generated = torch.cat([generated, next_token], dim=1)
