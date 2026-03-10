@@ -50,6 +50,9 @@ class PredictiveCodingPatch(nn.Module):
         self.d_repr = d_repr
         self.hebbian = hebbian
 
+        # Normalize compressed representations (bounded firing rates)
+        self.compress_norm = nn.LayerNorm(d_repr)
+
         if hebbian:
             # Weights as buffers — updated by Hebbian rules, not optimizer
             # compress: d_model → d_repr
@@ -105,8 +108,8 @@ class PredictiveCodingPatch(nn.Module):
     def do_compress(self, h):
         """Bottom-up compression: Qwen hidden state → representation space."""
         if self.hebbian:
-            return self._linear(h, self.compress_W, self.compress_b)
-        return self.compress(h)
+            return self.compress_norm(self._linear(h, self.compress_W, self.compress_b))
+        return self.compress_norm(self.compress(h))
 
     def do_predict_down(self, representation):
         """Top-down prediction: my representation → what level below should see."""
