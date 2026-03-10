@@ -55,8 +55,12 @@ def main():
     )
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--continuous", action="store_true",
-                        help="Continuous training on diverse ops")
+                        help="Continuous training on diverse ops (gradient)")
+    parser.add_argument("--hebbian", action="store_true",
+                        help="Hebbian+RPE training (brain-faithful local rules)")
     parser.add_argument("--n-steps", type=int, default=10000)
+    parser.add_argument("--episode-len", type=int, default=20,
+                        help="Problems per episode (hebbian mode)")
     parser.add_argument("--d-repr", type=int, default=128,
                         help="Representation dimension")
     parser.add_argument("--prediction-weight", type=float, default=0.1,
@@ -85,6 +89,7 @@ def main():
         d_model=d_model,
         d_repr=args.d_repr,
         patch_layers=patch_layers,
+        hebbian=args.hebbian,
     ).to(config.DEVICE)
 
     n_params = sum(p.numel() for p in pc_network.parameters())
@@ -111,7 +116,34 @@ def main():
             print(f"  Difficulty {diff}: {acc:.2%}")
         return
 
-    if args.continuous:
+    if args.hebbian and args.continuous:
+        from training.predictive_coding_train import (
+            train_predictive_coding_hebbian,
+        )
+
+        save_path = (
+            f"checkpoints/pc_hebbian_diverse_ops"
+            f"_L{len(patch_layers)}_R{args.d_repr}.pt"
+        )
+        os.makedirs("checkpoints", exist_ok=True)
+
+        print(f"\n=== Hebbian+RPE Predictive Coding Training ===")
+        print(f"  n_steps={args.n_steps}, lr={args.lr}")
+        print(f"  episode_len={args.episode_len}")
+        print(f"  save_path={save_path}")
+        print(f"  Mode: compress/predict_down=self-supervised, "
+              f"precision/correction=TD-gated")
+
+        train_predictive_coding_hebbian(
+            patched_model, pc_network, tokenizer,
+            device=config.DEVICE,
+            n_steps=args.n_steps,
+            lr=args.lr,
+            episode_len=args.episode_len,
+            save_path=save_path,
+        )
+
+    elif args.continuous:
         from training.predictive_coding_train import (
             train_predictive_coding_continuous,
         )

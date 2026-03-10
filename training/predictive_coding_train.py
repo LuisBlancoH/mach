@@ -1,9 +1,10 @@
 """
-Direct backprop training for predictive coding patches.
+Training loops for predictive coding patches.
 
-Stripped-down training loop — no Hebbian, no nuclei, no PFC, no hippocampus.
-Pure gradient descent on CE loss + prediction loss, to verify the predictive
-coding architecture works before adding brain machinery.
+Two modes:
+  - Gradient: Direct backprop on CE + prediction loss (verification)
+  - Hebbian+RPE: Brain-faithful local learning rules with TD error gating
+    compress/predict_down are self-supervised, precision/correction are TD-gated
 """
 
 import copy
@@ -274,3 +275,185 @@ def train_predictive_coding_continuous(patched_model, pc_network, tokenizer,
                             n_correct += 1
                 print(f"  EVAL {eval_op:<10} | {n_correct}/{len(eval_problems)} = {n_correct/len(eval_problems):.0%}")
             pc_network.train()
+
+
+def train_predictive_coding_hebbian(patched_model, pc_network, tokenizer,
+                                     device, n_steps=10000, lr=1e-4,
+                                     grad_clip=1.0, episode_len=20,
+                                     checkpoint_path=None, save_path=None):
+    """Hebbian+RPE training for predictive coding patches.
+
+    Brain-faithful learning: patches update via local Hebbian rules gated by
+    TD error. Only the critic and meta-learned learning rates use gradient descent.
+
+    Each "episode" is episode_len problems of the same operation. Between episodes,
+    patch buffers are reset (like the brain encountering a new task).
+    """
+    from training.two_channel_train import (
+        DIVERSE_TRAIN_OPS, generate_few_shot_episode
+    )
+    from data.arithmetic import extract_number
+
+    # Only train critic + learning rate parameters (not the patch buffers)
+    trainable = [p for p in pc_network.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable, lr=lr)
+
+    # Load checkpoint
+    start_step = 0
+    if save_path:
+        import os
+        if os.path.exists(save_path):
+            ckpt = torch.load(save_path, map_location=device, weights_only=False)
+            pc_network.load_state_dict(ckpt['pc_network'])
+            optimizer.load_state_dict(ckpt['optimizer'])
+            start_step = ckpt.get('step', 0)
+            print(f"  Resumed from step {start_step}")
+
+    pc_network.train()
+    current_op = random.choice(DIVERSE_TRAIN_OPS)
+    op_step_count = 0
+
+    all_correct = []
+    episode_correct = []
+    step_timer = time.time()
+    total_critic_loss = 0.0
+
+    for step in range(start_step, n_steps):
+        # Switch operation and reset patches every episode_len steps
+        op_step_count += 1
+        if op_step_count > episode_len:
+            current_op = random.choice(DIVERSE_TRAIN_OPS)
+            op_step_count = 1
+            pc_network.reset_episode()
+            episode_correct = []
+
+        # Generate one problem
+        problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
+        p = problems[0]
+
+        # Forward pass (two-pass: capture → settle → correct)
+        with torch.no_grad():
+            full_text = p["prompt"] + p["answer"]
+            encoding = tokenizer(full_text, return_tensors="pt").to(device)
+            input_ids = encoding.input_ids
+
+        # Settle captures traces for Hebbian update
+        pc_network._mode = "capture"
+        pc_network._captured.clear()
+        pc_network._corrections.clear()
+        with torch.no_grad():
+            patched_model.base_model(input_ids=input_ids)
+
+        # Settle (traces stored for Hebbian)
+        pc_network.settle()
+
+        # Check accuracy via generation
+        with torch.no_grad():
+            prompt_ids = tokenizer(p["prompt"], return_tensors="pt").input_ids.to(device)
+            gen = patched_model.generate(
+                prompt_ids, max_new_tokens=20,
+                do_sample=False, temperature=None, top_p=None
+            )
+            gen_text = tokenizer.decode(gen[0][prompt_ids.shape[1]:], skip_special_tokens=True)
+            pred_num = extract_number(gen_text)
+            correct = (pred_num == p.get("numerical_answer"))
+
+        reward = 1.0 if correct else -0.5
+        all_correct.append(1.0 if correct else 0.0)
+        episode_correct.append(1.0 if correct else 0.0)
+
+        # Hebbian+RPE update (local rules + TD error)
+        critic_loss = pc_network.hebbian_step(reward, device)
+
+        # Train critic + learning rates via gradient
+        if isinstance(critic_loss, torch.Tensor) and critic_loss.requires_grad:
+            optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+            optimizer.step()
+            total_critic_loss += critic_loss.item()
+
+        # Logging
+        if (step + 1) % 100 == 0:
+            recent = all_correct[-100:]
+            acc = sum(recent) / len(recent)
+            ep_acc = sum(episode_correct) / max(len(episode_correct), 1)
+            elapsed = time.time() - step_timer
+            rate = 100 / elapsed if elapsed > 0 else 0
+            step_timer = time.time()
+            avg_cl = total_critic_loss / 100
+            total_critic_loss = 0.0
+
+            print(
+                f"Step {step+1:5d} | op={current_op:<10} | "
+                f"acc(100)={acc:.0%} ep_acc={ep_acc:.0%} "
+                f"critic={avg_cl:.4f} [{rate:.1f} st/s]"
+            )
+
+        # Diagnostics + checkpoint
+        if (step + 1) % 2000 == 0:
+            diag = pc_network.get_diagnostics()
+            print("  Diagnostics:")
+            for key in sorted(diag.keys()):
+                val = diag[key]
+                print(f"    {key}: {val:.6f}" if abs(val) < 0.01 else f"    {key}: {val:.4f}")
+
+            # Gradient norms (critic + etas only)
+            print("  Gradient norms:")
+            for name, param in pc_network.named_parameters():
+                if param.grad is not None:
+                    print(f"    {name}: {param.grad.norm().item():.6f}")
+
+            # Save checkpoint
+            if save_path:
+                torch.save({
+                    'pc_network': pc_network.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'step': step + 1,
+                }, save_path)
+                print(f"  Checkpoint saved to {save_path}")
+
+            # Quick eval
+            print(f"  --- Validation (step {step+1}) ---")
+            eval_ops = DIVERSE_TRAIN_OPS[:6]
+            for eval_op in eval_ops:
+                eval_problems = generate_few_shot_episode(
+                    20, n_demos=0, op_type=eval_op
+                )
+                # Reset for eval episode
+                pc_network.reset_episode()
+                n_correct = 0
+                for j, ep in enumerate(eval_problems):
+                    with torch.no_grad():
+                        # Capture + settle
+                        pc_network._mode = "capture"
+                        pc_network._captured.clear()
+                        pc_network._corrections.clear()
+                        eval_ids = tokenizer(
+                            ep["prompt"] + ep["answer"], return_tensors="pt"
+                        ).input_ids.to(device)
+                        patched_model.base_model(input_ids=eval_ids)
+                        pc_network.settle()
+
+                        # Generate
+                        prompt_ids = tokenizer(
+                            ep["prompt"], return_tensors="pt"
+                        ).input_ids.to(device)
+                        gen = patched_model.generate(
+                            prompt_ids, max_new_tokens=20,
+                            do_sample=False, temperature=None, top_p=None
+                        )
+                        gen_text = tokenizer.decode(
+                            gen[0][prompt_ids.shape[1]:],
+                            skip_special_tokens=True
+                        )
+                        pred_num = extract_number(gen_text)
+                        correct = (pred_num == ep.get("numerical_answer"))
+
+                    # Hebbian update during eval too (within-episode learning)
+                    reward = 1.0 if correct else -0.5
+                    pc_network.hebbian_step(reward, device)
+                    if correct:
+                        n_correct += 1
+                print(f"  EVAL {eval_op:<10} | {n_correct}/{len(eval_problems)} = {n_correct/len(eval_problems):.0%}")
+            pc_network.reset_episode()  # clean up after eval
