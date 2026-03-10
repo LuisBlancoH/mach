@@ -163,6 +163,9 @@ def main():
         problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
         p = problems[0]
 
+        # Reset beliefs for new problem (working memory starts fresh)
+        cortex.reset()
+
         full_text = p["prompt"] + p["answer"]
         encoding = tokenizer(full_text, return_tensors="pt").to(config.DEVICE)
         input_ids = encoding.input_ids

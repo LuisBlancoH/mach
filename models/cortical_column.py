@@ -364,8 +364,10 @@ class ColumnarCortex(nn.Module):
         )
 
         # --- 2. Settling loop ---
-        for area in self.areas:
-            area.reset()
+        # NOTE: beliefs persist across tokens within a problem.
+        # Only observations are cleared (new input each token).
+        # This gives the cortex working memory for reasoning.
+        self._observations.clear()
 
         for t in range(self.n_settle):
             for area_idx in range(self.n_areas):
@@ -485,7 +487,8 @@ class ColumnarCortexModel(nn.Module):
         return self.base_model.device
 
     def forward(self, input_ids, labels=None, attention_mask=None):
-        self.cortex.reset()
+        # Don't reset cortex here — beliefs persist within a problem.
+        # The training loop calls cortex.reset() between problems.
 
         with torch.no_grad():
             outputs = self.base_model(
@@ -522,7 +525,7 @@ class ColumnarCortexModel(nn.Module):
         generated = input_ids.clone()
 
         for _ in range(max_new_tokens):
-            self.cortex.reset()
+            # Don't reset — beliefs carry across tokens (working memory)
 
             with torch.no_grad():
                 outputs = self.base_model(
