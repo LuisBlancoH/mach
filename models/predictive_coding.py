@@ -189,7 +189,7 @@ class PredictiveCodingNetwork(nn.Module):
     """
 
     def __init__(self, d_model, d_repr=128, patch_layers=None, n_settle=3,
-                 hebbian=False, correction_scale=0.01):
+                 hebbian=False, correction_scale=0.1):
         super().__init__()
         if patch_layers is None:
             patch_layers = [9, 18, 27, 34]
@@ -198,11 +198,7 @@ class PredictiveCodingNetwork(nn.Module):
         self.d_repr = d_repr
         self.n_settle = n_settle
         self.hebbian = hebbian
-        # Learnable correction scale — starts small, gradient pushes up when useful
-        # log-space so it stays positive: actual_scale = sigmoid(param) * 0.5
-        self.correction_scale_logit = nn.Parameter(
-            torch.tensor(-4.0)  # sigmoid(-4) ≈ 0.018 → 0.018 * 0.5 ≈ 0.009
-        )
+        self.correction_scale = correction_scale
 
         self.patches = nn.ModuleList([
             PredictiveCodingPatch(d_model, d_repr, hebbian=hebbian)
@@ -305,9 +301,7 @@ class PredictiveCodingNetwork(nn.Module):
             )
 
             correction = self.patches[i].do_error_to_correction(weighted_error)
-            # Scale corrections — learnable, starts small, gradient pushes up
-            scale = torch.sigmoid(self.correction_scale_logit) * 0.5
-            self._corrections[i] = correction * scale
+            self._corrections[i] = correction * self.correction_scale
 
             if pred is not None and i in representations:
                 actual_repr = compressed[i].detach().mean(dim=1)
@@ -449,7 +443,7 @@ class PredictiveCodingNetwork(nn.Module):
         for i, corr in self._corrections.items():
             if corr is not None:
                 diag[f"pc/patch{i}_correction_norm"] = corr.detach().norm().item()
-        diag["pc/correction_scale"] = (torch.sigmoid(self.correction_scale_logit) * 0.5).item()
+        diag["pc/correction_scale"] = self.correction_scale
         # Hebbian-specific diagnostics
         if self.hebbian:
             for i, patch in enumerate(self.patches):
