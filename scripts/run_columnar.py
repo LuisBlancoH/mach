@@ -21,6 +21,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn.functional as F
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -166,40 +167,56 @@ def main():
         problems = generate_few_shot_episode(1, n_demos=0, op_type=current_op)
         p = problems[0]
 
-        # Reset beliefs for new problem (working memory starts fresh)
+        # Fresh beliefs for new problem
         cortex.reset()
 
-        full_text = p["prompt"] + p["answer"]
-        encoding = tokenizer(full_text, return_tensors="pt").to(config.DEVICE)
-        input_ids = encoding.input_ids
+        prompt_text = p["prompt"]
+        answer_text = p["answer"]
 
-        prompt_len = len(tokenizer(p["prompt"]).input_ids)
-        labels = input_ids.clone()
-        labels[0, :prompt_len] = -100
+        prompt_ids = tokenizer(
+            prompt_text, return_tensors="pt"
+        ).input_ids.to(config.DEVICE)
+        answer_ids = tokenizer(
+            answer_text, return_tensors="pt"
+        ).input_ids.to(config.DEVICE)
 
-        # Forward
-        outputs = cortex_model(input_ids=input_ids, labels=labels)
-        ce_loss = outputs.loss
+        # Token-by-token training: beliefs carry across tokens
+        # This trains the cortex to USE working memory for reasoning.
+        context_ids = prompt_ids.clone()
+        total_ce = 0.0
+        pred_tokens = []
 
-        # Gradient step
-        optimizer.zero_grad()
-        ce_loss.backward()
-        torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
-        optimizer.step()
+        for t in range(answer_ids.shape[1]):
+            target_id = answer_ids[0, t].unsqueeze(0)
 
-        # Check accuracy (fresh beliefs for generation)
-        with torch.no_grad():
-            cortex.reset()
-            prompt_ids = tokenizer(
-                p["prompt"], return_tensors="pt"
-            ).input_ids.to(config.DEVICE)
-            gen = cortex_model.generate(prompt_ids, max_new_tokens=20)
-            gen_text = tokenizer.decode(
-                gen[0][prompt_ids.shape[1]:], skip_special_tokens=True
+            # Forward with current context (beliefs persist!)
+            outputs = cortex_model(input_ids=context_ids)
+            # Logits for last position → predict next token
+            logits = outputs.logits[0, -1, :]
+
+            token_loss = F.cross_entropy(logits.unsqueeze(0), target_id)
+
+            # Backward per token (can't accumulate through settle)
+            optimizer.zero_grad()
+            token_loss.backward()
+            torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
+            optimizer.step()
+
+            total_ce += token_loss.item()
+            pred_tokens.append(logits.argmax().item())
+
+            # Teacher forcing: append true token
+            context_ids = torch.cat(
+                [context_ids, target_id.unsqueeze(0)], dim=1
             )
-            pred_num = extract_number(gen_text)
-            correct = (pred_num == p.get("numerical_answer"))
-            all_correct.append(1.0 if correct else 0.0)
+
+        ce_loss_avg = total_ce / max(answer_ids.shape[1], 1)
+
+        # Check accuracy: did the cortex predict the answer correctly?
+        pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
+        pred_num = extract_number(pred_text)
+        correct = (pred_num == p.get("numerical_answer"))
+        all_correct.append(1.0 if correct else 0.0)
 
         # Hebbian update
         reward = 1.0 if correct else -0.5
@@ -217,7 +234,7 @@ def main():
             rounds = cortex._last_think_rounds
             print(
                 f"Step {step+1:5d} | op={current_op:<10} | "
-                f"acc(100)={acc:.0%} ce={ce_loss.item():.3f} "
+                f"acc(100)={acc:.0%} ce={ce_loss_avg:.3f} "
                 f"corr={corr:.2f} think={rounds} [{rate:.1f} st/s]"
             )
 
