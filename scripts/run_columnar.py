@@ -190,9 +190,10 @@ def main():
             target_id = answer_ids[0, t].unsqueeze(0)
 
             # Forward with current context (beliefs persist!)
+            # Cortex processes only last position (matches generate)
             outputs = cortex_model(input_ids=context_ids)
-            # Logits for last position → predict next token
-            logits = outputs.logits[0, -1, :]
+            # Logits shape: (batch, 1, vocab) — last position only
+            logits = outputs.logits[0, 0, :]
 
             token_loss = F.cross_entropy(logits.unsqueeze(0), target_id)
 

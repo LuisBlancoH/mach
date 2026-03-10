@@ -590,19 +590,20 @@ class ColumnarCortexModel(nn.Module):
                 output_hidden_states=True,
             )
 
-        qwen_final = outputs.hidden_states[-1]
-        cortex_output = self.cortex.think(qwen_final)
+        # Process only last position through cortex (matches generate behavior)
+        # This ensures train and test use the same cortex processing mode.
+        qwen_final_last = outputs.hidden_states[-1][:, -1:, :]
+        cortex_output = self.cortex.think(qwen_final_last)
+        # Get logits only for last position
         logits = self.base_model.lm_head(cortex_output)
 
         loss = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            # logits is (batch, 1, vocab) — predict next token after last position
+            # For token-by-token training, labels should have the target at position 0
+            shift_logits = logits[:, 0, :]  # (batch, vocab)
+            # We don't use labels here — the training loop handles CE directly
+            pass
 
         self._last_loss = loss
         self._last_logits = logits
