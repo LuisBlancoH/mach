@@ -484,6 +484,15 @@ class ColumnarCortex(nn.Module):
         self._last_correction_norm = correction.detach().norm().item()
 
         output = qwen_final_hidden.float() + correction
+
+        # Detach beliefs: preserve values as working memory but cut the graph.
+        # Each token gets a fresh graph for backward, while beliefs carry
+        # forward as persistent state (like biological working memory —
+        # the content persists but doesn't drag computation history).
+        for area in self.areas:
+            if area.beliefs is not None:
+                area.beliefs = area.beliefs.detach()
+
         return output.to(qwen_final_hidden.dtype)
 
     def compute_value(self):
