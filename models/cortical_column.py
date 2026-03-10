@@ -309,6 +309,15 @@ class ColumnarCortex(nn.Module):
         )
         self.fuse_b = nn.Parameter(torch.zeros(n_columns, d_col))
 
+        # === Re-entry: feed cortex output back as new input ===
+        # This is cortical re-entry — the cortex processes its own conclusions.
+        # Projects top-area beliefs back into column input space so each
+        # thinking round sees its own previous output as new evidence.
+        self.reentry_proj = nn.Linear(n_columns * d_col, n_columns * d_col)
+        # Initialize near-zero so first round is driven by observations
+        nn.init.normal_(self.reentry_proj.weight, std=0.01)
+        nn.init.zeros_(self.reentry_proj.bias)
+
         # === Cortical areas (hierarchy) ===
         self.areas = nn.ModuleList([
             CorticalArea(n_columns, d_col, n_heads) for _ in range(n_areas)
@@ -422,10 +431,13 @@ class ColumnarCortex(nn.Module):
         # Clear observations (already projected)
         self._observations.clear()
 
-        # --- 2. Thinking loop: reason before speaking ---
-        # Each round: settle the hierarchy. Beliefs persist across rounds.
-        # Stop early when beliefs have stabilized (natural convergence).
+        # --- 2. Thinking loop: reason via cortical re-entry ---
+        # Round 1: settle on observations (perception)
+        # Round 2+: settle on observations + own previous output (reasoning)
+        # Each round, the cortex processes something DIFFERENT because its
+        # own conclusions feed back as new evidence. This is reasoning.
         self._last_think_rounds = 0
+        effective_input = column_input
 
         for think_round in range(self.n_think):
             # Snapshot beliefs before this round (for convergence check)
@@ -437,7 +449,7 @@ class ColumnarCortex(nn.Module):
             # Settle: n_settle iterations of bottom-up/top-down/lateral
             # Competition sharpens with each thinking round
             for t in range(self.n_settle):
-                self._settle_once(column_input, think_round=think_round)
+                self._settle_once(effective_input, think_round=think_round)
 
             self._last_think_rounds = think_round + 1
 
@@ -448,6 +460,14 @@ class ColumnarCortex(nn.Module):
                 ).norm().item()
                 if belief_change < self.think_epsilon:
                     break  # cortex has settled — done thinking
+
+            # Re-entry: feed own conclusions back as new evidence
+            # Next round sees observations + what the cortex just concluded
+            top_beliefs = self.areas[-1].beliefs
+            reentry = self.reentry_proj(
+                top_beliefs.reshape(top_beliefs.shape[0], -1)
+            ).reshape(top_beliefs.shape[0], self.n_columns, self.d_col)
+            effective_input = column_input + reentry
 
         # --- 3. Output ---
         top_beliefs = self.areas[-1].beliefs  # (batch*seq, n_cols, d_col)
