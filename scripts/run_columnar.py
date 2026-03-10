@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-Cortex experiment: PC network that reads from Qwen and proposes output.
+Columnar cortex experiment: cortical columns reading from Qwen.
 
-Qwen runs fully intact (frozen). The cortex observes hidden states at
-multiple layers, processes through a predictive coding hierarchy, and
-produces a modified final hidden state for generation.
-
-No patching. No corruption. Qwen computes normally.
+Each column is a small predictive coding unit with meta-learned Hebbian plasticity.
+Columns communicate via lateral attention within areas, and via top-down/bottom-up
+connections between areas.
 
 Usage:
-    # Continuous training on diverse operations
-    python scripts/run_cortex.py --n-steps 10000
-
-    # Baseline comparison
-    python scripts/run_cortex.py --baseline-only
+    python scripts/run_columnar.py --n-steps 10000
+    python scripts/run_columnar.py --baseline-only
+    python scripts/run_columnar.py --d-col 128 --n-columns 20 --n-areas 3
 """
 
 import argparse
@@ -29,7 +25,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import config
-from models.cortex import Cortex, CortexModel
+from models.cortical_column import ColumnarCortex, ColumnarCortexModel
 
 
 def load_base_model():
@@ -49,13 +45,19 @@ def load_base_model():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cortex Experiment")
+    parser = argparse.ArgumentParser(description="Columnar Cortex")
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--n-steps", type=int, default=10000)
-    parser.add_argument("--d-cortical", type=int, default=512)
-    parser.add_argument("--n-cortex-layers", type=int, default=4)
+    parser.add_argument("--d-col", type=int, default=64,
+                        help="Dimension per column")
+    parser.add_argument("--n-columns", type=int, default=40,
+                        help="Number of columns per area")
+    parser.add_argument("--n-areas", type=int, default=3,
+                        help="Number of hierarchical areas")
     parser.add_argument("--n-settle", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--n-heads", type=int, default=4,
+                        help="Attention heads for lateral communication")
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--n-observe-layers", type=int, default=4)
     args = parser.parse_args()
 
@@ -74,12 +76,14 @@ def main():
 
     print(f"Observe layers: {observe_layers}")
 
-    # Create cortex
-    cortex = Cortex(
+    # Create columnar cortex
+    cortex = ColumnarCortex(
         d_model=d_model,
-        d_cortical=args.d_cortical,
-        n_layers=args.n_cortex_layers,
+        d_col=args.d_col,
+        n_columns=args.n_columns,
+        n_areas=args.n_areas,
         n_settle=args.n_settle,
+        n_heads=args.n_heads,
         observe_layers=observe_layers,
     ).to(config.DEVICE)
 
@@ -87,8 +91,11 @@ def main():
     n_buffers = sum(b.numel() for b in cortex.buffers())
     print(f"Cortex params (genome): {n_params:,}")
     print(f"Cortex buffers (plastic): {n_buffers:,}")
+    print(f"  d_col={args.d_col}, n_columns={args.n_columns}, "
+          f"n_areas={args.n_areas}")
+    print(f"  Total cortex width: {args.d_col * args.n_columns}")
 
-    cortex_model = CortexModel(model, cortex)
+    cortex_model = ColumnarCortexModel(model, cortex)
 
     if args.baseline_only:
         from evaluation.baseline import evaluate_model
@@ -101,11 +108,11 @@ def main():
                                  label=f"baseline d{diff}")
             print(f"  Difficulty {diff}: {acc:.2%}")
 
-        print("\n=== Cortex (untrained) ===")
+        print("\n=== Columnar Cortex (untrained) ===")
         for diff in [6, 7, 8, 9]:
             problems = generate_arithmetic_problems(200, diff)
             acc = evaluate_model(cortex_model, tokenizer, problems,
-                                 label=f"cortex d{diff}")
+                                 label=f"columnar d{diff}")
             print(f"  Difficulty {diff}: {acc:.2%}")
         return
 
@@ -115,34 +122,25 @@ def main():
     )
     from data.arithmetic import extract_number
 
-    # Optimizer for genome (input/output projections, critic, norms, precision)
-    genome_params = []
-    genome_params.extend(cortex.input_projs.parameters())
-    genome_params.extend(cortex.fuse.parameters())
-    genome_params.extend(cortex.output_proj.parameters())
-    genome_params.extend(cortex.critic.parameters())
-    for layer in cortex.layers:
-        genome_params.append(layer.precision_logit)
-        genome_params.extend(layer.norm.parameters())
-
+    # Optimizer for genome (all nn.Parameters in cortex)
+    genome_params = [p for p in cortex.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(genome_params, lr=args.lr)
 
-    # Load checkpoint
-    save_path = (f"checkpoints/cortex_diverse_ops"
-                 f"_L{args.n_cortex_layers}_C{args.d_cortical}.pt")
+    # Checkpoint
+    save_path = (f"checkpoints/columnar_"
+                 f"C{args.n_columns}x{args.d_col}_A{args.n_areas}.pt")
     os.makedirs("checkpoints", exist_ok=True)
     start_step = 0
     if os.path.exists(save_path):
-        ckpt = torch.load(save_path, map_location=config.DEVICE, weights_only=False)
+        ckpt = torch.load(save_path, map_location=config.DEVICE,
+                          weights_only=False)
         cortex.load_state_dict(ckpt['cortex'])
         optimizer.load_state_dict(ckpt['optimizer'])
         start_step = ckpt.get('step', 0)
         print(f"  Resumed from step {start_step}")
 
-    print(f"\n=== Cortex Training ===")
+    print(f"\n=== Columnar Cortex Training ===")
     print(f"  n_steps={args.n_steps}, lr={args.lr}")
-    print(f"  d_cortical={args.d_cortical}, n_layers={args.n_cortex_layers}")
-    print(f"  n_settle={args.n_settle}")
     print(f"  save_path={save_path}")
 
     cortex.train()
@@ -173,17 +171,17 @@ def main():
         labels = input_ids.clone()
         labels[0, :prompt_len] = -100
 
-        # Forward: Qwen intact → cortex observes → cortex proposes
+        # Forward
         outputs = cortex_model(input_ids=input_ids, labels=labels)
         ce_loss = outputs.loss
 
-        # Gradient step for genome
+        # Gradient step
         optimizer.zero_grad()
         ce_loss.backward()
         torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
         optimizer.step()
 
-        # Check accuracy via generation
+        # Check accuracy
         with torch.no_grad():
             prompt_ids = tokenizer(
                 p["prompt"], return_tensors="pt"
@@ -224,12 +222,18 @@ def main():
                 print(f"    {key}: {val:.4f}")
 
             # Gradient norms
-            print("  Gradient norms:")
+            print("  Gradient norms (top 10):")
+            grad_norms = []
             for name, param in cortex.named_parameters():
                 if param.grad is not None:
-                    print(f"    {name}: {param.grad.norm().item():.6f}")
+                    grad_norms.append(
+                        (name, param.grad.norm().item())
+                    )
+            grad_norms.sort(key=lambda x: -x[1])
+            for name, norm in grad_norms[:10]:
+                print(f"    {name}: {norm:.6f}")
 
-            # Save checkpoint
+            # Save
             torch.save({
                 'cortex': cortex.state_dict(),
                 'optimizer': optimizer.state_dict(),

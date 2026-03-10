@@ -7,16 +7,16 @@ Architecture:
   association cortex simultaneously.
 
   The cortex (this module) receives these multi-scale observations, processes
-  them through a predictive coding hierarchy, and produces a final hidden state
-  that Qwen's LM head uses for generation.
+  them through a predictive coding hierarchy, and produces a CORRECTION to
+  Qwen's final hidden state. Like prefrontal cortex modulating sensory processing.
 
   Qwen layer 9  ──→ ╮
-  Qwen layer 18 ──→ │  Cortex        ──→  final hidden state
+  Qwen layer 18 ──→ │  Cortex        ──→  correction
   Qwen layer 27 ──→ │  (PC hierarchy)     ↓
-  Qwen layer 34 ──→ ╯                    Qwen LM head → tokens
+  Qwen layer 34 ──→ ╯               qwen_final + correction → LM head → tokens
 
 No patching. No corruption. Qwen computes normally.
-We just observe, think, and propose.
+The cortex learns what to ADD to Qwen's thinking.
 
 Learning:
   - Cortex weights: Hebbian + reward modulation (brain-faithful)
@@ -202,15 +202,18 @@ class Cortex(nn.Module):
         # Fuse multi-scale inputs into single cortical input
         self.fuse = nn.Linear(d_cortical * len(observe_layers), d_cortical)
 
-        # Output projection: cortical activation → Qwen's LM head space
-        # The cortex must learn to "speak LM head" — produce 2560-dim vectors
-        # that the frozen LM head can decode into correct tokens.
-        # MLP for expressiveness (single linear may not be enough)
+        # Output projection: cortical activation → correction in Qwen's space
+        # The cortex doesn't replace Qwen's output — it corrects it.
+        # Like prefrontal cortex modulating sensory processing.
+        # Last layer zero-init so corrections start at zero (baseline = Qwen).
         self.output_proj = nn.Sequential(
             nn.Linear(d_cortical, d_cortical),
             nn.GELU(),
             nn.Linear(d_cortical, d_model),
         )
+        # Zero-init last layer: cortex starts as identity on Qwen's output
+        nn.init.zeros_(self.output_proj[-1].weight)
+        nn.init.zeros_(self.output_proj[-1].bias)
 
         # === Plastic cortex: Hebbian-trained hierarchy ===
 
@@ -231,6 +234,7 @@ class Cortex(nn.Module):
 
         # State
         self._observations = {}  # {layer_idx: hidden_state}
+        self._last_correction_norm = 0.0
 
     def reset(self):
         """Reset all cortical state."""
@@ -260,16 +264,18 @@ class Cortex(nn.Module):
 
         Takes multi-scale Qwen observations, fuses them, settles the
         cortical hierarchy independently at each sequence position, and
-        produces per-position modified hidden states for generation.
+        produces a correction to Qwen's final hidden state.
 
-        Each position gets its own settling — like the brain processing
-        each word/token with its own cortical column.
+        output = qwen_final + cortex_correction
+
+        At init, correction ≈ 0 (zero-init last layer), so we start at
+        Qwen's baseline accuracy. The cortex learns what to ADD.
 
         Args:
             qwen_final_hidden: (batch, seq, d_model) Qwen's final hidden state
 
         Returns:
-            output_hidden: (batch, seq, d_model) modified hidden state for LM head
+            output_hidden: (batch, seq, d_model) corrected hidden state for LM head
         """
         batch, seq, _ = qwen_final_hidden.shape
 
@@ -312,10 +318,12 @@ class Cortex(nn.Module):
         # (batch * seq, d_cortical)
         top_activation = self.layers[-1]._activations
 
-        # The cortex IS the output — no blending with Qwen
-        # Project cortex thinking to Qwen's LM head space
-        cortex_output = self.output_proj(top_activation)
-        output_hidden = cortex_output.view(batch, seq, self.d_model)
+        # Cortex produces a CORRECTION to Qwen's output
+        # Residual: output = qwen + correction (correction starts at 0)
+        correction = self.output_proj(top_activation)
+        correction = correction.view(batch, seq, self.d_model)
+        self._last_correction_norm = correction.detach().norm().item()
+        output_hidden = qwen_final_hidden.float() + correction
         return output_hidden.to(qwen_final_hidden.dtype)
 
     def compute_value(self):
@@ -362,6 +370,7 @@ class Cortex(nn.Module):
         diag["cortex/output_proj_norm"] = sum(
             p.norm().item() for p in self.output_proj.parameters()
         )
+        diag["cortex/correction_norm"] = self._last_correction_norm
         if self._last_value is not None:
             diag["cortex/critic_value"] = self._last_value.mean().item()
         return diag
