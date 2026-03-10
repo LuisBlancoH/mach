@@ -186,30 +186,31 @@ def main():
         answer_ids = tokenizer.encode(answer_str)  # includes <eos>
 
         # Train on each token of the answer autoregressively
-        # Context grows: prompt → prompt+digit1 → prompt+digit1+digit2 → ...
-        ce_loss = torch.tensor(0.0, device=device)
+        # Each token gets its own backward pass (can't accumulate through settle)
         context_ids = list(prompt_ids)
         all_pred_chars = []
+        total_ce = 0.0
 
         for target_id in answer_ids:
             context_tensor = torch.tensor([context_ids], device=device)
             brain.reset()
             logits = brain(context_tensor)
-            ce_loss = ce_loss + F.cross_entropy(logits, torch.tensor([target_id], device=device))
+            token_loss = F.cross_entropy(logits, torch.tensor([target_id], device=device))
 
+            # Backward per token
+            optimizer.zero_grad()
+            token_loss.backward()
+            torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
+            optimizer.step()
+
+            total_ce += token_loss.item()
             pred_id = logits.argmax(dim=-1).item()
             all_pred_chars.append(tokenizer.id_to_token.get(pred_id, '?'))
 
             # Teacher forcing: append true token for next step
             context_ids.append(target_id)
 
-        ce_loss = ce_loss / len(answer_ids)
-
-        # Gradient step for genome
-        optimizer.zero_grad()
-        ce_loss.backward()
-        torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
-        optimizer.step()
+        ce_loss_avg = total_ce / len(answer_ids)
 
         # Check if full answer is correct
         pred_answer = ''.join(all_pred_chars).replace('<eos>', '')
@@ -237,7 +238,7 @@ def main():
 
             print(
                 f"Step {step+1:5d} | op={op:<5} | "
-                f"acc(100)={acc:.0%} ce={ce_loss.item():.3f} "
+                f"acc(100)={acc:.0%} ce={ce_loss_avg:.3f} "
                 f"[{rate:.0f} st/s]"
             )
 
