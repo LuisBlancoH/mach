@@ -459,7 +459,9 @@ class ColumnarCortex(nn.Module):
             self._last_think_rounds = think_round + 1
 
             # Early stopping: beliefs stabilized?
-            if prev_beliefs is not None and self.areas[-1].beliefs is not None:
+            if (prev_beliefs is not None
+                    and self.areas[-1].beliefs is not None
+                    and prev_beliefs.shape == self.areas[-1].beliefs.shape):
                 belief_change = (
                     self.areas[-1].beliefs.detach() - prev_beliefs
                 ).norm().item()
