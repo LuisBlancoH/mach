@@ -220,10 +220,12 @@ def train_predictive_coding_continuous(patched_model, pc_network, tokenizer,
             rate = 100 / elapsed if elapsed > 0 else 0
             step_timer = time.time()
 
+            corr_scale = (torch.sigmoid(pc_network.correction_scale_logit) * 0.5).item()
             print(
                 f"Step {step+1:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} ce={ce_loss.item():.3f} "
-                f"pred={pred_loss.item():.4f} [{rate:.1f} st/s]"
+                f"pred={pred_loss.item():.4f} scale={corr_scale:.4f} "
+                f"[{rate:.1f} st/s]"
             )
 
         # Diagnostics + checkpoint
