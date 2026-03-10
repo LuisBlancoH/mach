@@ -85,7 +85,7 @@ class PredictiveCodingPatch(nn.Module):
             self.predict_down = nn.Linear(d_repr, d_repr)
             self.precision = nn.Linear(d_repr * 2, d_repr)
             self.error_to_correction = nn.Linear(d_repr, d_model)
-            nn.init.zeros_(self.error_to_correction.weight)
+            nn.init.normal_(self.error_to_correction.weight, std=0.01)
             nn.init.zeros_(self.error_to_correction.bias)
 
         # Diagnostics (set during settle)
