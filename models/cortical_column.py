@@ -232,7 +232,7 @@ class CorticalArea(nn.Module):
         else:
             self.W_predict_delta = delta_pred
 
-        # --- Homeostatic plasticity (differentiable) ---
+        # --- Homeostatic plasticity ---
         max_delta_norm = 10.0
         for attr in ['W_error_delta', 'W_predict_delta']:
             delta = getattr(self, attr)
@@ -241,7 +241,7 @@ class CorticalArea(nn.Module):
                 scale = torch.clamp(
                     max_delta_norm / (norms + 1e-8), max=1.0
                 )
-                setattr(self, attr, delta * scale)
+                setattr(self, attr, (delta * scale).detach())
 
 
 class ColumnarCortex(nn.Module):
