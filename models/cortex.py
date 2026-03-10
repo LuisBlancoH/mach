@@ -202,17 +202,15 @@ class Cortex(nn.Module):
         # Fuse multi-scale inputs into single cortical input
         self.fuse = nn.Linear(d_cortical * len(observe_layers), d_cortical)
 
-        # Output projection: cortical activation → Qwen's representation space
-        self.output_proj = nn.Linear(d_cortical, d_model)
-        # Initialize near-identity: output ≈ what Qwen would have produced
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
-
-        # Gate: blend cortex output with Qwen's original hidden state
-        # Starts at 0 (pure Qwen), learns to open when cortex helps
-        self.blend_gate = nn.Linear(d_cortical + d_model, 1)
-        nn.init.zeros_(self.blend_gate.weight)
-        nn.init.constant_(self.blend_gate.bias, -3.0)  # sigmoid(-3) ≈ 0.05
+        # Output projection: cortical activation → Qwen's LM head space
+        # The cortex must learn to "speak LM head" — produce 2560-dim vectors
+        # that the frozen LM head can decode into correct tokens.
+        # MLP for expressiveness (single linear may not be enough)
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_cortical, d_cortical),
+            nn.GELU(),
+            nn.Linear(d_cortical, d_model),
+        )
 
         # === Plastic cortex: Hebbian-trained hierarchy ===
 
@@ -233,7 +231,6 @@ class Cortex(nn.Module):
 
         # State
         self._observations = {}  # {layer_idx: hidden_state}
-        self._last_gate_value = 0.0
 
     def reset(self):
         """Reset all cortical state."""
@@ -315,18 +312,10 @@ class Cortex(nn.Module):
         # (batch * seq, d_cortical)
         top_activation = self.layers[-1]._activations
 
-        # Project back to Qwen space: (batch * seq, d_cortical) → (batch * seq, d_model)
+        # The cortex IS the output — no blending with Qwen
+        # Project cortex thinking to Qwen's LM head space
         cortex_output = self.output_proj(top_activation)
-        cortex_output = cortex_output.view(batch, seq, self.d_model)
-
-        # Blend gate per position
-        top_for_gate = top_activation.view(batch, seq, self.d_cortical)
-        gate_input = torch.cat([top_for_gate, qwen_final_hidden.float()], dim=-1)
-        gate = torch.sigmoid(self.blend_gate(gate_input))  # (batch, seq, 1)
-        self._last_gate_value = gate.detach().mean().item()
-
-        # Blend: gate=0 → pure Qwen, gate=1 → pure cortex
-        output_hidden = (1 - gate) * qwen_final_hidden.float() + gate * cortex_output
+        output_hidden = cortex_output.view(batch, seq, self.d_model)
         return output_hidden.to(qwen_final_hidden.dtype)
 
     def compute_value(self):
@@ -370,7 +359,9 @@ class Cortex(nn.Module):
             diag[f"cortex/layer{i}_precision"] = torch.sigmoid(
                 layer.precision_logit
             ).mean().item()
-        diag["cortex/blend_gate"] = self._last_gate_value
+        diag["cortex/output_proj_norm"] = sum(
+            p.norm().item() for p in self.output_proj.parameters()
+        )
         if self._last_value is not None:
             diag["cortex/critic_value"] = self._last_value.mean().item()
         return diag

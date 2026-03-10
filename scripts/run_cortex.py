@@ -115,12 +115,11 @@ def main():
     )
     from data.arithmetic import extract_number
 
-    # Optimizer for genome (input/output projections, gate, critic, norms, precision)
+    # Optimizer for genome (input/output projections, critic, norms, precision)
     genome_params = []
     genome_params.extend(cortex.input_projs.parameters())
     genome_params.extend(cortex.fuse.parameters())
     genome_params.extend(cortex.output_proj.parameters())
-    genome_params.extend(cortex.blend_gate.parameters())
     genome_params.extend(cortex.critic.parameters())
     for layer in cortex.layers:
         genome_params.append(layer.precision_logit)
@@ -205,7 +204,6 @@ def main():
         if (step + 1) % 100 == 0:
             recent = all_correct[-100:]
             acc = sum(recent) / len(recent)
-            gate = cortex._last_gate_value
             elapsed = time.time() - step_timer
             rate = 100 / elapsed if elapsed > 0 else 0
             step_timer = time.time()
@@ -213,7 +211,7 @@ def main():
             print(
                 f"Step {step+1:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} ce={ce_loss.item():.3f} "
-                f"gate={gate:.3f} [{rate:.1f} st/s]"
+                f"[{rate:.1f} st/s]"
             )
 
         # Diagnostics + checkpoint
