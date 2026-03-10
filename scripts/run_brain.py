@@ -181,20 +181,29 @@ def main():
             op=op, max_num=args.max_num
         )
 
-        # Encode prompt
+        # Encode prompt and answer
         prompt_ids = tokenizer.encode(prompt_str)
-        prompt_tensor = torch.tensor([prompt_ids], device=device)
+        answer_ids = tokenizer.encode(answer_str)  # includes <eos>
 
-        # Forward through brain
-        brain.reset()
-        logits = brain(prompt_tensor)  # (1, vocab_size)
+        # Train on each token of the answer autoregressively
+        # Context grows: prompt → prompt+digit1 → prompt+digit1+digit2 → ...
+        ce_loss = torch.tensor(0.0, device=device)
+        context_ids = list(prompt_ids)
+        all_pred_chars = []
 
-        # Target: first token of answer
-        answer_ids = tokenizer.encode(answer_str)
-        target = torch.tensor([answer_ids[0]], device=device)
+        for target_id in answer_ids:
+            context_tensor = torch.tensor([context_ids], device=device)
+            brain.reset()
+            logits = brain(context_tensor)
+            ce_loss = ce_loss + F.cross_entropy(logits, torch.tensor([target_id], device=device))
 
-        # CE loss on readout (trains genome)
-        ce_loss = F.cross_entropy(logits, target)
+            pred_id = logits.argmax(dim=-1).item()
+            all_pred_chars.append(tokenizer.id_to_token.get(pred_id, '?'))
+
+            # Teacher forcing: append true token for next step
+            context_ids.append(target_id)
+
+        ce_loss = ce_loss / len(answer_ids)
 
         # Gradient step for genome
         optimizer.zero_grad()
@@ -202,14 +211,18 @@ def main():
         torch.nn.utils.clip_grad_norm_(genome_params, 1.0)
         optimizer.step()
 
-        # Check if correct
-        pred_id = logits.argmax(dim=-1).item()
-        pred_str = tokenizer.id_to_token.get(pred_id, '?')
-        correct = (pred_str == answer_str[0])  # first digit
+        # Check if full answer is correct
+        pred_answer = ''.join(all_pred_chars).replace('<eos>', '')
+        correct = (pred_answer == answer_str)
         all_correct.append(1.0 if correct else 0.0)
 
-        # Reward signal
-        reward = 1.0 if correct else -0.5
+        # Reward: graded — partial credit for getting digits right
+        if correct:
+            reward = 1.0
+        elif len(pred_answer) > 0 and pred_answer[0] == answer_str[0]:
+            reward = 0.0  # first digit right, not punished
+        else:
+            reward = -0.5
 
         # Hebbian update (the brain learning)
         brain.hebbian_step(reward)
@@ -241,6 +254,7 @@ def main():
             for eval_op in ops:
                 n_correct = 0
                 n_total = 0
+                examples = []
                 for a in range(1, args.max_num + 1):
                     for b in range(1, args.max_num + 1):
                         if eval_op == 'sub' and a < b:
@@ -257,18 +271,22 @@ def main():
 
                         ids = tokenizer.encode(p)
                         t = torch.tensor([ids], device=device)
-                        brain.reset()
-                        with torch.no_grad():
-                            logits = brain(t)
-                        pred_id = logits.argmax(dim=-1).item()
-                        pred_char = tokenizer.id_to_token.get(pred_id, '?')
-                        # For multi-digit answers, just check first digit
-                        if pred_char == str(ans)[0]:
+                        gen_ids = brain.generate(t, max_new_tokens=4)
+                        pred_str = tokenizer.decode(gen_ids)
+                        ans_str = str(ans)
+                        if pred_str == ans_str:
                             n_correct += 1
                         n_total += 1
 
+                        # Collect a few examples
+                        if len(examples) < 5:
+                            mark = "✓" if pred_str == ans_str else "✗"
+                            examples.append(f"    {p}{ans_str} → {pred_str} {mark}")
+
                 print(f"  EVAL {eval_op:<5} | {n_correct}/{n_total} = "
                       f"{n_correct/n_total:.0%}")
+                for ex in examples:
+                    print(ex)
             print()
 
 

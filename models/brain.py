@@ -342,7 +342,7 @@ class Brain(nn.Module):
             token_ids: (batch, seq_len) input token indices
 
         Returns:
-            logits: (batch, vocab_size) output logits
+            logits: (batch, vocab_size) output logits for next token
         """
         # Embed sequence
         cortical_input = self._embed_sequence(token_ids)
@@ -354,6 +354,43 @@ class Brain(nn.Module):
         logits = self.readout(top_activation)
 
         return logits
+
+    def generate(self, token_ids, max_new_tokens=4, eos_id=17, pad_id=16):
+        """Generate multiple tokens autoregressively.
+
+        For each token: embed full sequence so far → settle → readout → append.
+        The settling re-runs on the extended context each time, like the brain
+        re-processing with new information.
+
+        Args:
+            token_ids: (batch, seq_len) prompt token IDs
+            max_new_tokens: maximum tokens to generate
+            eos_id: end-of-sequence token ID
+            pad_id: padding token ID
+
+        Returns:
+            generated_ids: list of generated token IDs
+        """
+        generated = []
+        current_ids = token_ids
+
+        for _ in range(max_new_tokens):
+            self.reset()
+            with torch.no_grad():
+                logits = self.forward(current_ids)
+            next_id = logits.argmax(dim=-1).item()
+
+            # Stop at EOS or pad
+            if next_id == eos_id or next_id == pad_id:
+                break
+
+            generated.append(next_id)
+
+            # Append to context for next iteration
+            next_tensor = torch.tensor([[next_id]], device=token_ids.device)
+            current_ids = torch.cat([current_ids, next_tensor], dim=1)
+
+        return generated
 
     def compute_value(self):
         """Compute critic value from top-layer activation."""
