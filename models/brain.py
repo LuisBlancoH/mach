@@ -190,6 +190,19 @@ class CorticalLayer(nn.Module):
             self.lateral_W.mul_(0.999)  # slow decay
             self.lateral_W.add_(eta * 0.1 * reward * delta_lat)
 
+        # === Homeostatic plasticity ===
+        # The brain scales synaptic weights to maintain stable firing rates.
+        # If weights grow too large, scale them down to a target norm.
+        max_norm = 30.0
+        for W in [self.up_W, self.lateral_W]:
+            norm = W.norm()
+            if norm > max_norm:
+                W.mul_(max_norm / norm)
+        if self.has_top_down:
+            norm = self.down_W.norm()
+            if norm > max_norm:
+                self.down_W.mul_(max_norm / norm)
+
 
 class Brain(nn.Module):
     """A minimal predictive coding brain.
