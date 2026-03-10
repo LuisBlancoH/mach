@@ -55,6 +55,8 @@ def main():
     parser.add_argument("--n-areas", type=int, default=3,
                         help="Number of hierarchical areas")
     parser.add_argument("--n-settle", type=int, default=5)
+    parser.add_argument("--n-think", type=int, default=3,
+                        help="Max reasoning rounds before output")
     parser.add_argument("--n-heads", type=int, default=4,
                         help="Attention heads for lateral communication")
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -83,6 +85,7 @@ def main():
         n_columns=args.n_columns,
         n_areas=args.n_areas,
         n_settle=args.n_settle,
+        n_think=args.n_think,
         n_heads=args.n_heads,
         observe_layers=observe_layers,
     ).to(config.DEVICE)
@@ -210,10 +213,11 @@ def main():
             step_timer = time.time()
 
             corr = cortex._last_correction_norm
+            rounds = cortex._last_think_rounds
             print(
                 f"Step {step+1:5d} | op={current_op:<10} | "
                 f"acc(100)={acc:.0%} ce={ce_loss.item():.3f} "
-                f"corr={corr:.2f} [{rate:.1f} st/s]"
+                f"corr={corr:.2f} think={rounds} [{rate:.1f} st/s]"
             )
 
         # Diagnostics + checkpoint

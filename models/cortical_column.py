@@ -262,7 +262,8 @@ class ColumnarCortex(nn.Module):
     """
 
     def __init__(self, d_model, d_col=64, n_columns=40, n_areas=3,
-                 n_settle=5, n_heads=4, observe_layers=None):
+                 n_settle=5, n_think=3, n_heads=4, observe_layers=None,
+                 think_epsilon=1e-3):
         super().__init__()
         if observe_layers is None:
             observe_layers = [9, 18, 27, 34]
@@ -273,6 +274,8 @@ class ColumnarCortex(nn.Module):
         self.n_columns = n_columns
         self.n_areas = n_areas
         self.n_settle = n_settle
+        self.n_think = n_think            # max reasoning rounds
+        self.think_epsilon = think_epsilon  # early stop when beliefs stabilize
 
         n_obs = len(observe_layers)
 
@@ -309,6 +312,7 @@ class ColumnarCortex(nn.Module):
         # === State ===
         self._observations = {}
         self._last_correction_norm = 0.0
+        self._last_think_rounds = 0
 
     def reset(self):
         """Reset between inputs."""
@@ -327,12 +331,42 @@ class ColumnarCortex(nn.Module):
         """Capture a Qwen hidden state (read-only)."""
         self._observations[obs_idx] = hidden_state.detach()
 
+    def _settle_once(self, column_input):
+        """Run one settling pass through the full hierarchy.
+
+        Args:
+            column_input: (batch*seq, n_columns, d_col) sensory input
+        """
+        for area_idx in range(self.n_areas):
+            area = self.areas[area_idx]
+
+            # Bottom-up input
+            if area_idx == 0:
+                bottom_up = column_input
+            else:
+                bottom_up = self.areas[area_idx - 1].beliefs
+                if bottom_up is None:
+                    bottom_up = column_input  # fallback
+
+            # Top-down prediction from area above
+            top_down = None
+            if area_idx < self.n_areas - 1:
+                top_down = self.areas[area_idx + 1].get_predictions()
+
+            area.settle_step(bottom_up, top_down)
+
     def think(self, qwen_final_hidden):
         """Process observations through the columnar hierarchy.
 
-        1. Project Qwen observations → per-column inputs
-        2. Settle: bottom-up / top-down / lateral for n_settle iterations
-        3. Output: top area beliefs → correction to Qwen's hidden state
+        Three nested loops:
+          1. Thinking (outer): multiple reasoning rounds on the same input.
+             Beliefs persist across rounds — each round sees the same
+             evidence but with deeper understanding from prior rounds.
+             Stops early when beliefs stabilize (gate closes naturally).
+          2. Settling (inner): within each thinking round, iterate the
+             hierarchy to convergence (bottom-up/top-down/lateral).
+          3. Generation (caller): across tokens, beliefs persist as
+             working memory.
 
         Args:
             qwen_final_hidden: (batch, seq, d_model)
@@ -363,30 +397,34 @@ class ColumnarCortex(nn.Module):
             + self.fuse_b.unsqueeze(0)
         )
 
-        # --- 2. Settling loop ---
-        # NOTE: beliefs persist across tokens within a problem.
-        # Only observations are cleared (new input each token).
-        # This gives the cortex working memory for reasoning.
+        # Clear observations (already projected)
         self._observations.clear()
 
-        for t in range(self.n_settle):
-            for area_idx in range(self.n_areas):
-                area = self.areas[area_idx]
+        # --- 2. Thinking loop: reason before speaking ---
+        # Each round: settle the hierarchy. Beliefs persist across rounds.
+        # Stop early when beliefs have stabilized (natural convergence).
+        self._last_think_rounds = 0
 
-                # Bottom-up input
-                if area_idx == 0:
-                    bottom_up = column_input
-                else:
-                    bottom_up = self.areas[area_idx - 1].beliefs
-                    if bottom_up is None:
-                        bottom_up = column_input  # fallback
+        for think_round in range(self.n_think):
+            # Snapshot beliefs before this round (for convergence check)
+            if self.areas[-1].beliefs is not None:
+                prev_beliefs = self.areas[-1].beliefs.detach().clone()
+            else:
+                prev_beliefs = None
 
-                # Top-down prediction from area above
-                top_down = None
-                if area_idx < self.n_areas - 1:
-                    top_down = self.areas[area_idx + 1].get_predictions()
+            # Settle: n_settle iterations of bottom-up/top-down/lateral
+            for t in range(self.n_settle):
+                self._settle_once(column_input)
 
-                area.settle_step(bottom_up, top_down)
+            self._last_think_rounds = think_round + 1
+
+            # Early stopping: beliefs stabilized?
+            if prev_beliefs is not None and self.areas[-1].beliefs is not None:
+                belief_change = (
+                    self.areas[-1].beliefs.detach() - prev_beliefs
+                ).norm().item()
+                if belief_change < self.think_epsilon:
+                    break  # cortex has settled — done thinking
 
         # --- 3. Output ---
         top_beliefs = self.areas[-1].beliefs  # (batch*seq, n_cols, d_col)
@@ -451,6 +489,7 @@ class ColumnarCortex(nn.Module):
                 torch.sigmoid(area.precision).mean().item()
             )
         diag["cortex/correction_norm"] = self._last_correction_norm
+        diag["cortex/think_rounds"] = self._last_think_rounds
         return diag
 
 
