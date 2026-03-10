@@ -53,6 +53,14 @@ class PredictiveCodingPatch(nn.Module):
         # Normalize compressed representations (bounded firing rates)
         self.compress_norm = nn.LayerNorm(d_repr)
 
+        # Confidence gate: learn when to apply corrections vs stay silent
+        # Input: prediction error magnitude → scalar gate
+        # Initialized to output ~0 (bias=-2 → sigmoid ≈ 0.12), so patches
+        # start nearly invisible and must learn WHEN to intervene
+        self.confidence_gate = nn.Linear(d_repr, 1)
+        nn.init.zeros_(self.confidence_gate.weight)
+        nn.init.constant_(self.confidence_gate.bias, -2.0)
+
         if hebbian:
             # Weights as buffers — updated by Hebbian rules, not optimizer
             # compress: d_model → d_repr
@@ -92,6 +100,7 @@ class PredictiveCodingPatch(nn.Module):
         self._last_error_norm = 0.0
         self._last_precision_mean = 0.0
         self._last_weighted_error_norm = 0.0
+        self._last_gate_mean = 0.0
 
         # Traces for Hebbian update (set during settle, consumed by hebbian_step)
         self._trace_compressed = None      # (batch, seq, d_repr)
@@ -124,10 +133,20 @@ class PredictiveCodingPatch(nn.Module):
         return self.precision(precision_input)
 
     def do_error_to_correction(self, weighted_error):
-        """Project precision-weighted error back to Qwen's residual stream."""
+        """Project precision-weighted error back to Qwen's residual stream.
+
+        Gated by confidence: if the PC hierarchy isn't confident its correction
+        will help, the gate suppresses it. Starts near-zero (patches invisible)
+        and learns when to intervene.
+        """
         if self.hebbian:
-            return self._linear(weighted_error, self.correction_W, self.correction_b)
-        return self.error_to_correction(weighted_error)
+            raw = self._linear(weighted_error, self.correction_W, self.correction_b)
+        else:
+            raw = self.error_to_correction(weighted_error)
+        # Gate: (batch, seq, 1) scalar per position
+        gate = torch.sigmoid(self.confidence_gate(weighted_error))
+        self._last_gate_mean = gate.detach().mean().item()
+        return raw * gate
 
     def compute_error(self, compressed, prediction, hidden_in=None):
         """Compute precision-weighted prediction error.
@@ -440,6 +459,7 @@ class PredictiveCodingNetwork(nn.Module):
             diag[f"pc/patch{i}_error_norm"] = patch._last_error_norm
             diag[f"pc/patch{i}_precision_mean"] = patch._last_precision_mean
             diag[f"pc/patch{i}_weighted_error_norm"] = patch._last_weighted_error_norm
+            diag[f"pc/patch{i}_gate_mean"] = patch._last_gate_mean
         for i, corr in self._corrections.items():
             if corr is not None:
                 diag[f"pc/patch{i}_correction_norm"] = corr.detach().norm().item()
