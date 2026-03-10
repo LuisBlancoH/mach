@@ -198,7 +198,11 @@ class PredictiveCodingNetwork(nn.Module):
         self.d_repr = d_repr
         self.n_settle = n_settle
         self.hebbian = hebbian
-        self.correction_scale = correction_scale  # keep corrections small relative to Qwen
+        # Learnable correction scale — starts small, gradient pushes up when useful
+        # log-space so it stays positive: actual_scale = sigmoid(param) * 0.5
+        self.correction_scale_logit = nn.Parameter(
+            torch.tensor(-4.0)  # sigmoid(-4) ≈ 0.018 → 0.018 * 0.5 ≈ 0.009
+        )
 
         self.patches = nn.ModuleList([
             PredictiveCodingPatch(d_model, d_repr, hebbian=hebbian)
@@ -301,8 +305,9 @@ class PredictiveCodingNetwork(nn.Module):
             )
 
             correction = self.patches[i].do_error_to_correction(weighted_error)
-            # Scale corrections to be small relative to Qwen's hidden states
-            self._corrections[i] = correction * self.correction_scale
+            # Scale corrections — learnable, starts small, gradient pushes up
+            scale = torch.sigmoid(self.correction_scale_logit) * 0.5
+            self._corrections[i] = correction * scale
 
             if pred is not None and i in representations:
                 actual_repr = compressed[i].detach().mean(dim=1)
@@ -444,6 +449,7 @@ class PredictiveCodingNetwork(nn.Module):
         for i, corr in self._corrections.items():
             if corr is not None:
                 diag[f"pc/patch{i}_correction_norm"] = corr.detach().norm().item()
+        diag["pc/correction_scale"] = (torch.sigmoid(self.correction_scale_logit) * 0.5).item()
         # Hebbian-specific diagnostics
         if self.hebbian:
             for i, patch in enumerate(self.patches):
